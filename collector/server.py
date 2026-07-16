@@ -16,6 +16,7 @@
 import argparse
 import json
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -242,11 +243,36 @@ class Handler(BaseHTTPRequestHandler):
         pass  # 접근 로그 끔 — 수집 로그만 본다
 
 
+class Tee:
+    """stdout/stderr 를 콘솔과 파일 양쪽에 쓴다 — 윈도우 bat 용 (--log).
+
+    셸 리다이렉트(>>)로 하면 스케줄러가 띄우는 cmd 창이 텅 비어 버린다.
+    창에는 그대로 흐르고 파일에도 남아야 죽은 뒤 사인을 볼 수 있다.
+    """
+    def __init__(self, stream, f):
+        self.s, self.f = stream, f
+
+    def write(self, x):
+        self.s.write(x)
+        self.f.write(x)
+
+    def flush(self):
+        self.s.flush()
+        self.f.flush()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=877)
     ap.add_argument("--no-collect", action="store_true", help="대시보드만")
+    ap.add_argument("--log", help="출력을 이 파일에도 복사 (콘솔에는 그대로)")
     args = ap.parse_args()
+
+    if args.log:
+        os.makedirs(os.path.dirname(args.log) or ".", exist_ok=True)
+        _f = open(args.log, "a", encoding="utf-8", buffering=1, errors="replace")
+        sys.stdout = Tee(sys.stdout, _f)
+        sys.stderr = Tee(sys.stderr, _f)
 
     if not args.no_collect:
         if bus_collector is None:

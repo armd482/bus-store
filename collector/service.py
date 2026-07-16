@@ -256,14 +256,14 @@ def win_bat_path():
 
 
 def win_install():
-    # ⚠️ 로그 리다이렉트 필수 — 스케줄러로 뜬 배치는 콘솔이 없어서, 리다이렉트가
-    #    없으면 수집기가 죽으며 남긴 트레이스백을 볼 방법이 없다 (✅ 실전에서 겪음).
+    # ⚠️ --log 로 파일에도 남긴다 (서버 내부 tee) — 죽은 뒤 사인을 보기 위함.
+    #    셸 리다이렉트(>>)로 하면 스케줄러가 띄우는 cmd 창이 텅 비어 버린다 (✅ 실전):
+    #    창에는 그대로 흐르고 파일에는 복사본이 남아야 한다.
     with open(win_bat_path(), "w") as f:
         f.write(f"""@echo off
 cd /d "{HERE}"
-if not exist logs mkdir logs
 :loop
-"{PY}" server.py >> logs\\server.log 2>&1
+"{PY}" server.py --log logs\\server.log
 timeout /t 10
 goto loop
 """)
@@ -275,8 +275,8 @@ goto loop
     if r.returncode != 0:
         sys.exit("schtasks 등록 실패 — 관리자 PowerShell 에서 다시 실행할 것.\n" + r.stderr.strip())
     run(["schtasks", "/Run", "/TN", TASK])
-    print("설치·시작됨.")
-    follow(os.path.join(HERE, "logs", "server.log"))
+    print("설치·시작됨 — 로그는 새로 뜬 cmd 창에 흐른다 (파일 복사본: logs\\server.log)")
+    print("창을 닫았거나 안 보이면: py service.py logs")
 
 
 def win_stop():
@@ -288,8 +288,8 @@ def win_stop():
 def win_start():
     run(["schtasks", "/Change", "/TN", TASK, "/Enable"], ok_fail=True)
     run(["schtasks", "/Run", "/TN", TASK])
-    print("시작됨.")
-    follow(os.path.join(HERE, "logs", "server.log"))
+    print("시작됨 — 로그는 새로 뜬 cmd 창에 흐른다 (파일 복사본: logs\\server.log)")
+    print("창을 닫았거나 안 보이면: py service.py logs")
 
 
 def win_logs():
