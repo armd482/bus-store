@@ -25,6 +25,20 @@ python3 server.py         # 수집 + 대시보드 → http://localhost:877
 
 코드는 셋 다 돈다. 다른 건 **항상 켜두는 방법**이다.
 
+**세 OS 공통 관리 명령** — 아래 OS 별 절차를 직접 밟는 대신 이걸 쓰면 된다:
+
+```bash
+python3 service.py install     # 상시 실행 등록 + 시작 (크래시·재부팅 자동 재시작)
+python3 service.py stop        # ★ 완전 종료 — 중지 + 자동 재시작·부팅 실행 해제
+python3 service.py start       # 다시 켜기
+python3 service.py uninstall   # 등록 제거
+python3 service.py status
+```
+
+`stop` 이 **완전 종료**다: 지금 내려가고, 크래시 감시도 풀리고, 재부팅해도 안 살아난다 — `start` 하기 전까지. 수동으로 띄운 `server.py` 가 있어도 함께 내린다. (macOS 에서 `install` 은 TCC 보호 폴더 밖 `~/findpath/` 로 코드를 알아서 복사한다 — 아래 macOS 절 참조.)
+
+아래는 `service.py` 가 하는 일의 수동 절차다 — 직접 제어하고 싶을 때만.
+
 ### 리눅스 / EC2 — 권장
 
 가장 단순하다. TCC 도 절전도 강제 재부팅도 없다.
@@ -33,7 +47,7 @@ python3 server.py         # 수집 + 대시보드 → http://localhost:877
 python3 server.py
 ```
 
-상시 실행은 systemd. `~/.config/systemd/user/findpath.service`:
+상시 실행은 systemd — 크래시 자동 재시작 + 부팅 자동 시작. **사용자가 `stop` 한 경우에만** 꺼진 채로 있는다. `~/.config/systemd/user/findpath.service`:
 
 ```ini
 [Unit]
@@ -42,31 +56,61 @@ Description=findpath collector
 WorkingDirectory=/home/ubuntu/find-path/collector
 ExecStart=/usr/bin/python3 server.py
 Restart=always
+RestartSec=10
 [Install]
 WantedBy=default.target
 ```
 
 ```bash
+loginctl enable-linger $(whoami)    # ⚠️ 필수 — 없으면 SSH 로그아웃 때 유저 서비스가 같이 죽는다
 systemctl --user enable --now findpath
 systemctl --user status findpath
 journalctl --user -u findpath -f    # 로그
+
+systemctl --user stop findpath      # 수동 종료 — 이때만 자동 재시작이 멈춘다 (Ctrl-C 에 해당)
+systemctl --user restart findpath   # 코드 고친 뒤 반영
 ```
 
 ### macOS
 
 ```bash
-python3 server.py
+python3 server.py        # 개발 — 터미널에서 직접. Ctrl-C 로 종료
 ```
 
-⚠️ **`~/Desktop` · `~/Documents` 아래에 두면 상시 실행이 안 된다.** 이 둘은 TCC 보호 폴더라 터미널에서 직접 실행은 되지만 **`launchd` 로 뜬 프로세스는 권한을 물려받지 못한다:**
+**상시 실행 (크래시·재부팅 자동 재시작)** — `launchd` 를 쓴다. 크래시하든 재부팅하든 알아서 다시 뜨고, **사용자가 명시적으로 내린 경우에만**(아래 bootout — 터미널의 Ctrl-C 에 해당) 꺼진 채로 있는다:
+
+```bash
+# 1. TCC 보호 밖으로 복사본을 둔다 (아래 ⚠️ 참조)
+rsync -a --exclude data --exclude logs ~/Desktop/assignment/find-path/collector/ ~/findpath/collector/
+mkdir -p ~/findpath/collector/logs
+
+# 2. plist 의 USERNAME 치환 후 설치
+sed "s/USERNAME/$(whoami)/g" ~/findpath/collector/com.findpath.collector.plist \
+  > ~/Library/LaunchAgents/com.findpath.collector.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.findpath.collector.plist
+
+# 상태 확인 (2번째 열이 '-' 면 실행 중)
+launchctl list | grep findpath
+tail -f ~/findpath/collector/logs/server.log
+
+# 수동 종료 — 이때만 자동 재시작이 멈춘다 (Ctrl-C 에 해당)
+launchctl bootout gui/$(id -u)/com.findpath.collector
+
+# 다시 켜기
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.findpath.collector.plist
+```
+
+죽었다 되살아나도 안전하다 — 일 콜 카운터는 디스크(`.buscalls-*`)라 쿼터를 다시 세지 않고, 관측 장부는 사이클 단위 커밋이다.
+
+⚠️ **`~/Desktop` · `~/Documents` 아래를 plist 가 가리키면 안 된다.** 이 둘은 TCC 보호 폴더라 터미널에서 직접 실행은 되지만 **`launchd` 로 뜬 프로세스는 권한을 물려받지 못한다:**
 
 ```
 python3: can't open file '.../Desktop/.../server.py': [Errno 1] Operation not permitted
 ```
 
-`python3` 에 전체 디스크 접근 권한을 주는 방법도 있으나 범위가 너무 넓다. **홈 밑 보호되지 않는 폴더(`~/findpath/` 등)로 옮기는 쪽이 권한 부여가 전혀 필요 없다.**
+`python3` 에 전체 디스크 접근 권한을 주는 방법도 있으나 범위가 너무 넓다. **홈 밑 보호되지 않는 폴더(`~/findpath/`)로 복사하는 쪽이 권한 부여가 전혀 필요 없다** (위 rsync). 코드를 고치면 rsync 를 다시 돌리고 `launchctl kickstart -k gui/$(id -u)/com.findpath.collector`.
 
-그리고 **잠들면 멈춘다.** 노트북을 덮으면 그 시간대는 0 이 된다 (아래 "한계").
+그리고 **잠들면 멈춘다.** launchd 도 잠은 못 깨운다 — 노트북을 덮으면 그 시간대는 0 이 된다 (아래 "한계"). 덮어도 계속 돌리려면 전원 연결 + `sudo pmset -c sleep 0` 또는 상시 기계(EC2)로.
 
 ### 윈도우
 
@@ -75,7 +119,19 @@ py fetch_routes.py
 py server.py
 ```
 
-상시 실행은 **작업 스케줄러** — "사용자 로그온 여부에 관계없이 실행", 트리거 "시스템 시작 시". 전원 옵션에서 절전을 꺼야 한다.
+상시 실행은 **작업 스케줄러 + 감시 루프 배치**. 작업 스케줄러의 자체 "실패 시 다시 시작"은 재시도 횟수에 상한이 있어서, 크래시 자동 재시작은 배치 루프가 맡는 쪽이 확실하다. `run_forever.bat`:
+
+```bat
+:loop
+py server.py
+timeout /t 10
+goto loop
+```
+
+- **부팅 자동 시작**: 작업 스케줄러에서 이 배치를 등록 — 트리거 "시스템 시작 시", "사용자 로그온 여부에 관계없이 실행"
+- **크래시**: 배치 루프가 10초 뒤 재시작 (쿼터 카운터는 디스크라 이어서 센다)
+- **수동 종료** (Ctrl-C 에 해당): 콘솔에서 Ctrl-C → "배치 작업을 종료하시겠습니까?" 에 Y. 스케줄러로 띄운 경우엔 작업 스케줄러에서 "끝내기"
+- 전원 옵션에서 절전을 꺼야 한다 (잠들면 그 시간대는 0)
 
 ✅ **인코딩은 처리돼 있다.** 윈도우 콘솔 기본이 cp949 라 로그의 한글·이모지에서 `UnicodeEncodeError` 가 나는데 — 하필 `⚠️ 실패` 줄은 API 가 실패할 때만 타는 경로라 **잘 돌다가 첫 실패에 통째로 죽는다.** `orchestrator.py` 가 import 시점에 stdout 을 UTF-8 로 고정한다. 모든 스크립트가 그 모듈을 import 하므로 별도 조치가 필요 없다.
 
@@ -140,10 +196,10 @@ tail -f /tmp/run.log
 정류장을 **넘은 순간만** 기록한다. 통과 시각은 `(t_prev, t]` 안에 있다 — API 에 타임스탬프 필드가 없어 폴링 시각으로만 좁힐 수 있다 (docs §3.1). ✅ 30초 폴링이면 이동의 94.7% 를 1칸으로 잡는다.
 
 ```json
-{"t":"...","t_prev":"...","routeid":"GGB...","routeno":"9000","routetp":"직행좌석버스",
- "cityCode":31020,"vehicleno":"경기77바3714","from_ord":31,"to_ord":32,
- "nodeid":"...","nodenm":"...","gpslati":37.4,"gpslong":127.1,
- "band":2,"daytype":"weekday"}
+{"t":"...","t_prev":"...","routeid":"GGB...","vehicleno":"경기77바3714",
+ "from_ord":31,"to_ord":32,"nodeid":"...","band":2,"daytype":"weekday"}
 ```
 
-⚠️ `gpslati`/`gpslong` 은 **버스 GPS 가 아니라 현재 정류장의 좌표**다. 정류장을 넘을 때만 바뀐다 (docs §3.1). 우리가 필요한 건 통과 시각이라 이걸로 충분하다.
+**최소 필드만 저장한다** — `vehicleno` 는 같은 차의 통과를 이어 붙여 구간 소요시간을 만드는 체인 키라 필수고, `band`/`daytype` 은 장부 재계산(`rebuild`)용이다. 노선번호·유형·정류장명·좌표는 `coverage.sqlite` 의 `route` 테이블에서 `routeid` 로 조인한다 — 행마다 반복 저장하지 않는다 (행 381B → ~220B).
+
+⚠️ API 의 `gpslati`/`gpslong` 은 **버스 GPS 가 아니라 현재 정류장의 좌표**다 (docs §3.1). 통과 시각만 필요하므로 저장하지 않는다.

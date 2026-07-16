@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  findpath 수집기 LaunchAgent — 크래시·재부팅 자동 재시작 (README "macOS 상시 실행")
+
+  ⚠️ USERNAME 을 치환하고 ~/findpath 에 복사본을 둔 뒤 설치할 것.
+     ~/Desktop·~/Documents 아래를 가리키면 TCC 때문에 Operation not permitted 로 죽는다.
+
+  의미:
+    RunAtLoad    — 로그인(재부팅 포함) 시 자동 시작
+    KeepAlive    — 어떤 이유로든 죽으면 자동 재시작 (쿼터 카운터는 디스크라 안전)
+    수동 종료     — launchctl bootout gui/$UID/com.findpath.collector  (이때만 안 되살아난다)
+    ThrottleInterval — 크래시 루프 시 10초 간격으로 제한
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.findpath.collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>server.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/USERNAME/findpath/collector</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/USERNAME/findpath/collector/logs/server.log</string>
+  <key>StandardErrorPath</key><string>/Users/USERNAME/findpath/collector/logs/server.err</string>
+</dict>
+</plist>

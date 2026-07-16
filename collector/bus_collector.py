@@ -285,14 +285,17 @@ def main():
                     #    첫 관측으로 취급하고 버린다. 4×interval 인 이유: 실패 1사이클
                     #    (~90s 공백)은 기존처럼 기록하고, 그 이상 공백만 자른다.
                     continue
-                p = meta[routeid]
+                # 최소 필드만 저장한다 (행 381B → ~220B).
+                #   필수: 통과 구간 (t_prev, t] + 차량(소요시간 체인 키) + 노선/구간
+                #   장부: band/daytype — rebuild 가 수집 당시 규칙으로 재계산하기 위함
+                #   안전: nodeid — ord 는 노선 개편 시 흔들릴 수 있다
+                # routeno/routetp/cityCode/nodenm/좌표는 coverage.sqlite 의
+                # route 테이블에서 routeid 로 조인한다 — 행마다 반복 저장하지 않는다.
                 rows.append({
                     "t": obs.isoformat(), "t_prev": prev[1].isoformat(),
-                    "routeid": routeid, "routeno": p["routeno"], "routetp": p["routetp"],
-                    "cityCode": p["cityCode"], "vehicleno": v,
+                    "routeid": routeid, "vehicleno": v,
                     "from_ord": prev[0], "to_ord": ordv,
-                    "nodeid": b.get("nodeid"), "nodenm": b.get("nodenm"),
-                    "gpslati": b.get("gpslati"), "gpslong": b.get("gpslong"),
+                    "nodeid": b.get("nodeid"),
                     "band": band, "daytype": dtype,
                 })
                 if band is not None:
