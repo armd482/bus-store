@@ -32,7 +32,9 @@ def kill_manual():
     """수동으로 띄운 server.py 도 내린다 — 모드와 무관하게 '완전 종료'가 되도록."""
     if os.name == "nt":
         return  # 윈도우는 스케줄러 /End 가 배치 트리를 내린다
-    run(["pkill", "-f", "python3? .*server\\.py"], ok_fail=True)
+    # ⚠️ -i 필수 — macOS 프레임워크 파이썬은 프로세스명이 대문자 'Python' 이라
+    #    소문자 패턴이 빗나간다 (✅ 실측: stop 이 수동 실행분을 못 내렸다).
+    run(["pkill", "-if", r"python[^ ]* server\.py"], ok_fail=True)
 
 
 # ── macOS — launchd ──────────────────────────────────────────────────

@@ -47,17 +47,20 @@ def snapshot():
     routes = c.execute("SELECT COUNT(*), COALESCE(SUM(nstops),0) FROM route").fetchone()
     nroute, nstops = routes
     nseg = max(0, nstops - nroute)
-    goal = nseg * nb  # 평일 기준 목표 셀
+    wd = O.WEEKDAYS
+    ph = ",".join("?" * len(wd))
+    goal = nseg * nb * len(wd)     # 평일(월~금 분리) 기준 목표 셀
+    day_goal = nseg * nb           # 요일 하나 기준 — 요일별 진행률의 분모
 
-    done = c.execute("SELECT COUNT(*) FROM cell WHERE daytype='weekday' AND n >= ?", (tgt,)).fetchone()[0]
-    seen = c.execute("SELECT COUNT(*) FROM cell WHERE daytype='weekday'").fetchone()[0]
+    done = c.execute(f"SELECT COUNT(*) FROM cell WHERE daytype IN ({ph}) AND n >= ?", (*wd, tgt)).fetchone()[0]
+    seen = c.execute(f"SELECT COUNT(*) FROM cell WHERE daytype IN ({ph})", wd).fetchone()[0]
     total = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
 
-    # 밴드별 (평일)
+    # 밴드별 (평일 5요일 합)
     byband = {b: (n, cells) for b, n, cells in c.execute(
-        "SELECT band, SUM(n), COUNT(*) FROM cell WHERE daytype='weekday' GROUP BY band")}
+        f"SELECT band, SUM(n), COUNT(*) FROM cell WHERE daytype IN ({ph}) GROUP BY band", wd)}
     band_rows = []
-    seg_per_band = nseg or 1
+    seg_per_band = (nseg * len(wd)) or 1
     for i, (a, b) in enumerate(bands):
         n, cells = byband.get(i, (0, 0))
         band_rows.append({
@@ -66,11 +69,11 @@ def snapshot():
             "peak": (a, b) in ((7, 9), (17, 20)),
         })
 
-    # 요일별
+    # 요일별 — 분모는 요일 하나 기준(day_goal)이다. 전체 goal 로 나누면 5배 과소.
     byday = {}
     for d, n, cells in c.execute("SELECT daytype, SUM(n), COUNT(*) FROM cell GROUP BY daytype"):
         full = c.execute("SELECT COUNT(*) FROM cell WHERE daytype=? AND n>=?", (d, tgt)).fetchone()[0]
-        byday[d] = {"obs": n, "cells": cells, "done": full, "pct": full / goal if goal else 0}
+        byday[d] = {"obs": n, "cells": cells, "done": full, "pct": full / day_goal if day_goal else 0}
 
     # 쿼터는 달력일 키다 (data.go.kr 자정 리셋) — 운행일(service_day)이 아니다
     calls = bus_collector.read_calls(bus_collector.quota_day(datetime.now(O.KST))) if bus_collector else 0
@@ -90,7 +93,7 @@ def snapshot():
                 eta = remain / per_day
 
     return {
-        "routes": nroute, "segments": nseg, "goal": goal, "target": tgt,
+        "routes": nroute, "segments": nseg, "goal": goal, "dayGoal": day_goal, "target": tgt,
         "done": done, "seen": seen, "total": total,
         "pct": done / goal if goal else 0,
         "bands": band_rows, "days": byday,
@@ -169,7 +172,7 @@ async function tick(){
   h += '</div>';
 
   // 밴드
-  h += '<h2>밴드별 (평일) — 컴퓨터가 꺼진 시간대는 영원히 0이다</h2>';
+  h += '<h2>밴드별 (평일 5요일 합) — 컴퓨터가 꺼진 시간대는 영원히 0이다</h2>';
   for(const b of d.bands){
     const label = `${String(b.from).padStart(2,'0')}-${String(b.to).padStart(2,'0')}시`;
     const stale = b.obs===0;
@@ -178,13 +181,15 @@ async function tick(){
        + `<div class=val>${num(b.obs)} ${stale?'<span class=bad>⚠ 관측 없음</span>':''}</div></div>`;
   }
 
-  // 요일
-  h += '<h2>요일별 — 토·일은 주 1일씩만 얻는다</h2><table>';
-  for(const [k,label] of [['weekday','평일'],['sat','토요일'],['sun','일요일']]){
-    const v = d.days[k] || {obs:0,done:0,pct:0};
-    const note = k!=='weekday' ? `<span class=tag>목표 ${d.target}샘플이면 ${d.target}주</span>` : '';
-    h += `<tr><td width=70>${label}${note}</td><td width=280>${bar(v.pct, k==='weekday'?'':'warn')}</td>
-          <td class=n>${num(v.obs)}건</td></tr>`;
+  // 요일 — 7종 전부 분리. 모든 요일이 주 1일씩만 얻는다 (목표 7샘플 = 요일당 7주)
+  h += `<h2>요일별 완성률 (전부 분리) — 각 요일은 주 1일씩만 얻는다: 목표 ${d.target}샘플이면 요일당 ${d.target}주</h2><table>`;
+  for(const [k,label] of [['mon','월'],['tue','화'],['wed','수'],['thu','목'],['fri','금'],['sat','토'],['sun','일']]){
+    const v = d.days[k] || {obs:0,done:0,cells:0,pct:0};
+    h += `<tr><td width=40>${label}</td>
+          <td class=n width=64><b>${pct(v.pct)}</b></td>
+          <td width=250>${bar(v.pct, (k==='sat'||k==='sun')?'warn':'')}</td>
+          <td class=n style="white-space:nowrap">${num(v.done)} / ${num(d.dayGoal)} 셀</td>
+          <td class=n style="white-space:nowrap;opacity:.6">${num(v.obs)}건</td></tr>`;
   }
   h += '</table>';
 

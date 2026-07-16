@@ -67,14 +67,21 @@ def service_day_of(t):
     return t - timedelta(hours=4)
 
 
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri")
+
+
 def day_type(t):
     """⚠️ 벽시계가 아니라 운행일 기준이다.
 
     토요일 01:30 에 도는 버스는 금요일 막차다. t.weekday() 를 그대로 쓰면
     금요일 막차가 '토요일' 표본으로 잘못 들어간다.
+
+    ⚠️ 요일 7종 전부 분리 (2026-07-17 결정). 비용을 알고 용인했다:
+    각 요일은 주 1일씩만 얻으므로 목표 7샘플 = 요일당 7주
+    (평일 통합이던 이전 판은 1.4주). 요일별 주행시간 차이를 직접 보기 위함.
+    규칙을 되돌리려면 day_type 을 고치고 rebuild — 요일은 t 에서 재계산된다.
     """
-    wd = service_day_of(t).weekday()
-    return "sun" if wd == 6 else "sat" if wd == 5 else "weekday"
+    return ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[service_day_of(t).weekday()]
 
 
 def band_of(t, bands):
@@ -148,17 +155,18 @@ def bump(conn, routeid, from_ord, to_ord, band, daytype, k=1):
 
 
 def route_progress(conn, target, nbands):
-    """노선별 (충족 셀, 목표 셀, 관측된 셀). 목표 셀 = 구간수 × 밴드수 (평일 기준)."""
-    rows = conn.execute("""
+    """노선별 (충족 셀, 목표 셀, 관측된 셀). 목표 셀 = 구간수 × 밴드수 × 평일 5요일."""
+    ph = ",".join("?" * len(WEEKDAYS))
+    rows = conn.execute(f"""
       SELECT r.routeid, r.routeno, r.routetp, r.cityCode, r.nstops,
-             COALESCE(SUM(CASE WHEN c.n >= ? AND c.daytype='weekday' THEN 1 ELSE 0 END), 0),
-             COALESCE(SUM(CASE WHEN c.daytype='weekday' THEN 1 ELSE 0 END), 0)
+             COALESCE(SUM(CASE WHEN c.n >= ? AND c.daytype IN ({ph}) THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN c.daytype IN ({ph}) THEN 1 ELSE 0 END), 0)
       FROM route r LEFT JOIN cell c ON c.routeid = r.routeid
       GROUP BY r.routeid
-    """, (target,)).fetchall()
+    """, (target, *WEEKDAYS, *WEEKDAYS)).fetchall()
     out = []
     for rid, no, tp, city, nstops, done, seen in rows:
-        goal = max(1, (nstops - 1)) * nbands  # 구간수 × 밴드수
+        goal = max(1, (nstops - 1)) * nbands * len(WEEKDAYS)  # 구간수 × 밴드수 × 요일수
         out.append({
             "routeid": rid, "routeno": no, "routetp": tp, "cityCode": city,
             "goal": goal, "done": done, "seen": seen,
@@ -253,7 +261,7 @@ def status():
     seen = sum(p["seen"] for p in prog)
     total_obs = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
 
-    print(f"=== 커버리지 (평일 · 목표 {tgt}샘플 · 시간대 {nb}개) ===")
+    print(f"=== 커버리지 (평일 5요일 분리 · 목표 {tgt}샘플 · 시간대 {nb}개) ===")
     print(f"  노선      {len(prog):,}개 중 완주 {len(done_routes):,}")
     print(f"  셀        {done:,} / {goal:,} 충족 ({done/goal*100 if goal else 0:.1f}%)")
     print(f"  관측된 셀  {seen:,} ({seen/goal*100 if goal else 0:.1f}%)  ← 한 번이라도 본 것")
@@ -265,11 +273,10 @@ def status():
         remain_cells = goal - done
         rate = min(k["maxRoutes"], len(prog) - len(done_routes))
         if rate:
-            avg_goal = goal / max(1, len(prog))
             rounds = max(1, (len(prog) - len(done_routes)) / rate)
-            days_per_round = tgt / per_cell_day
-            print(f"\n  추정: 라운드 {rounds:.1f}회 × {days_per_round:.1f}일 = 약 {rounds*days_per_round:.0f}일 (평일 기준)")
-            print(f"        ⚠️ 토·일은 주 1일씩만 얻으므로 별도. 목표 {tgt}샘플이면 {tgt}주.")
+            weeks_per_round = tgt / per_cell_day  # 각 요일은 주 1회씩만 발생 → 주 단위
+            print(f"\n  추정: 라운드 {rounds:.1f}회 × {weeks_per_round:.1f}주 = 약 {rounds*weeks_per_round:.0f}주")
+            print(f"        ⚠️ 요일 7종 전부 분리라 모든 요일이 주 1일씩만 채워진다 — 목표 {tgt}샘플이면 요일당 {tgt}주가 하한.")
 
     print(f"\n=== 진행 중 상위/하위 ===")
     live = sorted([p for p in prog if p["pct"] < 1.0], key=lambda p: -p["pct"])
@@ -331,7 +338,15 @@ def rebuild(force):
                 continue
             if to <= fo:
                 continue  # 회차 아티팩트(168→1 등) — 수집기와 같은 기준으로 거른다
-            key = (r["routeid"], fo, to, b, r.get("daytype", "weekday"))
+            # 요일은 저장값이 아니라 t 에서 다시 계산한다 — 분류 규칙이 바뀌어도
+            # (weekday 통합 → 월~일 분리) 옛 행이 새 규칙으로 재분류되도록.
+            # band 는 저장값을 쓴다: 밴드 정의가 바뀌면 표본의 의미 자체가 달라지므로
+            # 수집 당시 규칙을 고정하는 게 맞다.
+            try:
+                dt = day_type(datetime.fromisoformat(r["t"]))
+            except (KeyError, ValueError):
+                continue
+            key = (r["routeid"], fo, to, b, dt)
             counts[key] = counts.get(key, 0) + 1
     c = connect()
     old = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
