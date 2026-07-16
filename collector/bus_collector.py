@@ -80,27 +80,42 @@ def add_calls(day, n):
     return v
 
 
-def paced(fn, items, rate, workers):
-    """요청을 균등하게 흘려보낸다. ⚠️ 이게 핵심이다.
+def paced(fn, items, rate, workers, max_inflight):
+    """제약이 둘이라 방어도 둘이다 — 버스트(rate) 와 동시 세션(in-flight).
 
-    ThreadPoolExecutor.map 은 워커 수만큼 한꺼번에 던지고 시작한다. 그 버스트가
-    토큰 버킷에 걸려 HTTP 429 "API token rate limit exceeded" 를 부른다.
+    ① 버스트 — 제출을 1/rate 간격으로 벌린다.
+       ThreadPoolExecutor.map 은 워커 수만큼 한꺼번에 던진다. 그 버스트가
+       토큰 버킷에 걸려 HTTP 429 "API token rate limit exceeded" 를 부른다.
+       ✅ 실측 (같은 평균 rate, 다른 결과):
+           균등 6.0/s (제출 간격 167ms) → 88건 전부 성공, 429 0건
+           버스트 6.7/s (20개 동시)     → 180건 중 140건 실패
+         → 문제는 rate 가 아니라 버스트다.
+           균등 2/4/6 /s = 무결점. 10/s 부터 429·세션99 가 섞이기 시작(141/144).
 
-    ✅ 실측 (같은 평균 rate, 다른 결과):
-        균등 6.0/s (제출 간격 167ms) → 88건 전부 성공, 429 0건
-        버스트 6.7/s (20개 동시)     → 180건 중 140건 실패
-      → 문제는 rate 가 아니라 버스트다.
-        균등 2/4/6 /s = 무결점. 10/s 부터 429·세션99 가 섞이기 시작(141/144).
-
-    제출을 1/rate 초 간격으로 벌리면 in-flight 는 rate × 응답시간(~3s) ≈ 18개로
-    수렴하므로 동시 세션 30 상한에도 안 걸린다.
+    ② 동시 세션 30 — 세마포어로 in-flight 를 직접 센다.
+       ⚠️ rate 만으로 맞추려던 게 틀렸다. in-flight = rate × 응답시간인데
+          응답시간은 우리가 정하는 값이 아니다.
+       ✅ 실측: 응답 중앙값 2.48s / 평균 2.26s / **최대 4.99s**.
+           중앙값이면 6×2.5 = 15 로 여유롭지만, 꼬리에서 6×5 = 30 → 상한 정통.
+           그래서 실패가 평균이 아니라 꼬리에서 터졌다 (170노선 사이클 3.5%).
+       세마포어를 걸면 응답이 얼마나 느려지든 세션은 안 넘는다. 대신 느려지면
+       제출이 알아서 막혀 사이클이 길어진다 — 데이터를 버리는 것보다 낫다.
     """
+    sem = __import__("threading").Semaphore(max_inflight)
+
+    def guarded(it):
+        try:
+            return fn(it)
+        finally:
+            sem.release()
+
     out = [None] * len(items)
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    with ThreadPoolExecutor(max_workers=max(workers, max_inflight)) as ex:
         futs = {}
         for i, it in enumerate(items):
-            futs[ex.submit(fn, it)] = i
-            time.sleep(1.0 / rate)
+            sem.acquire()          # in-flight 상한 — 넘치면 여기서 막힌다
+            futs[ex.submit(guarded, it)] = i
+            time.sleep(1.0 / rate)  # 버스트 방지 — 상한에 안 걸려도 항상 벌린다
         for f, i in futs.items():
             out[i] = f.result()
     return out
@@ -145,6 +160,7 @@ def main():
     bands, target, nb = k["timebands"], k["targetSamples"], len(k["timebands"])
     interval, quota, maxr = k["intervalSec"], k["dailyQuota"], k["maxRoutes"]
     workers, rate = k["maxWorkers"], k["dispatchRate"]
+    inflight = k["maxInflight"]
     window = k["serviceWindow"]
 
     day = service_day(now())
@@ -198,14 +214,31 @@ def main():
             continue
 
         started = time.time()
-        results = paced(lambda p: fetch(key, p["cityCode"], p["routeid"]), picked, rate, workers)
-        add_calls(day, len(picked))
+        with LOCK:
+            STATE["fetching"] = True
+        meta = {p["routeid"]: p for p in picked}
+        results = paced(lambda p: fetch(key, p["cityCode"], p["routeid"]), picked, rate, workers, inflight)
+        calls = len(picked)
+
+        # code99(세션 고갈)는 일시적이다 — 꼬리 지연이 세션 30개를 채우는 순간에만
+        # 몰리고 몇 초 뒤엔 풀린다 (✅ 실측: 사이클별 실패 7→8→0). rate/inflight 를
+        # 더 조이면 사이클만 길어지므로, 실패분만 잠깐 뒤에 한 번 더 흘린다.
+        failed = [meta[rid] for rid, _, err in results if err]
+        if failed and read_calls(day) + calls + len(failed) <= quota:
+            time.sleep(2)  # 세션이 빠질 틈
+            retry = {rid: (rid, items, err)
+                     for rid, items, err in paced(
+                         lambda p: fetch(key, p["cityCode"], p["routeid"]),
+                         failed, rate, workers, inflight)}
+            calls += len(failed)
+            results = [retry.get(r[0], r) if r[2] else r for r in results]
+
+        add_calls(day, calls)
         cyc += 1
 
         obs = now()
         band = O.band_of(obs, bands)
         dtype = O.day_type(obs)
-        meta = {p["routeid"]: p for p in picked}
         rows, bumps = [], []
         moving = 0
         errs = {}
@@ -254,16 +287,23 @@ def main():
             STATE["moving"] = moving
             STATE["written"] = written
             STATE["errors"] = errs
+            STATE["retried"] = len(failed)
             STATE["night"] = False
+            STATE["fetching"] = False
 
         # 실패는 항상 보인다. 조용히 데이터를 버리는 게 제일 나쁘다.
+        nerr = sum(errs.values())
+        ok = len(picked) - nerr
+        rec = len(failed) - nerr  # 재시도로 회복된 수
+        print(f"[{obs:%H:%M:%S}] 응답 {ok}/{len(picked)}노선 · 운행 {moving}대 · "
+              f"통과 +{len(rows)} (누적 {written:,}) · {took:.0f}s"
+              + (f" · 재시도 {len(failed)}→회복 {rec}" if failed else ""), flush=True)
         if errs:
             top = sorted(errs.items(), key=lambda x: -x[1])[:2]
             detail = " ".join(f"{k}×{v}" for k, v in top)
-            print(f"[{obs:%H:%M:%S}] ⚠️ 실패 {sum(errs.values())}/{len(picked)} — {detail}", flush=True)
+            print(f"[{obs:%H:%M:%S}] ⚠️ 실패 {nerr}/{len(picked)} (재시도 후) — {detail}", flush=True)
         if cyc % 20 == 0:
-            print(f"[{obs:%H:%M:%S}] 콜 {read_calls(day):,}/{quota:,} · {len(picked)}노선 · "
-                  f"운행 {moving}대 · 통과 {written:,}건 · {took:.0f}s", flush=True)
+            print(f"[{obs:%H:%M:%S}] 콜 {read_calls(day):,}/{quota:,}", flush=True)
 
         # 지터는 max 안에. 밖에 두면 took > interval 일 때 음수가 되어 죽는다.
         time.sleep(max(1.0, interval - took + random.uniform(-2, 2)))

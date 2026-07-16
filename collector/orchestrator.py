@@ -30,6 +30,17 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+# ⚠️ 윈도우 방어. 모든 스크립트가 이 모듈을 import 하므로 여기서 한 번만 한다.
+#    윈도우의 기본 stdout 인코딩은 cp949 라 로그의 한글·이모지에서 UnicodeEncodeError 로 죽는다.
+#    ✅ 재현: PYTHONIOENCODING=cp949 → "⚠️ 실패" 출력에서 크래시.
+#    하필 그 줄은 API 실패 시에만 타는 경로다 → 잘 돌다가 첫 실패에 수집기가 통째로 죽는다.
+#    errors="replace" 까지 두는 건, 로그 한 글자 때문에 수집이 멈추는 일은 없어야 하기 때문.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass  # 파이프로 감싸였거나 3.7 미만
+
 KST = timezone(timedelta(hours=9))
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")

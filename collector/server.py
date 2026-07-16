@@ -32,6 +32,7 @@ except Exception:
 STATE = {
     "started": None, "cycles": 0, "lastObs": None, "lastCycleSec": None,
     "picked": 0, "moving": 0, "errors": {}, "written": 0, "night": False,
+    "fetching": False,  # 지금 API 요청 사이클이 도는 중인가 (대시보드 표시용)
 }
 LOCK = threading.Lock()
 
@@ -134,8 +135,10 @@ const pct = x => (x*100).toFixed(1)+'%';
 const num = x => (x||0).toLocaleString();
 function bar(p, cls){ return `<div class=bar><div class="fill ${cls||''}" style="width:${Math.min(100,p*100)}%"></div></div>`; }
 
+let S = null;  // 최근 /api 응답 — 1초 타이머(paintObs)가 참조한다
 async function tick(){
   const d = await (await fetch('/api')).json();
+  S = d;
   const s = d.state;
   const alive = s.lastObs && (Date.now()/1000 - s.lastObs) < 180;
 
@@ -159,8 +162,7 @@ async function tick(){
         <div class=k>/ ${num(d.quota)} (${pct(q)})</div></div>`;
   h += `<div class=card><div class=k>실패율</div><div class="v ${errRate>.05?'bad':errRate>.02?'warn':'ok'}">${pct(errRate)}</div>
         <div class=k>${Object.entries(s.errors).map(([k,v])=>k+'×'+v).join(' ')||'없음'}</div></div>`;
-  h += `<div class=card><div class=k>마지막 관측</div><div class="v ${alive?'ok':'bad'}">${
-        s.lastObs? Math.round(Date.now()/1000-s.lastObs)+'초 전':'—'}</div>
+  h += `<div class=card><div class=k>마지막 관측</div><div class=v id=lastobs>—</div>
         <div class=k>사이클 ${s.lastCycleSec?s.lastCycleSec.toFixed(0)+'s':'—'} · ${s.picked}노선${s.night?' (심야)':''}</div></div>`;
   h += `<div class=card><div class=k>총 관측</div><div class=v>${num(d.total)}</div>
         <div class=k>운행 ${num(s.moving)}대</div></div>`;
@@ -193,8 +195,23 @@ async function tick(){
   h += '</table>';
 
   document.getElementById('app').innerHTML = h;
+  paintObs();
 }
-tick(); setInterval(tick, 5000);
+
+// 마지막 관측 타이머 — /api 폴링(5초)과 별개로 1초마다 다시 그린다.
+// 수집기가 요청 사이클 중이면 '데이터 요청 중' 태그를 함께 띄운다.
+// (사이클의 대부분이 요청 시간이라, 타이머를 통째로 바꾸면 거의 항상 가려진다)
+function paintObs(){
+  const el = document.getElementById('lastobs');
+  if(!el || !S) return;
+  const s = S.state;
+  const secs = s.lastObs ? Math.round(Date.now()/1000 - s.lastObs) : null;
+  const alive = secs != null && secs < 180;
+  el.className = 'v ' + (alive ? 'ok' : 'bad');
+  el.innerHTML = (secs != null ? secs + '초 전' : '—')
+    + (s.fetching ? ' <span class=tag style="background:#3b82f622;color:#3b82f6">데이터 요청 중</span>' : '');
+}
+tick(); setInterval(tick, 5000); setInterval(paintObs, 1000);
 </script>
 """
 
@@ -238,7 +255,17 @@ def main():
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"대시보드 http://localhost:{args.port}  (수집 {'끔' if args.no_collect else '켬'})", flush=True)
-    srv.serve_forever()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        # Ctrl-C 정상 종료. 수집 스레드는 daemon 이라 함께 죽는다 — 사이클 중간이어도
+        # 안전하다: sqlite 는 WAL + 사이클 단위 commit, jsonl 은 줄 단위 append,
+        # 콜 카운터는 os.replace 원자 쓰기.
+        # ⚠️ os._exit 인 이유: daemon 스레드가 print 중(stdout 락 보유)에 인터프리터가
+        #    finalize 되면 "_enter_buffered_busy ... could not acquire lock" 으로 abort 한다.
+        #    finalize 를 건너뛰면 그 경합 자체가 없다.
+        print("\n종료", flush=True)
+        os._exit(0)
 
 
 if __name__ == "__main__":
