@@ -190,7 +190,11 @@ def main():
         want = maxr
 
         # 노선 재선정 — 채운 노선은 빠지고 미커버가 들어온다
-        if not picked or cyc % REPICK_EVERY == 0 or len(picked) != want:
+        # ⚠️ len(picked) != want 로 매 사이클 재선정하지 않는다 — 심야엔 운행 노선이
+        #    상한보다 적은 게 정상이라, 그 조건이면 밤새 사이클마다 무거운 커버리지
+        #    쿼리(cell 전체 GROUP BY)를 돌리고 로그도 도배된다. 모자랄 땐
+        #    10사이클(~7분)마다만 다시 본다 — 새벽 운행 재개도 그 안에 잡힌다.
+        if not picked or cyc % REPICK_EVERY == 0 or (len(picked) < want and cyc % 10 == 0):
             picked = O.pick_routes(conn, want, target, nb, t=t)
             if not picked:
                 # ⚠️ 빈 풀과 완주를 구분한다. 안 그러면 새로 배포한 사람이
@@ -255,6 +259,13 @@ def main():
                 last[v] = (ordv, obs)
                 if prev is None or prev[0] == ordv:
                     continue  # 처음 보거나 아직 같은 정류장
+                if (obs - prev[1]).total_seconds() > interval * 4:
+                    # ⚠️ 유령 통과 방지 — 노선이 재선정에서 빠졌다 돌아오면 prev 가
+                    #    1시간+ 전 것이다. 그걸 전이로 치면 폭 1시간짜리 '통과'가 정상
+                    #    샘플처럼 셀에 들어간다 (최악: 우연히 인접 정류장이면 감지 불가).
+                    #    첫 관측으로 취급하고 버린다. 4×interval 인 이유: 실패 1사이클
+                    #    (~90s 공백)은 기존처럼 기록하고, 그 이상 공백만 자른다.
+                    continue
                 p = meta[routeid]
                 rows.append({
                     "t": obs.isoformat(), "t_prev": prev[1].isoformat(),

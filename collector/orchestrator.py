@@ -19,8 +19,13 @@
    평일부터 채우고 주말은 뒤에 붙일 것.
 
 사용:
-  python3 orchestrator.py status     진행률
-  python3 orchestrator.py routes     다음 사이클에 폴링할 노선
+  python3 orchestrator.py status         진행률
+  python3 orchestrator.py routes         다음 사이클에 폴링할 노선
+  python3 orchestrator.py reset --yes    관측 카운트 초기화 (아래 주의)
+
+⚠️ 데이터(jsonl)와 장부(cell)는 따로다 — jsonl 을 지웠으면 reset 도 해야 한다.
+   장부만 남으면 "이미 채웠다"고 믿어 그 구간을 다시 안 찍는다: 영구 구멍.
+   반대로 장부만 지우면 재수집할 뿐이라 안전하다 (중복 데이터, 쿼터 낭비).
 """
 
 import json
@@ -271,6 +276,25 @@ def status():
         print(f"  {p['routeno']:<6} {p['routetp'][:4]:<4} {p['pct']*100:5.1f}%  ({p['done']:,}/{p['goal']:,})")
 
 
+def reset(force):
+    """관측 카운트(cell) + 관측 파생 상태(emptyStreak/lastSeen) 초기화.
+
+    노선 풀(route)과 일 콜 카운터(.buscalls-*)는 **유지한다** —
+    풀은 다시 받으려면 4,400콜이고, 콜 카운터는 오늘 실제로 쓴 쿼터라
+    지우면 50만 상한을 넘겨 그날 수집이 죽을 수 있다.
+    """
+    c = connect()
+    n = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
+    if not force:
+        sys.exit(f"관측 {n:,}건이 지워진다. jsonl 데이터도 같이 지울 것(rm data/bus-*.jsonl).\n"
+                 f"정말이면: python3 orchestrator.py reset --yes")
+    c.execute("DELETE FROM cell")
+    c.execute("UPDATE route SET emptyStreak = 0, lastSeen = NULL")
+    c.commit()
+    print(f"관측 {n:,}건 초기화. 노선 풀·일 콜 카운터는 유지 (쿼터는 실사용이라 지우면 안 된다).")
+    print("수집기가 돌고 있었다면 재시작할 것 — 메모리의 누적 카운터(written)는 별개다.")
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     if cmd == "status":
@@ -280,8 +304,10 @@ def main():
         k = cfg()
         for p in pick_routes(c, k["maxRoutes"], k["targetSamples"], len(k["timebands"])):
             print(f"{p['routeid']}\t{p['cityCode']}\t{p['routeno']}\t{p['pct']*100:.1f}%")
+    elif cmd == "reset":
+        reset("--yes" in sys.argv[2:])
     else:
-        sys.exit(f"모르는 명령: {cmd}  (status | routes)")
+        sys.exit(f"모르는 명령: {cmd}  (status | routes | reset)")
 
 
 if __name__ == "__main__":

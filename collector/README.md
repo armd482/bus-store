@@ -8,7 +8,7 @@
 
 ```bash
 cp .env.example .env      # 키를 채운다. 발급처는 .env.example 안에.
-python3 fetch_routes.py   # 노선 풀 — 경기 2,200노선, 약 6분. 처음 한 번만.
+python3 fetch_routes.py   # 노선 풀 — 경기 2,200노선(정류소 수 + 운행시간), 약 10분. 처음 한 번만.
 python3 server.py         # 수집 + 대시보드 → http://localhost:877
 ```
 
