@@ -97,12 +97,25 @@ def connect():
     # 노선 풀 — fetch_routes.py 가 채운다
     c.execute("""
       CREATE TABLE IF NOT EXISTS route (
-        routeid  TEXT PRIMARY KEY,
-        cityCode INTEGER NOT NULL,
-        routeno  TEXT,
-        routetp  TEXT,
-        nstops   INTEGER DEFAULT 0
+        routeid     TEXT PRIMARY KEY,
+        cityCode    INTEGER NOT NULL,
+        routeno     TEXT,
+        routetp     TEXT,
+        nstops      INTEGER DEFAULT 0,
+        startvt     TEXT,               -- 첫차 'HHMM' — pick_routes 의 운행시간 필터(§2.6)
+        endvt       TEXT,               -- 막차 출발 'HHMM'. ⚠️ 도착이 아니다
+        emptyStreak INTEGER DEFAULT 0,  -- 연속 0대 반환 횟수 — 관측이 정하는 후순위
+        lastSeen    REAL                -- 마지막으로 버스가 보인 시각
       )""")
+
+    # 기존 DB 마이그레이션 — CREATE TABLE IF NOT EXISTS 는 이미 있는 테이블에 컬럼을 안 붙인다.
+    # ⚠️ 이걸 빠뜨려 배포본에만 손으로 ALTER 했다가, 새 기계에서 'no such column: startvt' 로 죽었다.
+    have = {r[1] for r in c.execute("PRAGMA table_info(route)")}
+    for col, decl in (("startvt", "TEXT"), ("endvt", "TEXT"),
+                      ("emptyStreak", "INTEGER DEFAULT 0"), ("lastSeen", "REAL")):
+        if col not in have:
+            c.execute(f"ALTER TABLE route ADD COLUMN {col} {decl}")
+    c.commit()
     return c
 
 

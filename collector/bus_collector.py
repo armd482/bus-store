@@ -177,8 +177,17 @@ def main():
         if not picked or cyc % REPICK_EVERY == 0 or len(picked) != want:
             picked = O.pick_routes(conn, want, target, nb, t=t)
             if not picked:
-                print(f"[{t:%H:%M:%S}] 모든 노선 완주 — 대기", flush=True)
-                time.sleep(600)
+                # ⚠️ 빈 풀과 완주를 구분한다. 안 그러면 새로 배포한 사람이
+                #    "모든 노선 완주"를 보고 정상인 줄 안다.
+                pool = conn.execute("SELECT COUNT(*) FROM route").fetchone()[0]
+                if pool == 0:
+                    print(f"[{t:%H:%M:%S}] ❌ 노선 풀이 비어 있다 — 먼저 `python3 fetch_routes.py` 를 돌릴 것",
+                          flush=True)
+                    time.sleep(60)
+                else:
+                    print(f"[{t:%H:%M:%S}] 폴링할 노선 없음 (풀 {pool:,}) — "
+                          f"전부 완주했거나 지금 운행 중인 노선이 없다", flush=True)
+                    time.sleep(600)
                 continue
             print(f"[{t:%H:%M:%S}] 노선 재선정: {len(picked)}개 "
                   f"(진행률 {picked[0]['pct']*100:.1f}% ~ {picked[-1]['pct']*100:.1f}%)", flush=True)
