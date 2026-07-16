@@ -19,12 +19,17 @@
    평일부터 채우고 주말은 뒤에 붙일 것.
 
 사용:
-  python3 orchestrator.py status         진행률
-  python3 orchestrator.py routes         다음 사이클에 폴링할 노선
-  python3 orchestrator.py reset --yes    관측 카운트 초기화 (아래 주의)
+  python3 orchestrator.py status           진행률
+  python3 orchestrator.py routes           다음 사이클에 폴링할 노선
+  python3 orchestrator.py reset --yes      관측 카운트 전체 초기화 (아래 주의)
+  python3 orchestrator.py rebuild --yes    장부를 jsonl 데이터에서 재계산
 
-⚠️ 데이터(jsonl)와 장부(cell)는 따로다 — jsonl 을 지웠으면 reset 도 해야 한다.
-   장부만 남으면 "이미 채웠다"고 믿어 그 구간을 다시 안 찍는다: 영구 구멍.
+⚠️ 데이터(jsonl)와 장부(cell)는 따로다 — 아무도 jsonl 을 다시 읽지 않으므로
+   파일이나 행을 지워도 장부는 모른다. 장부만 남으면 "이미 채웠다"고 믿어
+   그 구간을 다시 안 찍는다: 영구 구멍. 데이터를 지웠으면:
+     전부 지웠다  → reset --yes  (장부도 0으로)
+     일부만 지웠다 → rebuild --yes (남은 jsonl 로 장부 재계산 — 행에 band/daytype
+                     이 박혀 있어 정확히 재현된다)
    반대로 장부만 지우면 재수집할 뿐이라 안전하다 (중복 데이터, 쿼터 낭비).
 """
 
@@ -295,6 +300,44 @@ def reset(force):
     print("수집기가 돌고 있었다면 재시작할 것 — 메모리의 누적 카운터(written)는 별개다.")
 
 
+def rebuild(force):
+    """장부(cell)를 jsonl 데이터에서 재계산 — 데이터 일부를 지웠거나 장부가 의심될 때.
+
+    행에 band/daytype 이 저장돼 있어 수집 당시와 동일하게 재현된다.
+    band 가 없는 행(밴드 밖 03-04시 관측)은 원래도 장부에 안 들어갔으므로 건너뛴다.
+    emptyStreak/lastSeen 은 jsonl 에 이력이 없으므로 건드리지 않는다.
+    ⚠️ 수집기를 멈추고 돌릴 것 — 재계산 중 들어온 관측은 교체 때 유실된다.
+    """
+    import glob
+    files = sorted(glob.glob(os.path.join(DATA, "bus-*.jsonl")))
+    if not force:
+        sys.exit(f"jsonl {len(files)}개 파일에서 장부를 다시 계산해 cell 을 통째로 교체한다.\n"
+                 f"수집기를 먼저 멈출 것. 정말이면: python3 orchestrator.py rebuild --yes")
+    counts = {}
+    bad = 0
+    for p in files:
+        for line in open(p, encoding="utf-8"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                bad += 1  # 강제종료로 잘린 마지막 줄 등 — 한 줄 손상은 한 줄만 버린다
+                continue
+            b = r.get("band")
+            if b is None:
+                continue
+            key = (r["routeid"], r["from_ord"], r["to_ord"], b, r.get("daytype", "weekday"))
+            counts[key] = counts.get(key, 0) + 1
+    c = connect()
+    old = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
+    c.execute("DELETE FROM cell")
+    c.executemany("INSERT INTO cell(routeid,from_ord,to_ord,band,daytype,n) VALUES(?,?,?,?,?,?)",
+                  [k + (n,) for k, n in counts.items()])
+    c.commit()
+    print(f"재계산 완료: 파일 {len(files)}개 → 관측 {sum(counts.values()):,}건 · 셀 {len(counts):,}개 "
+          f"(이전 장부 {old:,}건" + (f" · 깨진 줄 {bad}" if bad else "") + ")")
+    print("수집기가 돌고 있었다면 재시작할 것.")
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     if cmd == "status":
@@ -306,8 +349,10 @@ def main():
             print(f"{p['routeid']}\t{p['cityCode']}\t{p['routeno']}\t{p['pct']*100:.1f}%")
     elif cmd == "reset":
         reset("--yes" in sys.argv[2:])
+    elif cmd == "rebuild":
+        rebuild("--yes" in sys.argv[2:])
     else:
-        sys.exit(f"모르는 명령: {cmd}  (status | routes | reset)")
+        sys.exit(f"모르는 명령: {cmd}  (status | routes | reset | rebuild)")
 
 
 if __name__ == "__main__":

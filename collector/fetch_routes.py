@@ -13,6 +13,7 @@
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,10 @@ from concurrent.futures import ThreadPoolExecutor
 import orchestrator as O
 
 BASE = "https://apis.data.go.kr/1613000/BusRouteInfoInqireService"
+
+# ⚠️ 25 로 돌렸다가 code99(세션 30/30)로 죽었다. 워커당 순차 2콜이라 in-flight ≤ 워커수인데,
+#    서버 쪽 세션이 응답 후 바로 안 빠져 상한에 너무 붙으면 꼬리에서 터진다 (수집기 실측과 동일).
+WORKERS = 15
 
 
 def load_key():
@@ -37,19 +42,34 @@ def load_key():
     return None
 
 
-def get(key, op, **kw):
+def get(key, op, retries=3, **kw):
     """⚠️ 실패가 HTTP 200 으로 온다 — resultCode 를 확인하고 아니면 예외를 던진다.
-    이걸 안 보면 세션 초과(code99)가 빈 목록으로 둔갑해 nstops=0 이 조용히 저장된다."""
+    이걸 안 보면 세션 초과(code99)가 빈 목록으로 둔갑해 nstops=0 이 조용히 저장된다.
+
+    code99(세션 고갈)와 네트워크 오류는 일시적이라 백오프(2·4·8s) 후 재시도한다.
+    시군 목록 같은 최상위 호출이 일시 오류 한 방에 전체 실행을 죽이지 않게.
+    나머지 코드(키 오류 등)는 재시도해도 같으므로 즉시 던진다."""
     q = urllib.parse.urlencode({"serviceKey": key, "_type": "json", **kw})
-    with urllib.request.urlopen(f"{BASE}/{op}?{q}", timeout=25) as r:
-        d = json.loads(r.read().decode())
-    h = d.get("response", {}).get("header", {})
-    code = str(h.get("resultCode", "?"))
-    if code not in ("00", "0"):
-        raise RuntimeError(f"code{code}:{h.get('resultMsg', '')[:40]}")
-    body = d["response"].get("body") or {}
-    it = ((body.get("items") or {}).get("item") or []) if isinstance(body, dict) else []
-    return [it] if isinstance(it, dict) else it
+    last = None
+    for i in range(retries + 1):
+        if i:
+            time.sleep(2 * 2 ** (i - 1))
+        try:
+            with urllib.request.urlopen(f"{BASE}/{op}?{q}", timeout=25) as r:
+                d = json.loads(r.read().decode())
+        except Exception as e:
+            last = e
+            continue
+        h = d.get("response", {}).get("header", {})
+        code = str(h.get("resultCode", "?"))
+        if code in ("00", "0"):
+            body = d["response"].get("body") or {}
+            it = ((body.get("items") or {}).get("item") or []) if isinstance(body, dict) else []
+            return [it] if isinstance(it, dict) else it
+        last = RuntimeError(f"code{code}:{h.get('resultMsg', '')[:40]}")
+        if code != "99":
+            break
+    raise last
 
 
 def _vt(x):
@@ -88,7 +108,7 @@ def main():
                 fails.append((rid, "stops", str(ex)[:30]))
             return rid, (n, s, e)
 
-        with ThreadPoolExecutor(max_workers=k.get("maxWorkers", 8)) as ex:
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
             details = dict(ex.map(detail, routes))
 
         for r in routes:

@@ -94,6 +94,13 @@ def rows_of(payload):
 # ── 일 호출수는 디스크에 남긴다 ─────────────────────────────────────────
 # LaunchAgent 가 KeepAlive 로 재시작하면 메모리 카운터는 0으로 리셋된다.
 # 맥이 잠들었다 깨거나 크래시가 몇 번 나면 1,000회 상한을 넘겨 그날 수집이 죽는다.
+# ⚠️ 키는 운행일(04시)이 아니라 **달력일** — 서울 열린데이터광장 쿼터가 자정에 리셋된다.
+#    운행일로 세면 04시 리셋 시점에 API 는 00-01시 콜(~48)을 이미 새 날로 세고 있어
+#    950 + 48 = 998/1,000 으로 마진이 사실상 없었다.
+
+def quota_day(t):
+    return t.strftime("%Y-%m-%d")
+
 
 def calls_path(day):
     return os.path.join(OUT_DIR, f".calls-{day}")
@@ -132,7 +139,7 @@ def main():
     last_state = {}  # trainNo -> (statnId, trainSttus)
 
     print(f"[{now():%H:%M:%S}] 수집 시작 · {LINE} · {INTERVAL_SEC}s 간격 · "
-          f"일 상한 {DAILY_CAP}회 (오늘 이미 {read_calls(day)}회 사용)", flush=True)
+          f"일 상한 {DAILY_CAP}회 (오늘 이미 {read_calls(quota_day(now()))}회 사용)", flush=True)
 
     while True:
         t = now()
@@ -148,14 +155,15 @@ def main():
             time.sleep(300)
             continue
 
-        calls = read_calls(day)
+        qday = quota_day(t)  # 쿼터는 달력일 — 운행일(day)과 자정~04시에 갈린다
+        calls = read_calls(qday)
         if calls >= DAILY_CAP:
-            print(f"[{t:%H:%M:%S}] 일 상한 {calls}/{DAILY_CAP} 도달 — 운행일 전환까지 대기", flush=True)
+            print(f"[{t:%H:%M:%S}] 일 상한 {calls}/{DAILY_CAP} 도달 — 자정 리셋까지 대기", flush=True)
             time.sleep(300)
             continue
 
         try:
-            calls = bump_calls(day)  # 호출 전에 센다 — 죽어도 과다호출로 새지 않게
+            calls = bump_calls(qday)  # 호출 전에 센다 — 죽어도 과다호출로 새지 않게
             payload = fetch(key)
             rows, err = rows_of(payload)
             if err:

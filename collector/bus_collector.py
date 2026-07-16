@@ -60,6 +60,14 @@ def service_day(t):
 
 
 # ── 일 호출수는 디스크에 (KeepAlive 재시작해도 상한을 넘지 않게) ────────
+# ⚠️ 키는 운행일(04시 경계)이 아니라 **달력일**이다 — data.go.kr 쿼터가 자정에 리셋된다.
+#    운행일로 세면 04시에 카운터만 0이 되는데 API 는 00-04시 콜(~3.7만)을 이미 새 날로
+#    세고 있어, 470,000 + 37,000 = 507,000 으로 실제 50만 상한을 넘길 수 있다.
+#    (운행일 경계는 데이터 파일·요일 분류에만 쓴다 — 그쪽은 04시가 맞다.)
+def quota_day(t):
+    return t.strftime("%Y-%m-%d")
+
+
 def calls_path(day):
     return os.path.join(O.DATA, f".buscalls-{day}")
 
@@ -168,11 +176,12 @@ def main():
     picked, cyc, written = [], 0, 0
 
     print(f"[{now():%H:%M:%S}] 수집 시작 · 목표 {target}샘플 · 밴드 {nb}개 · "
-          f"최대 {maxr}노선 · 상한 {quota:,} (오늘 {read_calls(day):,} 사용)", flush=True)
+          f"최대 {maxr}노선 · 상한 {quota:,} (오늘 {read_calls(quota_day(now())):,} 사용)", flush=True)
 
     while True:
         t = now()
         d = service_day(t)
+        qday = quota_day(t)   # 쿼터는 달력일 — 운행일(d)과 자정~04시에 갈린다
         if d != day:
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d}", flush=True)
             day, last, written, picked = d, {}, 0, []
@@ -212,7 +221,7 @@ def main():
             print(f"[{t:%H:%M:%S}] 노선 재선정: {len(picked)}개 "
                   f"(진행률 {picked[0]['pct']*100:.1f}% ~ {picked[-1]['pct']*100:.1f}%)", flush=True)
 
-        if read_calls(day) + len(picked) > quota:
+        if read_calls(qday) + len(picked) > quota:
             print(f"[{t:%H:%M:%S}] 일 상한 근접 — 대기", flush=True)
             time.sleep(300)
             continue
@@ -228,7 +237,7 @@ def main():
         # 몰리고 몇 초 뒤엔 풀린다 (✅ 실측: 사이클별 실패 7→8→0). rate/inflight 를
         # 더 조이면 사이클만 길어지므로, 실패분만 잠깐 뒤에 한 번 더 흘린다.
         failed = [meta[rid] for rid, _, err in results if err]
-        if failed and read_calls(day) + calls + len(failed) <= quota:
+        if failed and read_calls(qday) + calls + len(failed) <= quota:
             time.sleep(2)  # 세션이 빠질 틈
             retry = {rid: (rid, items, err)
                      for rid, items, err in paced(
@@ -237,7 +246,7 @@ def main():
             calls += len(failed)
             results = [retry.get(r[0], r) if r[2] else r for r in results]
 
-        add_calls(day, calls)
+        add_calls(qday, calls)
         cyc += 1
 
         obs = now()
@@ -314,7 +323,7 @@ def main():
             detail = " ".join(f"{k}×{v}" for k, v in top)
             print(f"[{obs:%H:%M:%S}] ⚠️ 실패 {nerr}/{len(picked)} (재시도 후) — {detail}", flush=True)
         if cyc % 20 == 0:
-            print(f"[{obs:%H:%M:%S}] 콜 {read_calls(day):,}/{quota:,}", flush=True)
+            print(f"[{obs:%H:%M:%S}] 콜 {read_calls(qday):,}/{quota:,}", flush=True)
 
         # 지터는 max 안에. 밖에 두면 took > interval 일 때 음수가 되어 죽는다.
         time.sleep(max(1.0, interval - took + random.uniform(-2, 2)))

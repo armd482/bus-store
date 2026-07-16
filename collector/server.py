@@ -72,8 +72,8 @@ def snapshot():
         full = c.execute("SELECT COUNT(*) FROM cell WHERE daytype=? AND n>=?", (d, tgt)).fetchone()[0]
         byday[d] = {"obs": n, "cells": cells, "done": full, "pct": full / goal if goal else 0}
 
-    day = bus_collector.service_day(datetime.now(O.KST)) if bus_collector else None
-    calls = bus_collector.read_calls(day) if bus_collector and day else 0
+    # 쿼터는 달력일 키다 (data.go.kr 자정 리셋) — 운행일(service_day)이 아니다
+    calls = bus_collector.read_calls(bus_collector.quota_day(datetime.now(O.KST))) if bus_collector else 0
 
     with LOCK:
         st = dict(STATE)
