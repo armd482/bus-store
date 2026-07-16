@@ -28,6 +28,28 @@ def run(cmd, ok_fail=False):
     return r
 
 
+def ensure_pool(workdir):
+    """노선 풀이 비어 있으면 fetch_routes 를 먼저 돌린다 — install 전용.
+
+    순서가 핵심이다: 수집기를 시작하기 **전**이라 세션 30 충돌이 없다.
+    풀 없이 수집기를 올리면 '노선 풀이 비어 있다'만 반복하며 공회전하고,
+    그 상태에서 fetch_routes 를 돌리면 세션을 나눠 써 서로 실패한다 (✅ 실측).
+    """
+    import sqlite3
+    db = os.path.join(workdir, "data", "coverage.sqlite")
+    try:
+        n = sqlite3.connect(db).execute("SELECT COUNT(*) FROM route").fetchone()[0]
+    except sqlite3.Error:
+        n = 0
+    if n:
+        print(f"노선 풀 {n:,}개 확인 — fetch_routes 생략")
+        return
+    print("노선 풀이 비어 있다 — fetch_routes.py 를 먼저 돌린다 (~10분, 4,400여 콜)")
+    r = subprocess.run([PY, "fetch_routes.py"], cwd=workdir)  # 출력 그대로 보여준다
+    if r.returncode != 0:
+        sys.exit("fetch_routes 실패 — .env 의 GBIS_BUS_KEY 를 확인하고 install 을 다시 돌릴 것")
+
+
 def kill_manual():
     """수동으로 띄운 server.py 도 내린다 — 모드와 무관하게 '완전 종료'가 되도록."""
     if os.name == "nt":
@@ -62,6 +84,8 @@ def mac_target():
 def mac_install():
     d = mac_run_dir()
     os.makedirs(os.path.join(d, "logs"), exist_ok=True)
+    run(["launchctl", "bootout", mac_target()], ok_fail=True)  # 돌던 게 있으면 먼저 내리고
+    ensure_pool(d)                                             # 풀이 비었으면 fetch_routes 부터
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -135,6 +159,8 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 """)
+    run(["systemctl", "--user", "stop", "findpath"], ok_fail=True)  # 돌던 게 있으면 먼저 내리고
+    ensure_pool(HERE)                                               # 풀이 비었으면 fetch_routes 부터
     user = os.environ.get("USER", "")
     run(["loginctl", "enable-linger", user], ok_fail=True)  # 부팅 자동 실행 (로그인 불요)
     run(["systemctl", "--user", "daemon-reload"])
@@ -185,6 +211,8 @@ cd /d "{HERE}"
 timeout /t 10
 goto loop
 """)
+    run(["schtasks", "/End", "/TN", TASK], ok_fail=True)  # 돌던 게 있으면 먼저 내리고
+    ensure_pool(HERE)                                     # 풀이 비었으면 fetch_routes 부터
     # ONSTART 등록은 관리자 권한 필요 — 실패하면 안내
     r = run(["schtasks", "/Create", "/F", "/TN", TASK, "/TR", win_bat_path(),
              "/SC", "ONSTART", "/RL", "HIGHEST"], ok_fail=True)

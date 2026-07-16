@@ -37,6 +37,8 @@ python3 service.py status
 
 `stop` 이 **완전 종료**다: 지금 내려가고, 크래시 감시도 풀리고, 재부팅해도 안 살아난다 — `start` 하기 전까지. 수동으로 띄운 `server.py` 가 있어도 함께 내린다. (macOS 에서 `install` 은 TCC 보호 폴더 밖 `~/findpath/` 로 코드를 알아서 복사한다 — 아래 macOS 절 참조.)
 
+`install` 은 **노선 풀이 비어 있으면 `fetch_routes.py` 를 알아서 먼저 돌린다** (~10분) — 수집기 시작 전이라 세션 충돌이 없다. 즉 새 기계에선 `.env` 만 채우고 `install` 한 방이면 된다.
+
 아래는 `service.py` 가 하는 일의 수동 절차다 — 직접 제어하고 싶을 때만.
 
 ### 리눅스 / EC2 — 권장
