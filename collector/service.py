@@ -5,8 +5,12 @@
   python3 service.py stop        ★ 완전 종료 — 프로세스 중지 + 자동 재시작·부팅 실행 해제.
                                  start 하기 전까지 재부팅해도 안 살아난다.
   python3 service.py start       다시 켜기 (등록은 유지돼 있던 것)
+  python3 service.py logs        로그 실시간 보기
   python3 service.py uninstall   등록 자체를 제거
   python3 service.py status      상태 확인
+
+install/start 는 시작 후 그 자리에서 로그를 스트리밍한다 — 직접 실행하던 때와
+같은 화면. 단 Ctrl-C 는 **보기만** 끝낸다. 수집은 백그라운드에서 계속 돈다.
 
 수동 실행(python3 server.py + Ctrl-C)과 병행하지 말 것 — 세션 30 을 나눠 쓰면 서로 실패한다.
 stop 은 수동으로 띄운 server.py 도 함께 내린다 (어느 모드든 '완전 종료' 한 명령).
@@ -15,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LABEL = "com.findpath.collector"
@@ -26,6 +31,32 @@ def run(cmd, ok_fail=False):
     if r.returncode != 0 and not ok_fail:
         sys.exit(f"실패: {' '.join(cmd)}\n{r.stderr.strip()}")
     return r
+
+
+def follow(path):
+    """로그 파일을 tail -f 처럼 따라간다 — 윈도우 포함 순수 파이썬.
+    Ctrl-C 는 보기만 끝낸다. 수집은 백그라운드에서 계속 돈다."""
+    print(f"로그 스트리밍 (Ctrl-C = 보기만 종료, 수집은 계속): {path}", flush=True)
+    try:
+        while not os.path.exists(path):
+            time.sleep(0.5)
+        with open(path, encoding="utf-8", errors="replace") as f:
+            # 최근 내용부터: 끝에서 4KB 앞으로 가서 마지막 몇 줄을 먼저 보여준다
+            f.seek(0, 2)
+            back = min(f.tell(), 4096)
+            f.seek(f.tell() - back)
+            if back:
+                tail = f.read().splitlines()[-10:]
+                for l in tail:
+                    print(l, flush=True)
+            while True:
+                line = f.readline()
+                if line:
+                    print(line, end="", flush=True)
+                else:
+                    time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\n보기 종료 — 수집은 계속 돈다. 다시 보려면: python3 service.py logs", flush=True)
 
 
 def ensure_pool(workdir):
@@ -60,16 +91,22 @@ def kill_manual():
 
 
 # ── macOS — launchd ──────────────────────────────────────────────────
-def mac_run_dir():
-    """TCC 보호 폴더(Desktop/Documents) 밑이면 ~/findpath 로 코드를 복사해 그쪽을 돌린다.
-    launchd 는 보호 폴더를 못 읽는다 (README). data/logs 는 실행본 쪽에 새로 쌓인다."""
+def mac_workdir():
+    """launchd 가 실제로 도는 위치. TCC 보호 폴더(Desktop/Documents) 밑이면 ~/findpath."""
     home = os.path.expanduser("~")
-    if not HERE.startswith((os.path.join(home, "Desktop"), os.path.join(home, "Documents"))):
-        return HERE
-    dst = os.path.join(home, "findpath", "collector")
-    shutil.copytree(HERE, dst, dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns("data", "logs", "__pycache__", "*.pyc"))
-    print(f"TCC 보호 밖으로 복사: {dst}  (코드 수정 후엔 install 재실행으로 재배포)")
+    if HERE.startswith((os.path.join(home, "Desktop"), os.path.join(home, "Documents"))):
+        return os.path.join(home, "findpath", "collector")
+    return HERE
+
+
+def mac_run_dir():
+    """TCC 보호 폴더 밑이면 ~/findpath 로 코드를 복사해 그쪽을 돌린다.
+    launchd 는 보호 폴더를 못 읽는다 (README). data/logs 는 실행본 쪽에 새로 쌓인다."""
+    dst = mac_workdir()
+    if dst != HERE:
+        shutil.copytree(HERE, dst, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("data", "logs", "__pycache__", "*.pyc"))
+        print(f"TCC 보호 밖으로 복사: {dst}  (코드 수정 후엔 install 재실행으로 재배포)")
     return dst
 
 
@@ -104,7 +141,8 @@ def mac_install():
     run(["launchctl", "enable", mac_target()], ok_fail=True)
     run(["launchctl", "bootout", mac_target()], ok_fail=True)  # 이미 떠 있으면 교체
     run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path()])
-    print(f"설치·시작됨. 로그: {d}/logs/server.log · 대시보드: http://localhost:877")
+    print(f"설치·시작됨. 대시보드: http://localhost:877")
+    follow(os.path.join(d, "logs", "server.log"))
 
 
 def mac_stop():
@@ -121,6 +159,11 @@ def mac_start():
     run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path()], ok_fail=True)
     run(["launchctl", "kickstart", mac_target()], ok_fail=True)
     print("시작됨.")
+    follow(os.path.join(mac_workdir(), "logs", "server.log"))
+
+
+def mac_logs():
+    follow(os.path.join(mac_workdir(), "logs", "server.log"))
 
 
 def mac_uninstall():
@@ -165,7 +208,8 @@ WantedBy=default.target
     run(["loginctl", "enable-linger", user], ok_fail=True)  # 부팅 자동 실행 (로그인 불요)
     run(["systemctl", "--user", "daemon-reload"])
     run(["systemctl", "--user", "enable", "--now", "findpath"])
-    print("설치·시작됨. 로그: journalctl --user -u findpath -f")
+    print("설치·시작됨.")
+    lx_logs()
 
 
 def lx_stop():
@@ -177,6 +221,15 @@ def lx_stop():
 def lx_start():
     run(["systemctl", "--user", "enable", "--now", "findpath"])
     print("시작됨.")
+    lx_logs()
+
+
+def lx_logs():
+    print("로그 스트리밍 (Ctrl-C = 보기만 종료, 수집은 계속)", flush=True)
+    try:
+        subprocess.run(["journalctl", "--user", "-u", "findpath", "-f", "-n", "10"])
+    except KeyboardInterrupt:
+        print("\n보기 종료 — 수집은 계속 돈다. 다시 보려면: python3 service.py logs", flush=True)
 
 
 def lx_uninstall():
@@ -223,6 +276,7 @@ goto loop
         sys.exit("schtasks 등록 실패 — 관리자 PowerShell 에서 다시 실행할 것.\n" + r.stderr.strip())
     run(["schtasks", "/Run", "/TN", TASK])
     print("설치·시작됨.")
+    follow(os.path.join(HERE, "logs", "server.log"))
 
 
 def win_stop():
@@ -235,6 +289,11 @@ def win_start():
     run(["schtasks", "/Change", "/TN", TASK, "/Enable"], ok_fail=True)
     run(["schtasks", "/Run", "/TN", TASK])
     print("시작됨.")
+    follow(os.path.join(HERE, "logs", "server.log"))
+
+
+def win_logs():
+    follow(os.path.join(HERE, "logs", "server.log"))
 
 
 def win_uninstall():
@@ -256,17 +315,17 @@ def main():
     table = {
         ("mac", "install"): mac_install, ("mac", "stop"): mac_stop,
         ("mac", "start"): mac_start, ("mac", "uninstall"): mac_uninstall,
-        ("mac", "status"): mac_status,
+        ("mac", "status"): mac_status, ("mac", "logs"): mac_logs,
         ("lx", "install"): lx_install, ("lx", "stop"): lx_stop,
         ("lx", "start"): lx_start, ("lx", "uninstall"): lx_uninstall,
-        ("lx", "status"): lx_status,
+        ("lx", "status"): lx_status, ("lx", "logs"): lx_logs,
         ("win", "install"): win_install, ("win", "stop"): win_stop,
         ("win", "start"): win_start, ("win", "uninstall"): win_uninstall,
-        ("win", "status"): win_status,
+        ("win", "status"): win_status, ("win", "logs"): win_logs,
     }
     fn = table.get((osname, cmd))
     if not fn:
-        sys.exit(f"모르는 명령: {cmd}  (install | start | stop | uninstall | status)")
+        sys.exit(f"모르는 명령: {cmd}  (install | start | stop | logs | uninstall | status)")
     fn()
 
 
