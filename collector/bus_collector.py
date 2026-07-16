@@ -264,10 +264,20 @@ def main():
             moving += len(items)
             for b in items:
                 v, ordv = b.get("vehicleno"), b.get("nodeord")
+                try:
+                    ordv = int(ordv)
+                except (TypeError, ValueError):
+                    continue  # 순번 없는 항목 — 전이 계산 불가
+                if not v:
+                    continue  # 차량번호 없음 — last[None] 으로 서로 다른 버스가 섞인다
                 prev = last.get(v)
                 last[v] = (ordv, obs)
-                if prev is None or prev[0] == ordv:
-                    continue  # 처음 보거나 아직 같은 정류장
+                if prev is None or ordv <= prev[0]:
+                    # 처음 보거나, 같은 정류장이거나, **역방향** — 역방향은 회차 아티팩트다:
+                    # 종점 도착 후 재출발하면 ord 가 168→1 로 떨어진다 (✅ 실측 0.07%).
+                    # 물리적 전이가 아니므로 버린다. last 는 갱신했으므로 새 운행분
+                    # (1→2→…)은 다음 사이클부터 정상 기록된다.
+                    continue
                 if (obs - prev[1]).total_seconds() > interval * 4:
                     # ⚠️ 유령 통과 방지 — 노선이 재선정에서 빠졌다 돌아오면 prev 가
                     #    1시간+ 전 것이다. 그걸 전이로 치면 폭 1시간짜리 '통과'가 정상

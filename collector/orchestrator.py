@@ -325,7 +325,13 @@ def rebuild(force):
             b = r.get("band")
             if b is None:
                 continue
-            key = (r["routeid"], r["from_ord"], r["to_ord"], b, r.get("daytype", "weekday"))
+            try:
+                fo, to = int(r["from_ord"]), int(r["to_ord"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if to <= fo:
+                continue  # 회차 아티팩트(168→1 등) — 수집기와 같은 기준으로 거른다
+            key = (r["routeid"], fo, to, b, r.get("daytype", "weekday"))
             counts[key] = counts.get(key, 0) + 1
     c = connect()
     old = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
