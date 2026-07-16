@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""
+버스 위치 수집기 — stop_times 재료 (docs §4.4, §5)
+
+이 데이터는 C 아키텍처(자체 GTFS)용이다. 현재 채택된 B+ 는 TMAP sectionTime 을
+쓰므로 필요 없다. → C 를 되살릴 선택지를 살려두기 위한 수집.
+
+노선 선택은 orchestrator 가 한다 — 이미 목표를 채운 구간을 재폴링하지 않고
+미커버 노선으로 옮겨간다. 그래야 총 소요가 달력이 아니라 커버리지에 묶인다.
+
+핵심 사실 (✅ §3.1 실측):
+  - 해상도는 정류장 단위다. gpslati/gpslong 은 버스 GPS 가 아니라 "현재 정류장 좌표"이고
+    정류장을 넘을 때만 바뀐다. → 우리가 필요한 건 통과 시각이므로 이걸로 충분.
+  - 타임스탬프 필드가 없다. 통과 시각은 (t_prev, t] 로만 좁혀진다. 둘 다 기록한다.
+  - 30초 폴링이면 이동의 94.7%를 1칸으로 잡는다 (2칸 이상 건너뜀 5.2%).
+"""
+
+import json
+import os
+import random
+import sys
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+import orchestrator as O
+
+BASE = "https://apis.data.go.kr/1613000/BusLcInfoInqireService/getRouteAcctoBusLcList"
+REPICK_EVERY = 120  # 사이클마다 노선 재선정 (약 1시간)
+
+# server.py 가 대시보드용으로 주입한다. 단독 실행 시엔 로컬 더미.
+STATE = {"errors": {}}
+LOCK = __import__("threading").Lock()
+
+
+def load_key():
+    """자기 폴더의 .env 를 먼저 본다 — launchd 는 ~/Desktop 을 못 읽는다(macOS TCC)."""
+    key = os.environ.get("GBIS_BUS_KEY")
+    if key:
+        return key
+    for p in (os.path.join(O.HERE, ".env"),
+              os.path.join(O.HERE, "..", "..", "bus-test", ".env.local")):
+        try:
+            for line in open(p, encoding="utf-8"):
+                if line.strip().startswith("GBIS_BUS_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            continue
+    return None
+
+
+def now():
+    return datetime.now(O.KST)
+
+
+def service_day(t):
+    return O.service_day_of(t).strftime("%Y-%m-%d")
+
+
+# ── 일 호출수는 디스크에 (KeepAlive 재시작해도 상한을 넘지 않게) ────────
+def calls_path(day):
+    return os.path.join(O.DATA, f".buscalls-{day}")
+
+
+def read_calls(day):
+    try:
+        return int(open(calls_path(day)).read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def add_calls(day, n):
+    v = read_calls(day) + n
+    tmp = calls_path(day) + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(v))
+    os.replace(tmp, calls_path(day))
+    return v
+
+
+def paced(fn, items, rate, workers):
+    """요청을 균등하게 흘려보낸다. ⚠️ 이게 핵심이다.
+
+    ThreadPoolExecutor.map 은 워커 수만큼 한꺼번에 던지고 시작한다. 그 버스트가
+    토큰 버킷에 걸려 HTTP 429 "API token rate limit exceeded" 를 부른다.
+
+    ✅ 실측 (같은 평균 rate, 다른 결과):
+        균등 6.0/s (제출 간격 167ms) → 88건 전부 성공, 429 0건
+        버스트 6.7/s (20개 동시)     → 180건 중 140건 실패
+      → 문제는 rate 가 아니라 버스트다.
+        균등 2/4/6 /s = 무결점. 10/s 부터 429·세션99 가 섞이기 시작(141/144).
+
+    제출을 1/rate 초 간격으로 벌리면 in-flight 는 rate × 응답시간(~3s) ≈ 18개로
+    수렴하므로 동시 세션 30 상한에도 안 걸린다.
+    """
+    out = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {}
+        for i, it in enumerate(items):
+            futs[ex.submit(fn, it)] = i
+            time.sleep(1.0 / rate)
+        for f, i in futs.items():
+            out[i] = f.result()
+    return out
+
+
+def fetch(key, city, routeid):
+    """⚠️ 실패가 HTTP 200 으로 온다. resultCode 를 반드시 볼 것.
+
+    세션 초과 시:
+      {"response":{"header":{"resultCode":99,"resultMsg":"가용한 세션이 존재하지 않습니다. (30/30)"},"body":""}}
+    → HTTP 200 이고 예외도 안 난다. resultCode 를 안 보면 조용히 데이터를 버린다.
+    ✅ 실측: 제약은 "30 TPS"가 아니라 **동시 세션 30개**다. 응답이 ~3초이므로
+       실효 처리량은 30÷3s = 초당 10건이 상한. 우리 프로세스 전체의 워커 합이 30을 넘으면 안 된다.
+    """
+    q = urllib.parse.urlencode({"serviceKey": key, "_type": "json", "cityCode": city,
+                                "routeId": routeid, "numOfRows": 200})
+    try:
+        with urllib.request.urlopen(f"{BASE}?{q}", timeout=15) as r:
+            d = json.loads(r.read().decode())
+        h = d.get("response", {}).get("header", {})
+        code = str(h.get("resultCode", "?"))
+        if code not in ("00", "0"):
+            return routeid, [], f"code{code}:{h.get('resultMsg','')[:24]}"
+        body = d["response"].get("body") or {}
+        if not isinstance(body, dict):
+            return routeid, [], "body_not_dict"
+        it = (body.get("items") or {}).get("item") or []
+        if isinstance(it, dict):
+            it = [it]
+        return routeid, it, None
+    except Exception as e:
+        return routeid, [], type(e).__name__
+
+
+def main():
+    key = load_key()
+    if not key:
+        sys.exit("GBIS_BUS_KEY 없음")
+
+    k = O.cfg()
+    conn = O.connect()
+    bands, target, nb = k["timebands"], k["targetSamples"], len(k["timebands"])
+    interval, quota, maxr = k["intervalSec"], k["dailyQuota"], k["maxRoutes"]
+    workers, rate = k["maxWorkers"], k["dispatchRate"]
+    window = k["serviceWindow"]
+
+    day = service_day(now())
+    last = {}       # vehicleno -> (nodeord, 그 정류장에서 처음 본 시각)
+    picked, cyc, written = [], 0, 0
+
+    print(f"[{now():%H:%M:%S}] 수집 시작 · 목표 {target}샘플 · 밴드 {nb}개 · "
+          f"최대 {maxr}노선 · 상한 {quota:,} (오늘 {read_calls(day):,} 사용)", flush=True)
+
+    while True:
+        t = now()
+        d = service_day(t)
+        if d != day:
+            print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d}", flush=True)
+            day, last, written, picked = d, {}, 0, []
+            continue
+        if not O.in_window(t, window):
+            # ✅ 실측: 03-04시는 버스가 0이다. 관측 수는 폴링이 아니라
+            #    버스 통과 횟수로 정해지므로 여기 폴링하면 순손실.
+            time.sleep(300)
+            continue
+
+        # ⚠️ 심야 노선 수를 상수로 정하지 않는다. 운행시간 필터 + 관측(emptyStreak)이
+        #    실제로 도는 것만 남긴다. ✅ 실측상 01시에 도는 노선은 17~418개 사이인데
+        #    (노선 소요시간을 몰라 추정 폭이 크다) 그걸 40 같은 숫자로 못 박으면
+        #    05:16 까지 달리는 36번을 버리고 차고에 있는 낮 노선을 찍게 된다.
+        want = maxr
+
+        # 노선 재선정 — 채운 노선은 빠지고 미커버가 들어온다
+        if not picked or cyc % REPICK_EVERY == 0 or len(picked) != want:
+            picked = O.pick_routes(conn, want, target, nb, t=t)
+            if not picked:
+                print(f"[{t:%H:%M:%S}] 모든 노선 완주 — 대기", flush=True)
+                time.sleep(600)
+                continue
+            print(f"[{t:%H:%M:%S}] 노선 재선정: {len(picked)}개 "
+                  f"(진행률 {picked[0]['pct']*100:.1f}% ~ {picked[-1]['pct']*100:.1f}%)", flush=True)
+
+        if read_calls(day) + len(picked) > quota:
+            print(f"[{t:%H:%M:%S}] 일 상한 근접 — 대기", flush=True)
+            time.sleep(300)
+            continue
+
+        started = time.time()
+        results = paced(lambda p: fetch(key, p["cityCode"], p["routeid"]), picked, rate, workers)
+        add_calls(day, len(picked))
+        cyc += 1
+
+        obs = now()
+        band = O.band_of(obs, bands)
+        dtype = O.day_type(obs)
+        meta = {p["routeid"]: p for p in picked}
+        rows, bumps = [], []
+        moving = 0
+        errs = {}
+
+        for routeid, items, err in results:
+            if err:
+                errs[err] = errs.get(err, 0) + 1
+                continue
+            O.mark_empty(conn, routeid, not items)   # 추정이 아니라 관측이 정한다
+            moving += len(items)
+            for b in items:
+                v, ordv = b.get("vehicleno"), b.get("nodeord")
+                prev = last.get(v)
+                last[v] = (ordv, obs)
+                if prev is None or prev[0] == ordv:
+                    continue  # 처음 보거나 아직 같은 정류장
+                p = meta[routeid]
+                rows.append({
+                    "t": obs.isoformat(), "t_prev": prev[1].isoformat(),
+                    "routeid": routeid, "routeno": p["routeno"], "routetp": p["routetp"],
+                    "cityCode": p["cityCode"], "vehicleno": v,
+                    "from_ord": prev[0], "to_ord": ordv,
+                    "nodeid": b.get("nodeid"), "nodenm": b.get("nodenm"),
+                    "gpslati": b.get("gpslati"), "gpslong": b.get("gpslong"),
+                    "band": band, "daytype": dtype,
+                })
+                if band is not None:
+                    bumps.append((routeid, prev[0], ordv, band, dtype))
+
+        if rows:
+            with open(os.path.join(O.DATA, f"bus-{day}.jsonl"), "a", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            written += len(rows)
+        if bumps:
+            for a in bumps:
+                O.bump(conn, *a)
+            conn.commit()
+
+        took = time.time() - started
+        with LOCK:
+            STATE["cycles"] = cyc
+            STATE["lastObs"] = time.time()
+            STATE["lastCycleSec"] = took
+            STATE["picked"] = len(picked)
+            STATE["moving"] = moving
+            STATE["written"] = written
+            STATE["errors"] = errs
+            STATE["night"] = False
+
+        # 실패는 항상 보인다. 조용히 데이터를 버리는 게 제일 나쁘다.
+        if errs:
+            top = sorted(errs.items(), key=lambda x: -x[1])[:2]
+            detail = " ".join(f"{k}×{v}" for k, v in top)
+            print(f"[{obs:%H:%M:%S}] ⚠️ 실패 {sum(errs.values())}/{len(picked)} — {detail}", flush=True)
+        if cyc % 20 == 0:
+            print(f"[{obs:%H:%M:%S}] 콜 {read_calls(day):,}/{quota:,} · {len(picked)}노선 · "
+                  f"운행 {moving}대 · 통과 {written:,}건 · {took:.0f}s", flush=True)
+
+        # 지터는 max 안에. 밖에 두면 took > interval 일 때 음수가 되어 죽는다.
+        time.sleep(max(1.0, interval - took + random.uniform(-2, 2)))
+
+
+if __name__ == "__main__":
+    main()

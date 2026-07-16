@@ -1,0 +1,27 @@
+# ── 비밀 ─────────────────────────────────────────────
+# 키는 절대 커밋하지 않는다. 수집기는 실행 위치의 .env 를 읽는다.
+.env
+.env.*
+!.env.example
+
+# ── 수집 데이터 ───────────────────────────────────────
+# 하루 130MB · 2주 1.3GB. 원본은 수집 기계에 남고 저장소엔 코드만 둔다.
+collector/data/
+collector/logs/
+*.jsonl
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# ── C 스파이크 산출물 (445MB, 전부 재다운로드 가능) ──────
+# OTP jar    : github.com/opentripplanner/OpenTripPlanner/releases (v2.9.0, Java 25)
+# 한국 pbf    : download.geofabrik.de/asia/south-korea-latest.osm.pbf
+# 판교 클리핑 : osmium extract --bbox 127.06,37.38,127.13,37.43
+spike/osm/*.pbf
+spike/otp/*.jar
+spike/graph/
+
+# ── 기타 ─────────────────────────────────────────────
+__pycache__/
+*.pyc
+.DS_Store
