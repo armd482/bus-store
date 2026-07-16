@@ -20,6 +20,7 @@ import os
 import random
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -154,6 +155,10 @@ def fetch(key, city, routeid):
         if isinstance(it, dict):
             it = [it]
         return routeid, it, None
+    except urllib.error.HTTPError as e:
+        # 상태코드가 곧 원인이다: HTTP429=rate limit(키 공유·버스트), HTTP5xx=서버 장애.
+        # 'HTTPError' 로 뭉치면 로그만으로 구분이 안 된다 (✅ 실전에서 아쉬웠던 것).
+        return routeid, [], f"HTTP{e.code}"
     except Exception as e:
         return routeid, [], type(e).__name__
 
@@ -332,8 +337,10 @@ def main():
               f"통과 +{len(rows)} (누적 {written:,}) · {took:.0f}s"
               + (f" · 재시도 {len(failed)}→회복 {rec}" if failed else ""), flush=True)
         if errs:
-            top = sorted(errs.items(), key=lambda x: -x[1])[:2]
-            detail = " ".join(f"{k}×{v}" for k, v in top)
+            # 재시도로 회복 못 한 것만 여기 온다 — 이 줄은 server.log 에도 남으므로
+            # (⚠️ 표식) 원인을 자르지 않고 전부 기록한다. 회복된 재시도는 위
+            # 사이클 줄(콘솔 전용)에만 나온다.
+            detail = " ".join(f"{k}×{v}" for k, v in sorted(errs.items(), key=lambda x: -x[1]))
             print(f"[{obs:%H:%M:%S}] ⚠️ 실패 {nerr}/{len(picked)} (재시도 후) — {detail}", flush=True)
         if cyc % 20 == 0:
             print(f"[{obs:%H:%M:%S}] 콜 {read_calls(qday):,}/{quota:,}", flush=True)

@@ -244,17 +244,25 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Tee:
-    """stdout/stderr 를 콘솔과 파일 양쪽에 쓴다 — 윈도우 bat 용 (--log).
+    """콘솔에는 전부, 파일에는 중요한 줄만 — 윈도우 bat 용 (--log).
 
     셸 리다이렉트(>>)로 하면 스케줄러가 띄우는 cmd 창이 텅 비어 버린다.
-    창에는 그대로 흐르고 파일에도 남아야 죽은 뒤 사인을 볼 수 있다.
+    창에는 그대로 흐르고, 파일은 **사망 사인 확인용**이므로 오류·경고와
+    시작/종료 표식만 남긴다 — 사이클 로그로 채우면 정작 필요한 줄이 묻힌다.
+    stderr 는 전체 보존한다 (트레이스백은 여러 줄이고 표식이 없다).
     """
-    def __init__(self, stream, f):
-        self.s, self.f = stream, f
+    KEEP = ("⚠️", "❌", "Traceback", "Error", "수집 시작", "대시보드", "종료 감지", "일 상한")
+
+    def __init__(self, stream, f, keep_all=False):
+        self.s, self.f, self.keep_all, self.buf = stream, f, keep_all, ""
 
     def write(self, x):
         self.s.write(x)
-        self.f.write(x)
+        self.buf += x
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            if self.keep_all or any(k in line for k in self.KEEP):
+                self.f.write(line + "\n")
 
     def flush(self):
         self.s.flush()
@@ -271,8 +279,8 @@ def main():
     if args.log:
         os.makedirs(os.path.dirname(args.log) or ".", exist_ok=True)
         _f = open(args.log, "a", encoding="utf-8", buffering=1, errors="replace")
-        sys.stdout = Tee(sys.stdout, _f)
-        sys.stderr = Tee(sys.stderr, _f)
+        sys.stdout = Tee(sys.stdout, _f)                 # 오류·경고·표식만
+        sys.stderr = Tee(sys.stderr, _f, keep_all=True)  # 트레이스백은 전체
 
     if not args.no_collect:
         if bus_collector is None:
