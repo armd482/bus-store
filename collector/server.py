@@ -258,6 +258,16 @@ def main():
         with LOCK:
             STATE["started"] = time.time()
 
+        # ⚠️ 수집 스레드 감시 — 스레드만 죽으면 대시보드는 멀쩡히 떠 있어서
+        #    launchd/systemd/배치 루프의 자동 재시작이 발동하지 않는 좀비가 된다
+        #    (✅ 실전: 마지막 관측만 하염없이 늘어나는 채로 발견됨).
+        #    스레드가 죽으면 프로세스째 내려서 재시작 장치가 되살리게 한다.
+        def watchdog():
+            t.join()  # 수집 스레드가 죽어야 리턴한다
+            print("수집 스레드 종료 감지 — 프로세스를 내린다 (자동 재시작 장치가 되살린다)", flush=True)
+            os._exit(1)
+        threading.Thread(target=watchdog, daemon=True).start()
+
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"대시보드 http://localhost:{args.port}  (수집 {'끔' if args.no_collect else '켬'})", flush=True)
     try:

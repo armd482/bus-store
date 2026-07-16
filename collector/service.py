@@ -203,11 +203,14 @@ def win_bat_path():
 
 
 def win_install():
+    # ⚠️ 로그 리다이렉트 필수 — 스케줄러로 뜬 배치는 콘솔이 없어서, 리다이렉트가
+    #    없으면 수집기가 죽으며 남긴 트레이스백을 볼 방법이 없다 (✅ 실전에서 겪음).
     with open(win_bat_path(), "w") as f:
         f.write(f"""@echo off
 cd /d "{HERE}"
+if not exist logs mkdir logs
 :loop
-"{PY}" server.py
+"{PY}" server.py >> logs\\server.log 2>&1
 timeout /t 10
 goto loop
 """)
