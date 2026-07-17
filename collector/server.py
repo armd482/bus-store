@@ -29,6 +29,11 @@ try:
 except Exception:
     bus_collector = None
 
+try:
+    import subway_collector          # 별도 프로세스 — 대시보드는 그 디스크 산출물만 읽는다
+except Exception:
+    subway_collector = None
+
 # 수집기가 갱신하는 최근 상태 (대시보드가 읽는다)
 STATE = {
     "started": None, "cycles": 0, "lastObs": None, "lastCycleSec": None,
@@ -68,6 +73,48 @@ def _obs_rate_per_day():
     if window < 3600 or size == 0:
         return None, 0.0                     # 표본 부족
     return (size / AVG_ROW_BYTES) / (window / 86400), window / 86400
+
+
+def subway_snapshot():
+    """지하철 수집 현황 — 별도 프로세스라 디스크(카운터 + 오늘 jsonl)에서만 읽는다.
+
+    파일은 운행일(shinbundang-{service_day}), 쿼터는 달력일(.calls-{quota_day}) —
+    subway_collector 와 같은 경계를 쓴다. 오늘 파일은 하루치라 항상 작아 전체 스캔 OK.
+    """
+    if subway_collector is None:
+        return {"present": False}
+    now = datetime.now(O.KST)
+    day = subway_collector.service_day(now)
+    calls = subway_collector.read_calls(subway_collector.quota_day(now))
+    path = os.path.join(O.DATA, f"shinbundang-{day}.jsonl")
+    written, trains, last_t, last_nm = 0, set(), None, None
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                written += 1
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                trains.add(r.get("trainNo"))
+                last_t, last_nm = r.get("t"), r.get("statnNm")
+    except OSError:
+        pass
+    last_epoch = None
+    if last_t:
+        try:
+            last_epoch = datetime.fromisoformat(last_t).timestamp()
+        except ValueError:
+            pass
+    return {
+        "present": True,
+        "started": calls > 0 or written > 0,      # 오늘 한 번이라도 돌았나
+        "line": subway_collector.LINE,
+        "calls": calls, "cap": subway_collector.DAILY_CAP,
+        "written": written, "trains": len(trains - {None}),
+        "lastObs": last_epoch, "lastStn": last_nm,
+        "inService": subway_collector.in_service(now),
+    }
 
 
 # ── 커버리지 집계 ──────────────────────────────────────────────────
@@ -168,6 +215,7 @@ def snapshot():
         "bands": band_rows, "days": byday, "today": today, "nowBand": nowband,
         "calls": calls, "quota": k["dailyQuota"],
         "state": st, "etaDays": eta, "etaDaysHi": eta_hi, "etaMeasuring": eta_measuring,
+        "subway": subway_snapshot(),
         "cfg": {kk: k[kk] for kk in
                 ("targetSamples", "maxRoutes", "dispatchRate",
                  "intervalSec", "serviceWindow", "dailyQuota")},
@@ -207,17 +255,32 @@ const pct = x => (x*100).toFixed(1)+'%';
 const num = x => (x||0).toLocaleString();
 function bar(p, cls){ return `<div class=bar><div class="fill ${cls||''}" style="width:${Math.min(100,p*100)}%"></div></div>`; }
 
-let S = null;  // 최근 /api 응답 — 1초 타이머(paintObs)가 참조한다
+let S = null, tab = 'bus';  // S: 최근 /api 응답 · tab: 활성 탭
+window.setTab = (t) => { tab = t; render(); };
+
 async function tick(){
-  const d = await (await fetch('/api')).json();
-  S = d;
+  S = await (await fetch('/api')).json();
+  render();
+}
+
+function render(){
+  const d = S; if(!d) return;
   const s = d.state;
   const alive = s.lastObs && (Date.now()/1000 - s.lastObs) < 180;
-
   document.getElementById('sub').innerHTML =
     `경기 ${num(d.routes)}노선 · ${num(d.segments)}구간 · 목표 ${num(d.goal)}셀 × ${d.target}샘플`
-    + (alive ? ' · <span class=ok>●</span> 수집 중' : ' · <span class=bad>●</span> 멈춤');
+    + (alive ? ' · <span class=ok>●</span> 버스 수집 중' : ' · <span class=bad>●</span> 버스 멈춤');
 
+  const tb = (id,label) => `<span onclick="setTab('${id}')" style="cursor:pointer;padding:6px 16px;`
+    + `border-bottom:2px solid ${tab===id?'#3b82f6':'transparent'};${tab===id?'font-weight:700':'opacity:.5'}">${label}</span>`;
+  let h = `<div style="display:flex;gap:8px;border-bottom:1px solid #8883;margin:0 0 18px">${tb('bus','버스')}${tb('subway','지하철')}</div>`;
+  h += (tab === 'subway') ? renderSubway(d) : renderBus(d);
+  document.getElementById('app').innerHTML = h;
+  paintObs();
+}
+
+function renderBus(d){
+  const s = d.state;
   let h = '';
   // 완성률
   h += `<div class=big>${pct(d.pct)}</div>`;
@@ -243,8 +306,6 @@ async function tick(){
   h += '</div>';
 
   // 밴드 — 지금 채워지는 요일의 **누적** (모든 주의 해당 요일 합).
-  // 장부에 날짜가 없고 (밴드, 요일) 카운트만 쌓이므로 자연히 누적이다.
-  // 04시(운행일 경계)에 다음 요일 뷰로 넘어간다 — 자정 넘김은 전날 요일에 계속.
   const KO = {mon:'월',tue:'화',wed:'수',thu:'목',fri:'금',sat:'토',sun:'일'};
   h += `<h2>밴드별 — <b>${KO[d.today]||'?'}요일</b> 누적 (모든 주 합산 · 04시에 다음 요일로 전환)</h2>`;
   for(const b of d.bands){
@@ -255,7 +316,7 @@ async function tick(){
        + `<div class=val>${num(b.obs)} / ${num(b.need)} · <b>${pct(b.pct)}</b></div></div>`;
   }
 
-  // 요일 — 7종 전부 분리. 모든 요일이 주 1일씩만 얻는다 (목표 7샘플 = 요일당 7주)
+  // 요일 — 7종 전부 분리
   h += `<h2>요일별 완성률 (전부 분리) — 각 요일은 주 1일씩만 얻는다: 목표 ${d.target}샘플이면 요일당 ${d.target}주</h2><table>`;
   for(const [k,label] of [['mon','월'],['tue','화'],['wed','수'],['thu','목'],['fri','금'],['sat','토'],['sun','일']]){
     const v = d.days[k] || {obs:0,done:0,cells:0,pct:0};
@@ -267,11 +328,11 @@ async function tick(){
   }
   h += '</table>';
 
-  // 오류 로그 — 재시도 후에도 실패한 사이클만 (회복된 재시도는 제외). 최근 순.
+  // 오류 로그 — 재시도 후 잔여 실패만 · 매일(운행일 경계) 초기화
   const log = (s.errLog||[]);
-  h += `<h2>오류 로그 — 재시도 후 잔여 실패 (최근 ${log.length}건)</h2>`;
+  h += `<h2>오류 로그 — 오늘 잔여 실패 (${log.length}건 · 매일 초기화)</h2>`;
   if(!log.length){
-    h += '<div class=sub style="color:#22c55e">최근 실패 없음</div>';
+    h += '<div class=sub style="color:#22c55e">오늘 실패 없음</div>';
   } else {
     h += '<table>';
     for(const e of log.slice().reverse()){
@@ -290,9 +351,35 @@ async function tick(){
   for(const [k,v] of Object.entries(d.cfg))
     h += `<tr><td width=140><code>${k}</code></td><td>${JSON.stringify(v)}</td></tr>`;
   h += '</table>';
+  return h;
+}
 
-  document.getElementById('app').innerHTML = h;
-  paintObs();
+function renderSubway(d){
+  const sub = d.subway;
+  if(!sub || !sub.present)
+    return '<div class=sub>이 서버엔 지하철 수집기가 없다 (subway_collector 미탑재).</div>';
+  if(!sub.started)
+    return '<div class=sub>지하철 수집기가 아직 안 돎 — <code>.env</code> 에 SEOUL_SUBWAY_KEY 를 넣고 '
+      + 'systemd 유닛(findpath-subway)을 걸 것. §8 #1(지하철 정시성)이 프로젝트 존폐 항목이라 우선순위가 높다.</div>';
+  const alive = sub.lastObs && (Date.now()/1000 - sub.lastObs) < 300;  // 75s 폴링이라 여유롭게 5분
+  const q = sub.calls/sub.cap;
+  let h = `<div class=sub><b>${sub.line}</b> 실시간 위치 — 정시성 검증용 (docs §8 #1 · §3.3.3). 판교 등 경기 구간 포함 ✅</div>`;
+  h += '<h2>건강 상태</h2><div class=grid>';
+  h += `<div class=card><div class=k>쿼터 (달력일)</div><div class="v ${q>.95?'bad':q>.85?'warn':''}">${num(sub.calls)}</div>
+        <div class=k>/ ${num(sub.cap)} (${pct(q)})</div></div>`;
+  h += `<div class=card><div class=k>마지막 관측</div><div class="v ${alive?'ok':(sub.inService?'bad':'')}">${
+        sub.lastObs? Math.round(Date.now()/1000-sub.lastObs)+'초 전':'—'}</div>
+        <div class=k>${sub.lastStn||'—'}${sub.inService?'':' · 운행 시간 밖'}</div></div>`;
+  h += `<div class=card><div class=k>오늘 기록</div><div class=v>${num(sub.written)}</div>
+        <div class=k>상태 변화 관측</div></div>`;
+  h += `<div class=card><div class=k>열차</div><div class=v>${num(sub.trains)}</div>
+        <div class=k>오늘 본 trainNo</div></div>`;
+  h += '</div>';
+  h += '<h2>수집 목적</h2>';
+  h += '<div class=sub>trainNo 로 열차를 식별해 여러 날 관측을 겹치면 각 열차의 실제 통과 시각 분포가 나온다 → '
+    + '운영사 계획 시각표(PDF)와 대조해 <b>정시성</b>을 판정한다. 신분당선 20대라 며칠이면 수렴한다. '
+    + '이 판정이 §8 #1 — 열차가 ±3분씩 흔들리면 시각표 기반 절벽이 무의미해져 차별점이 사라진다.</div>';
+  return h;
 }
 
 // 마지막 관측 타이머 — /api 폴링(5초)과 별개로 1초마다 다시 그린다.

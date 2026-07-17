@@ -229,6 +229,8 @@ def main():
         if d != day:
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d}", flush=True)
             day, last, written, picked = d, {}, 0, []
+            with LOCK:
+                STATE["errLog"] = []   # 오류 로그 매일 초기화 — 어제 실패가 오늘 화면에 안 남게
             kickoff_export(t)   # 그저께가 된 파일을 내보낸다
             continue
         if not O.in_window(t, window):
