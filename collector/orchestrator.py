@@ -316,14 +316,20 @@ def rebuild(force):
     ⚠️ 수집기를 멈추고 돌릴 것 — 재계산 중 들어온 관측은 교체 때 유실된다.
     """
     import glob
+    import gzip
     files = sorted(glob.glob(os.path.join(DATA, "bus-*.jsonl")))
+    # exportDir 로 내보낸 .gz 도 진실의 일부다 — 같이 재계산한다
+    exp = cfg().get("exportDir")
+    if exp:
+        files += sorted(glob.glob(os.path.join(exp, "bus-*.jsonl.gz")))
     if not force:
         sys.exit(f"jsonl {len(files)}개 파일에서 장부를 다시 계산해 cell 을 통째로 교체한다.\n"
                  f"수집기를 먼저 멈출 것. 정말이면: python3 orchestrator.py rebuild --yes")
     counts = {}
     bad = 0
     for p in files:
-        for line in open(p, encoding="utf-8"):
+        opener = gzip.open if p.endswith(".gz") else open
+        for line in opener(p, mode="rt", encoding="utf-8"):
             try:
                 r = json.loads(line)
             except ValueError:
