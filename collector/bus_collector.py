@@ -354,7 +354,10 @@ def main():
         if bumps:
             for a in bumps:
                 O.bump(conn, *a)
-            conn.commit()
+        # bumps 가 없어도 커밋 — mark_empty 의 emptyStreak 갱신이 트랜잭션에 걸려 있다.
+        # 조건부로 두면 전이 0건인 심야에 쓰기 트랜잭션이 몇 분씩 열린 채 유지되고
+        # (WAL 비대 + 다른 쓰기 차단) 크래시 시 그 갱신들이 유실된다.
+        conn.commit()
 
         took = time.time() - started
         with LOCK:

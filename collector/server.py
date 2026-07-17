@@ -86,9 +86,9 @@ def snapshot():
     day_goal = nseg * nb           # 요일 하나 기준 — 요일별 진행률의 분모
     goal = day_goal * ndays        # 전체 목표 셀 (구간 × 밴드 × 7요일)
 
-    done = c.execute("SELECT COUNT(*) FROM cell WHERE n >= ?", (tgt,)).fetchone()[0]
-    seen = c.execute("SELECT COUNT(*) FROM cell").fetchone()[0]
-    total = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
+    # 한 번의 스캔으로 — 5초마다 오는 /api 가 셀 수백만 규모에서도 버티도록
+    seen, total, done = c.execute(
+        "SELECT COUNT(*), COALESCE(SUM(n),0), COALESCE(SUM(n >= ?),0) FROM cell", (tgt,)).fetchone()
 
     # 밴드별 — 오늘(운행일 기준) 요일만 본다. 자정~04시엔 전날 요일이 '오늘'이다
     # (01:30 관측은 전날 막차 — day_type 이 운행일 경계로 처리한다).
@@ -108,10 +108,11 @@ def snapshot():
             "peak": (a, b) in ((7, 9), (17, 20)),
         })
 
-    # 요일별 — 분모는 요일 하나 기준(day_goal)이다. 전체 goal 로 나누면 5배 과소.
+    # 요일별 — 분모는 요일 하나 기준(day_goal). 단일 GROUP BY 로 한 번에
+    # (요일마다 별도 COUNT 쿼리를 치면 스캔 7회 — 셀이 커지면 /api 가 느려진다).
     byday = {}
-    for d, n, cells in c.execute("SELECT daytype, SUM(n), COUNT(*) FROM cell GROUP BY daytype"):
-        full = c.execute("SELECT COUNT(*) FROM cell WHERE daytype=? AND n>=?", (d, tgt)).fetchone()[0]
+    for d, n, cells, full in c.execute(
+            "SELECT daytype, SUM(n), COUNT(*), SUM(n >= ?) FROM cell GROUP BY daytype", (tgt,)):
         byday[d] = {"obs": n, "cells": cells, "done": full, "pct": full / day_goal if day_goal else 0}
 
     # 쿼터는 달력일 키다 (data.go.kr 자정 리셋) — 운행일(service_day)이 아니다

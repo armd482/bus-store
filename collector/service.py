@@ -84,7 +84,12 @@ def ensure_pool(workdir):
 def kill_manual():
     """수동으로 띄운 server.py 도 내린다 — 모드와 무관하게 '완전 종료'가 되도록."""
     if os.name == "nt":
-        return  # 윈도우는 스케줄러 /End 가 배치 트리를 내린다
+        # 스케줄러 트리는 schtasks /End 가 내리지만 수동 `py server.py` 는 남는다.
+        # 커맨드라인으로 골라 죽인다 (service.py 자신은 'server.py' 에 안 걸린다).
+        run(["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -match 'server\\.py'} "
+             "| ForEach-Object {Stop-Process -Id $_.ProcessId -Force}"], ok_fail=True)
+        return
     # ⚠️ -i 필수 — macOS 프레임워크 파이썬은 프로세스명이 대문자 'Python' 이라
     #    소문자 패턴이 빗나간다 (✅ 실측: stop 이 수동 실행분을 못 내렸다).
     run(["pkill", "-if", r"python[^ ]* server\.py"], ok_fail=True)
@@ -191,12 +196,15 @@ def lx_unit_path():
 
 def lx_install():
     os.makedirs(os.path.dirname(lx_unit_path()), exist_ok=True)
+    # ⚠️ --port 8080 필수 — 기본 877 은 특권 포트(<1024)라 리눅스 일반 유저는 bind 못 한다
+    #    (✅ 실전: EC2 에서 PermissionError 크래시 루프. 손으로 고쳐도 install 재실행이
+    #    유닛을 재생성하며 되돌리므로 여기 박아둔다).
     with open(lx_unit_path(), "w") as f:
         f.write(f"""[Unit]
 Description=findpath collector
 [Service]
 WorkingDirectory={HERE}
-ExecStart={PY} server.py
+ExecStart={PY} server.py --port 8080
 Restart=always
 RestartSec=10
 [Install]
@@ -208,7 +216,7 @@ WantedBy=default.target
     run(["loginctl", "enable-linger", user], ok_fail=True)  # 부팅 자동 실행 (로그인 불요)
     run(["systemctl", "--user", "daemon-reload"])
     run(["systemctl", "--user", "enable", "--now", "findpath"])
-    print("설치·시작됨.")
+    print("설치·시작됨. 대시보드: http://localhost:8080 (리눅스는 877이 특권 포트라 8080)")
     lx_logs()
 
 
@@ -282,6 +290,7 @@ goto loop
 def win_stop():
     run(["schtasks", "/End", "/TN", TASK], ok_fail=True)               # 지금 내리고
     run(["schtasks", "/Change", "/TN", TASK, "/Disable"], ok_fail=True)  # 재부팅에도 안 뜨게
+    kill_manual()                                                        # 수동 실행분도
     print("완전 종료. 재부팅해도 안 살아난다 — 다시 켜려면: python3 service.py start")
 
 

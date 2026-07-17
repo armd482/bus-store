@@ -15,8 +15,9 @@
      시간대 19개 → 2.7회/일 → 목표 10샘플에 3.7일
    → timebands 가 수집 기간을 지배한다. config.json 참조.
 
-⚠️ 요일이 병목: 토·일은 주 1일씩만 얻는다. 목표 10샘플이면 10주.
-   평일부터 채우고 주말은 뒤에 붙일 것.
+⚠️ 요일 7종 전부 분리(2026-07-17) — 월~일 모두 주 1일씩만 채워지는 동등한
+   처지다. 진행률·완주 판정도 전부 7요일 기준이다 (5요일만 세면 노선이
+   주말을 남긴 채 '완주'로 빠질 수 있다).
 
 사용:
   python3 orchestrator.py status           진행률
@@ -65,9 +66,6 @@ def cfg():
 def service_day_of(t):
     """운행일. 04시 기준으로 하루를 가른다 — 01:30 에 잡힌 버스는 전날 운행분이다."""
     return t - timedelta(hours=4)
-
-
-WEEKDAYS = ("mon", "tue", "wed", "thu", "fri")
 
 
 def day_type(t):
@@ -122,6 +120,9 @@ def connect():
         PRIMARY KEY (routeid, from_ord, to_ord, band, daytype)
       )""")
     c.execute("CREATE INDEX IF NOT EXISTS cell_route ON cell(routeid)")
+    # 대시보드가 5초마다 요일·밴드 필터 쿼리를 친다 — 셀이 수백만이 되면
+    # daytype 풀스캔이 /api 를 초 단위로 늘린다.
+    c.execute("CREATE INDEX IF NOT EXISTS cell_day ON cell(daytype)")
     # 노선 풀 — fetch_routes.py 가 채운다
     c.execute("""
       CREATE TABLE IF NOT EXISTS route (
@@ -155,18 +156,22 @@ def bump(conn, routeid, from_ord, to_ord, band, daytype, k=1):
 
 
 def route_progress(conn, target, nbands):
-    """노선별 (충족 셀, 목표 셀, 관측된 셀). 목표 셀 = 구간수 × 밴드수 × 평일 5요일."""
-    ph = ",".join("?" * len(WEEKDAYS))
-    rows = conn.execute(f"""
+    """노선별 (충족 셀, 목표 셀, 관측된 셀). 목표 셀 = 구간수 × 밴드수 × 7요일.
+
+    ⚠️ 7요일 전부 센다 — 평일만 세면(이전 판) 평일이 다 찬 노선이 pct=1.0 으로
+    로테이션에서 빠져 토·일 셀이 영영 안 채워지는 구조가 된다. 대시보드(server.py)의
+    분모와도 일치해야 한다.
+    """
+    rows = conn.execute("""
       SELECT r.routeid, r.routeno, r.routetp, r.cityCode, r.nstops,
-             COALESCE(SUM(CASE WHEN c.n >= ? AND c.daytype IN ({ph}) THEN 1 ELSE 0 END), 0),
-             COALESCE(SUM(CASE WHEN c.daytype IN ({ph}) THEN 1 ELSE 0 END), 0)
+             COALESCE(SUM(CASE WHEN c.n >= ? THEN 1 ELSE 0 END), 0),
+             COUNT(c.n)
       FROM route r LEFT JOIN cell c ON c.routeid = r.routeid
       GROUP BY r.routeid
-    """, (target, *WEEKDAYS, *WEEKDAYS)).fetchall()
+    """, (target,)).fetchall()
     out = []
     for rid, no, tp, city, nstops, done, seen in rows:
-        goal = max(1, (nstops - 1)) * nbands * len(WEEKDAYS)  # 구간수 × 밴드수 × 요일수
+        goal = max(1, (nstops - 1)) * nbands * 7  # 구간수 × 밴드수 × 7요일
         out.append({
             "routeid": rid, "routeno": no, "routetp": tp, "cityCode": city,
             "goal": goal, "done": done, "seen": seen,
@@ -261,7 +266,7 @@ def status():
     seen = sum(p["seen"] for p in prog)
     total_obs = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
 
-    print(f"=== 커버리지 (평일 5요일 분리 · 목표 {tgt}샘플 · 시간대 {nb}개) ===")
+    print(f"=== 커버리지 (요일 7종 분리 · 목표 {tgt}샘플 · 시간대 {nb}개) ===")
     print(f"  노선      {len(prog):,}개 중 완주 {len(done_routes):,}")
     print(f"  셀        {done:,} / {goal:,} 충족 ({done/goal*100 if goal else 0:.1f}%)")
     print(f"  관측된 셀  {seen:,} ({seen/goal*100 if goal else 0:.1f}%)  ← 한 번이라도 본 것")
@@ -307,13 +312,20 @@ def reset(force):
     print("수집기가 돌고 있었다면 재시작할 것 — 메모리의 누적 카운터(written)는 별개다.")
 
 
-def rebuild(force):
+def rebuild(force, shrink_ok=False):
     """장부(cell)를 jsonl 데이터에서 재계산 — 데이터 일부를 지웠거나 장부가 의심될 때.
 
-    행에 band/daytype 이 저장돼 있어 수집 당시와 동일하게 재현된다.
+    행에 band 가 저장돼 있어 수집 당시 규칙이 고정되고, 요일은 t 에서 재계산한다.
     band 가 없는 행(밴드 밖 03-04시 관측)은 원래도 장부에 안 들어갔으므로 건너뛴다.
     emptyStreak/lastSeen 은 jsonl 에 이력이 없으므로 건드리지 않는다.
     ⚠️ 수집기를 멈추고 돌릴 것 — 재계산 중 들어온 관측은 교체 때 유실된다.
+
+    메모리: 전체를 dict 로 들지 않는다 — 15주 뒤 셀 ~700만 개면 1GB+ 라
+    t4g.micro 에서 OOM 이다. 파일(하루) 단위로만 모아 스테이징 테이블에 흘린다.
+
+    축소 가드: 재계산 결과가 기존 장부의 절반 미만이면 중단한다 — 내보낸 .gz 를
+    클라우드로 move 해버려 로컬에 과거가 없는 상태에서 돌리면 장부가 이틀치로
+    쪼그라드는 사고를 막는다 (그래서 rclone 은 copy 를 쓴다 — README).
     """
     import glob
     import gzip
@@ -325,10 +337,18 @@ def rebuild(force):
     if not force:
         sys.exit(f"jsonl {len(files)}개 파일에서 장부를 다시 계산해 cell 을 통째로 교체한다.\n"
                  f"수집기를 먼저 멈출 것. 정말이면: python3 orchestrator.py rebuild --yes")
-    counts = {}
-    bad = 0
+    c = connect()
+    old = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
+    # 스테이징에 먼저 쌓고 마지막에 원자적으로 교체한다 — 도중 실패해도 기존 장부가 남는다
+    c.execute("DROP TABLE IF EXISTS cell_stage")
+    c.execute("""CREATE TABLE cell_stage (
+        routeid TEXT NOT NULL, from_ord INTEGER NOT NULL, to_ord INTEGER NOT NULL,
+        band INTEGER NOT NULL, daytype TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (routeid, from_ord, to_ord, band, daytype))""")
+    bad = total = 0
     for p in files:
         opener = gzip.open if p.endswith(".gz") else open
+        day_counts = {}   # 이 파일(하루)에서만 — 메모리 상한이 하루치로 묶인다
         for line in opener(p, mode="rt", encoding="utf-8"):
             try:
                 r = json.loads(line)
@@ -346,21 +366,30 @@ def rebuild(force):
                 continue  # 회차 아티팩트(168→1 등) — 수집기와 같은 기준으로 거른다
             # 요일은 저장값이 아니라 t 에서 다시 계산한다 — 분류 규칙이 바뀌어도
             # (weekday 통합 → 월~일 분리) 옛 행이 새 규칙으로 재분류되도록.
-            # band 는 저장값을 쓴다: 밴드 정의가 바뀌면 표본의 의미 자체가 달라지므로
-            # 수집 당시 규칙을 고정하는 게 맞다.
             try:
                 dt = day_type(datetime.fromisoformat(r["t"]))
             except (KeyError, ValueError):
                 continue
             key = (r["routeid"], fo, to, b, dt)
-            counts[key] = counts.get(key, 0) + 1
-    c = connect()
-    old = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
+            day_counts[key] = day_counts.get(key, 0) + 1
+        c.executemany("""INSERT INTO cell_stage(routeid,from_ord,to_ord,band,daytype,n)
+                         VALUES(?,?,?,?,?,?)
+                         ON CONFLICT(routeid,from_ord,to_ord,band,daytype)
+                         DO UPDATE SET n = n + excluded.n""",
+                      [k + (v,) for k, v in day_counts.items()])
+        total += sum(day_counts.values())
+    if old and total < old * 0.5 and not shrink_ok:
+        c.execute("DROP TABLE cell_stage")
+        c.commit()
+        sys.exit(f"⚠️ 중단 — 재계산 결과({total:,}건)가 기존 장부({old:,}건)의 절반 미만이다.\n"
+                 "내보낸 .gz 가 전부 로컬(exportDir)에 있는지 확인할 것 — 클라우드로 move 했다면 먼저 내려받기.\n"
+                 "그래도 맞다면: python3 orchestrator.py rebuild --yes --shrink-ok")
+    ncell = c.execute("SELECT COUNT(*) FROM cell_stage").fetchone()[0]
     c.execute("DELETE FROM cell")
-    c.executemany("INSERT INTO cell(routeid,from_ord,to_ord,band,daytype,n) VALUES(?,?,?,?,?,?)",
-                  [k + (n,) for k, n in counts.items()])
+    c.execute("INSERT INTO cell SELECT * FROM cell_stage")
+    c.execute("DROP TABLE cell_stage")
     c.commit()
-    print(f"재계산 완료: 파일 {len(files)}개 → 관측 {sum(counts.values()):,}건 · 셀 {len(counts):,}개 "
+    print(f"재계산 완료: 파일 {len(files)}개 → 관측 {total:,}건 · 셀 {ncell:,}개 "
           f"(이전 장부 {old:,}건" + (f" · 깨진 줄 {bad}" if bad else "") + ")")
     print("수집기가 돌고 있었다면 재시작할 것.")
 
@@ -377,7 +406,7 @@ def main():
     elif cmd == "reset":
         reset("--yes" in sys.argv[2:])
     elif cmd == "rebuild":
-        rebuild("--yes" in sys.argv[2:])
+        rebuild("--yes" in sys.argv[2:], "--shrink-ok" in sys.argv[2:])
     else:
         sys.exit(f"모르는 명령: {cmd}  (status | routes | reset | rebuild)")
 

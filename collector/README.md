@@ -55,13 +55,15 @@ python3 server.py
 [Unit]
 Description=findpath collector
 [Service]
-WorkingDirectory=/home/ubuntu/find-path/collector
-ExecStart=/usr/bin/python3 server.py
+WorkingDirectory=/home/ubuntu/bus-store/collector
+ExecStart=/usr/bin/python3 server.py --port 8080
 Restart=always
 RestartSec=10
 [Install]
 WantedBy=default.target
 ```
+
+⚠️ **`--port 8080` 필수** — 기본 877 은 특권 포트(<1024)라 리눅스 일반 유저는 bind 못 한다 (✅ 실전: `PermissionError` 크래시 루프). `service.py install` 이 유닛을 만들 때도 8080 을 박는다. 대시보드는 `http://localhost:8080`.
 
 ```bash
 loginctl enable-linger $(whoami)    # ⚠️ 필수 — 없으면 SSH 로그아웃 때 유저 서비스가 같이 죽는다
@@ -72,6 +74,14 @@ journalctl --user -u findpath -f    # 로그
 systemctl --user stop findpath      # 수동 종료 — 이때만 자동 재시작이 멈춘다 (Ctrl-C 에 해당)
 systemctl --user restart findpath   # 코드 고친 뒤 반영
 ```
+
+**백업 (EC2 + 구글드라이브):** `config.json` 의 `exportDir` 를 로컬 폴더로 지정하고 rclone 크론으로 올린다:
+
+```
+30 4 * * * rclone copy /home/ubuntu/bus-store/collector/findpath-export gdrive:busdata --include "*.jsonl.gz" --log-file /home/ubuntu/rclone.log
+```
+
+⚠️ **`move` 가 아니라 `copy`** — move 로 로컬 .gz 를 지우면 `rebuild` 가 과거 데이터를 못 봐서 장부가 이틀치로 쪼그라든다 (rebuild 에 축소 가드가 있어 중단되긴 하지만, 애초에 copy 가 맞다). .gz 는 15주 전체 ~1.6GB 라 20GB 디스크에 로컬 보관 부담이 없다.
 
 ### macOS
 
@@ -139,16 +149,17 @@ goto loop
 
 ## 상태 보기
 
-`http://localhost:877`
+`http://localhost:877` (리눅스 서비스 설치 시 **8080**)
 
 | | |
 |---|---|
-| **완성률** | 목표 셀 대비 채운 셀. ETA 는 가정이 아니라 **실측 관측률로 역산**한다 |
-| **밴드별** | 7개 시간대. **`⚠ 관측 없음` 이 그 시간에 기계가 꺼져 있었다는 유일한 신호다** |
-| **요일별** | 토·일 분리 |
-| **건강** | 쿼터 · **실패를 종류별로** · 마지막 관측 시각(= 살아 있는지) |
+| **완성률** | 목표 셀(구간 × 밴드 7 × 요일 7) 대비 충족 셀. ETA 는 최근 1~2 운행일 실측 관측률로 **밴드별 천장 도달 범위**를 계산한다 |
+| **밴드별** | 지금 채워지는 요일의 **누적** (모든 주 합산 · 04시에 다음 요일로 전환) · 현재 밴드 `진행 중` 표시 |
+| **요일별** | **7종 전부 분리** — 요일마다 완성률·충족 셀·관측 수. 각 요일은 주 1일씩만 채워진다 |
+| **건강** | 쿼터 · 실패율(종류별) · 마지막 관측(1초 타이머 + `데이터 요청 중`) |
+| **오류 로그** | 재시도 후 잔여 실패만 — 시각·규모·원인(HTTP429/code99/…) 최근 50건 |
 
-JSON 이 필요하면 `curl -s localhost:877/api`. 터미널만 있으면 `python3 orchestrator.py status`.
+JSON 이 필요하면 `curl -s localhost:8080/api`. 터미널만 있으면 `python3 orchestrator.py status`.
 
 ## 제어
 
@@ -169,8 +180,10 @@ tail -f /tmp/run.log
 
 | | 한도 | 현재 |
 |---|---|---|
-| 버스위치정보 (TAGO 운영) | **50만/일** | 170노선 폴링 = 약 40만/일 |
+| 버스위치정보 (TAGO 운영) | **50만/일** | 170노선 폴링 ≈ **44~46만/일** (✅ 실측 — 재시도 포함) |
 | 서울 지하철 실시간 | **1,000/일** | 신분당선 1노선 72초 = 딱 한계 |
+
+카운터는 **달력일** 키다 (data.go.kr 자정 리셋과 일치). 데이터 파일은 운행일(04시) — 둘은 일부러 다르다: 돈은 자정에, 데이터는 04시에 넘어간다. ⚠️ `fetch_routes.py` 의 ~4,400콜은 카운터에 안 잡히므로 사용량이 상한 근처인 날엔 자정 직후로 미룰 것.
 
 ⚠️ **한도는 두 개고 서로 다르다** (docs §3.1):
 
@@ -199,7 +212,7 @@ tail -f /tmp/run.log
 
 ```json
 {"t":"...","t_prev":"...","routeid":"GGB...","vehicleno":"경기77바3714",
- "from_ord":31,"to_ord":32,"nodeid":"...","band":2,"daytype":"weekday"}
+ "from_ord":31,"to_ord":32,"nodeid":"...","band":2,"daytype":"fri"}
 ```
 
 **최소 필드만 저장한다** — `vehicleno` 는 같은 차의 통과를 이어 붙여 구간 소요시간을 만드는 체인 키라 필수고, `band`/`daytype` 은 장부 재계산(`rebuild`)용이다. 노선번호·유형·정류장명·좌표는 `coverage.sqlite` 의 `route` 테이블에서 `routeid` 로 조인한다 — 행마다 반복 저장하지 않는다 (행 381B → ~220B).
