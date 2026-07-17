@@ -148,6 +148,38 @@ def connect():
     return c
 
 
+def export_old_jsonl(prefix, keep_days):
+    """{prefix}-YYYY-MM-DD.jsonl 중 keep_days 밖의 것을 gzip 해 config.exportDir 로
+    옮기고 원본 삭제 — 용량 확보 + 백업. 버스·지하철 수집기가 공유한다.
+
+    exportDir 미설정이면 아무것도 안 한다. 실패하면 원본을 지우지 않는다
+    (다음 호출 때 재시도) — 데이터를 잃는 경로는 없다. .gz 는 rclone 크론이
+    구글드라이브로 올린다 (README). rebuild 는 bus-*.gz 만 읽으므로 같은
+    폴더에 shinbundang-*.gz 가 섞여도 무해하다.
+    """
+    export_dir = cfg().get("exportDir")
+    if not export_dir:
+        return
+    import glob
+    import gzip
+    import shutil
+    try:
+        os.makedirs(export_dir, exist_ok=True)
+        for src in sorted(glob.glob(os.path.join(DATA, f"{prefix}-*.jsonl"))):
+            day = os.path.basename(src)[len(prefix) + 1:len(prefix) + 11]  # {prefix}-|YYYY-MM-DD|.jsonl
+            if day in keep_days:
+                continue
+            dst = os.path.join(export_dir, os.path.basename(src) + ".gz")
+            with open(src, "rb") as fi, gzip.open(dst + ".tmp", "wb") as fo:
+                shutil.copyfileobj(fi, fo)
+            os.replace(dst + ".tmp", dst)   # 원자적 — 반쯤 쓴 .gz 가 안 남게
+            os.remove(src)
+            print(f"[내보내기] {os.path.basename(src)} → {dst} "
+                  f"({os.path.getsize(dst)/1e6:.1f}MB)", flush=True)
+    except OSError as e:
+        print(f"[{datetime.now(KST):%H:%M:%S}] ⚠️ 내보내기 실패 ({prefix}, 원본 보존): {e}", flush=True)
+
+
 def bump(conn, routeid, from_ord, to_ord, band, daytype, k=1):
     conn.execute("""
       INSERT INTO cell(routeid,from_ord,to_ord,band,daytype,n) VALUES(?,?,?,?,?,?)

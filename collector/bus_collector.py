@@ -89,32 +89,6 @@ def add_calls(day, n):
     return v
 
 
-def export_old_files(export_dir, keep_days):
-    """오늘·어제를 제외한 bus-*.jsonl 을 gzip 해 exportDir 로 옮긴다 — 용량 확보 + 백업.
-
-    어제 파일을 남기는 이유: 대시보드 ETA(_obs_rate_per_day)가 어제 파일 크기를 쓴다.
-    실패하면 원본을 지우지 않는다 — 다음 전환 때 재시도. 데이터를 잃는 경로는 없다.
-    """
-    import glob
-    import gzip
-    import shutil
-    try:
-        os.makedirs(export_dir, exist_ok=True)
-        for src in sorted(glob.glob(os.path.join(O.DATA, "bus-*.jsonl"))):
-            day = os.path.basename(src)[4:14]
-            if day in keep_days:
-                continue
-            dst = os.path.join(export_dir, os.path.basename(src) + ".gz")
-            with open(src, "rb") as fi, gzip.open(dst + ".tmp", "wb") as fo:
-                shutil.copyfileobj(fi, fo)
-            os.replace(dst + ".tmp", dst)   # 원자적 — 반쯤 쓴 .gz 가 남지 않게
-            os.remove(src)
-            print(f"[내보내기] {os.path.basename(src)} → {dst} "
-                  f"({os.path.getsize(dst)/1e6:.0f}MB)", flush=True)
-    except OSError as e:
-        print(f"[{datetime.now(O.KST):%H:%M:%S}] ⚠️ 내보내기 실패 (원본 보존, 다음 전환 때 재시도): {e}", flush=True)
-
-
 def paced(fn, items, rate, workers, max_inflight):
     """제약이 둘이라 방어도 둘이다 — 버스트(rate) 와 동시 세션(in-flight).
 
@@ -206,16 +180,13 @@ def main():
     last = {}       # vehicleno -> (nodeord, 그 정류장에서 처음 본 시각)
     picked, cyc, written = [], 0, 0
 
-    export_dir = k.get("exportDir")
-
     def kickoff_export(t):
-        """오늘·어제만 남기고 내보내기 — 별도 스레드 (gzip 수 초가 사이클을 막지 않게)."""
-        if not export_dir:
-            return
+        """오늘·어제만 남기고 bus-*.jsonl 내보내기 — 별도 스레드 (gzip 수 초가 사이클을 막지 않게).
+        어제를 남기는 건 대시보드 ETA(_obs_rate_per_day)가 어제 파일 크기를 쓰기 때문."""
         keep = {service_day(t),
                 (O.service_day_of(t) - timedelta(days=1)).strftime("%Y-%m-%d")}
         __import__("threading").Thread(
-            target=export_old_files, args=(export_dir, keep), daemon=True).start()
+            target=O.export_old_jsonl, args=("bus", keep), daemon=True).start()
 
     kickoff_export(now())   # 시작 시 1회 — 꺼져 있는 동안 쌓인 옛 파일 정리
 

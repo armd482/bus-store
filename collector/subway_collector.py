@@ -25,6 +25,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+import orchestrator as O    # 공용 내보내기(export_old_jsonl) — jsonl gzip → exportDir
+
 KST = timezone(timedelta(hours=9))
 
 LINE = "신분당선"
@@ -138,6 +140,14 @@ def main():
     written = 0
     last_state = {}  # trainNo -> (statnId, trainSttus)
 
+    def export(t):
+        """오늘·어제만 남기고 shinbundang-*.jsonl 을 gzip → exportDir (구글드라이브 백업).
+        지하철 파일은 작아 gzip 이 즉시라 스레드 불필요."""
+        keep = {service_day(t), service_day(t - timedelta(days=1))}
+        O.export_old_jsonl("shinbundang", keep)
+
+    export(now())   # 시작 시 1회 — 꺼져 있는 동안 쌓인 옛 파일 정리
+
     print(f"[{now():%H:%M:%S}] 수집 시작 · {LINE} · {INTERVAL_SEC}s 간격 · "
           f"일 상한 {DAILY_CAP}회 (오늘 이미 {read_calls(quota_day(now()))}회 사용)", flush=True)
 
@@ -148,6 +158,7 @@ def main():
         if d != day:  # 날이 바뀌면 위상 초기화 (카운터는 파일이 날짜별이라 자동)
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d} (전일 {read_calls(day)}콜 / {written}건)", flush=True)
             day, written, last_state = d, 0, {}
+            export(t)   # 그저께가 된 파일을 백업으로 내보낸다
             time.sleep(random.uniform(0, INTERVAL_SEC))
             continue
 

@@ -20,7 +20,7 @@
   "_dayTypes": "요일 7종 전부 분리 (2026-07-17 결정 — 기간 비용을 알고 용인). ⚠️ 각 요일은 주 1일씩만 얻으므로 목표 7샘플이면 요일당 7주 — 평일 통합(weekday, 1.4주) 대비 5배. 요일별 주행시간 차이를 직접 보기 위함. 되돌리려면 orchestrator.day_type 을 고치고 rebuild — 요일은 jsonl 의 t 에서 재계산되므로 데이터 손실 없음.",
 
   "exportDir": null,
-  "_exportDir": "지정하면 운행일 전환(04시)마다 그저께 이전의 bus-*.jsonl 을 gzip(~10:1)해 이 폴더로 옮기고 원본을 지운다 — 로컬 디스크는 오늘+어제(~310MB)만 유지. OneDrive/구글드라이브 동기화 폴더를 주면 백업까지 자동. 옮긴 .gz 는 rebuild 가 그대로 읽는다. ⚠️ 리눅스/EC2 는 로컬 폴더 지정 + rclone **copy** 크론(README) — move 로 클라우드에 올리고 로컬을 지우면 rebuild 가 과거를 못 본다 (축소 가드가 잡아주긴 하지만 애초에 copy 가 맞다. .gz 는 15주 전체 ~1.6GB 라 로컬 보관 부담 없음). null 이면 끔. 윈도우 예: \"C:\\\\Users\\\\me\\\\OneDrive\\\\busdata\"",
+  "_exportDir": "지정하면 운행일 전환(04시)마다 그저께 이전의 bus-*.jsonl · shinbundang-*.jsonl 을 gzip(~10:1)해 이 폴더로 옮기고 원본을 지운다 — 버스·지하철 수집기가 공유. 로컬 디스크는 오늘+어제만 유지. OneDrive/구글드라이브 동기화 폴더를 주면 백업까지 자동. 옮긴 bus-*.gz 는 rebuild 가 그대로 읽는다(지하철은 장부가 없어 rebuild 무관). ⚠️ 리눅스/EC2 는 로컬 폴더 지정 + rclone **copy** 크론(README, --include \"*.jsonl.gz\" 라 둘 다 올라감) — move 로 클라우드에 올리고 로컬을 지우면 rebuild 가 과거를 못 본다 (축소 가드가 잡아주긴 하지만 애초에 copy 가 맞다). null 이면 끔. 윈도우 예: \"C:\\\\Users\\\\me\\\\OneDrive\\\\busdata\"",
 
   "intervalSec": 30,
   "_intervalSec": "✅ 실측: 30초면 정류장 이동의 94.7%를 1칸으로 잡는다(2칸 이상 건너뜀 5.2%). 갱신주기 10~20초보다 성기게.",
