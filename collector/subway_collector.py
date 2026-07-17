@@ -79,6 +79,40 @@ def service_day(t):
     return (t - timedelta(hours=4)).strftime("%Y-%m-%d")
 
 
+def daytype(t):
+    """지하철은 3종(weekday/sat/sun) — 시각표가 요일별이라 이 단위로 수렴한다.
+    ⚠️ 버스(7종)와 다르다: 지하철은 trainNo 가 매일 같은 시각표라 요일별 며칠이면
+    수렴하고, §8 #3(토요일=평일 시각표인가 공휴일인가)을 이 3분리가 답한다."""
+    wd = (t - timedelta(hours=4)).weekday()
+    return "sun" if wd == 6 else "sat" if wd == 5 else "weekday"
+
+
+# ── 수집일 장부 — 요일별로 며칠 관측했나 (수집률의 분자) ──────────────────
+# 지하철 수집률 = 요일별 수집 일수 / 목표. trainNo 가 매일 반복되므로 하루당
+# 열차·역별 1샘플씩 쌓이고, 요일별 N일이면 정시성 분포가 나온다. 옛 jsonl 은
+# gzip 으로 내보내지므로(백업) 누적 일수는 이 작은 장부에 따로 남긴다.
+def days_ledger_path():
+    return os.path.join(OUT_DIR, ".subway-days.json")
+
+
+def record_day(dt, day):
+    """오늘(운행일)을 그 요일 목록에 넣는다 — 이미 있으면 no-op (중복 방지)."""
+    p = days_ledger_path()
+    try:
+        led = json.load(open(p, encoding="utf-8"))
+    except (OSError, ValueError):
+        led = {}
+    days = set(led.get(dt, []))
+    if day in days:
+        return
+    days.add(day)
+    led[dt] = sorted(days)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(led, f)
+    os.replace(tmp, p)
+
+
 def fetch(key):
     url = f"{BASE}/{key}/json/realtimePosition/0/1000/{urllib.parse.quote(LINE)}"
     with urllib.request.urlopen(url, timeout=20) as r:
@@ -138,6 +172,7 @@ def main():
 
     day = service_day(now())
     written = 0
+    recorded = None  # 오늘을 수집일 장부에 이미 넣었는지 (하루 1회만 쓰면 됨)
     last_state = {}  # trainNo -> (statnId, trainSttus)
 
     def export(t):
@@ -203,6 +238,9 @@ def main():
                             "lstcarAt": r.get("lstcarAt"),
                         }, ensure_ascii=False) + "\n")
                         written += 1
+                if written and recorded != day:
+                    record_day(daytype(t), day)   # 오늘 실관측 확보 → 수집일 장부에 1회 기록
+                    recorded = day
                 if calls % 20 == 0:
                     print(f"[{t:%H:%M:%S}] 콜 {calls}/{DAILY_CAP} · 기록 {written}건 · 열차 {len(rows)}대", flush=True)
         except Exception as e:

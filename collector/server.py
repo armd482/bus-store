@@ -106,14 +106,24 @@ def subway_snapshot():
             last_epoch = datetime.fromisoformat(last_t).timestamp()
         except ValueError:
             pass
+    # 수집률 — 요일별 수집 일수 (수렴의 분자). 옛 jsonl 은 백업으로 내보내지므로
+    # 누적 일수는 별도 장부(.subway-days.json)에서 읽는다.
+    try:
+        ledger = json.load(open(os.path.join(O.DATA, ".subway-days.json"), encoding="utf-8"))
+    except (OSError, ValueError):
+        ledger = {}
+    tgt = O.cfg().get("targetSamples", 7)
+    coverage = {dt: {"days": len(ledger.get(dt, [])), "target": tgt}
+                for dt in ("weekday", "sat", "sun")}
     return {
         "present": True,
-        "started": calls > 0 or written > 0,      # 오늘 한 번이라도 돌았나
+        "started": calls > 0 or written > 0 or any(ledger.values()),
         "line": subway_collector.LINE,
         "calls": calls, "cap": subway_collector.DAILY_CAP,
         "written": written, "trains": len(trains - {None}),
         "lastObs": last_epoch, "lastStn": last_nm,
         "inService": subway_collector.in_service(now),
+        "coverage": coverage,
     }
 
 
@@ -375,6 +385,21 @@ function renderSubway(d){
   h += `<div class=card><div class=k>열차</div><div class=v>${num(sub.trains)}</div>
         <div class=k>오늘 본 trainNo</div></div>`;
   h += '</div>';
+
+  // 수집률 — 요일별 수집 일수 / 목표. trainNo 반복이라 요일별 며칠이면 수렴.
+  const cov = sub.coverage || {};
+  h += '<h2>수집률 — 요일별 수집 일수 (trainNo 반복이라 며칠이면 수렴)</h2><table>';
+  for(const [k,label] of [['weekday','평일'],['sat','토요일'],['sun','일요일']]){
+    const v = cov[k] || {days:0,target:7};
+    const p = v.target ? v.days/v.target : 0;
+    h += `<tr><td width=70>${label}</td>
+          <td class=n width=54><b>${pct(Math.min(1,p))}</b></td>
+          <td width=250>${bar(Math.min(1,p), p>=1?'ok':(k==='sat'||k==='sun')?'warn':'')}</td>
+          <td class=n style="white-space:nowrap">${v.days} / ${v.target}일</td></tr>`;
+  }
+  h += '</table>';
+  h += '<div class=sub style="margin-top:6px">⚠️ 토·일은 주 1일씩만 얻는다. §8 #3(토요일=평일 시각표인가 공휴일인가)을 이 3분리가 답한다.</div>';
+
   h += '<h2>수집 목적</h2>';
   h += '<div class=sub>trainNo 로 열차를 식별해 여러 날 관측을 겹치면 각 열차의 실제 통과 시각 분포가 나온다 → '
     + '운영사 계획 시각표(PDF)와 대조해 <b>정시성</b>을 판정한다. 신분당선 20대라 며칠이면 수렴한다. '
