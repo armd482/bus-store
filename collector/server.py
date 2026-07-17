@@ -57,16 +57,21 @@ def snapshot():
     seen = c.execute(f"SELECT COUNT(*) FROM cell WHERE daytype IN ({ph})", wd).fetchone()[0]
     total = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
 
-    # 밴드별 (평일 5요일 합)
+    # 밴드별 — 오늘(운행일 기준) 요일만 본다. 자정~04시엔 전날 요일이 '오늘'이다
+    # (01:30 관측은 전날 막차 — day_type 이 운행일 경계로 처리한다).
+    now = datetime.now(O.KST)
+    today = O.day_type(now)
+    nowband = O.band_of(now, bands)
     byband = {b: (n, cells) for b, n, cells in c.execute(
-        f"SELECT band, SUM(n), COUNT(*) FROM cell WHERE daytype IN ({ph}) GROUP BY band", wd)}
+        "SELECT band, SUM(n), COUNT(*) FROM cell WHERE daytype=? GROUP BY band", (today,))}
     band_rows = []
-    seg_per_band = (nseg * len(wd)) or 1
+    band_need = nseg * tgt  # 이 요일·밴드에서 채워야 할 관측 수 = 구간수 × 목표샘플
     for i, (a, b) in enumerate(bands):
         n, cells = byband.get(i, (0, 0))
         band_rows.append({
             "i": i, "from": a, "to": b if b <= 24 else b - 24, "wrap": b > 24,
-            "obs": n, "cells": cells, "pct": cells / seg_per_band if seg_per_band else 0,
+            "obs": n, "cells": cells, "need": band_need,
+            "pct": n / band_need if band_need else 0,
             "peak": (a, b) in ((7, 9), (17, 20)),
         })
 
@@ -94,10 +99,12 @@ def snapshot():
                 eta = remain / per_day
 
     return {
-        "routes": nroute, "segments": nseg, "goal": goal, "dayGoal": day_goal, "target": tgt,
+        "routes": nroute, "segments": nseg, "goal": goal, "dayGoal": day_goal,
+        "dayNeed": nseg * nb * tgt,  # 요일 하나의 필요 관측 건수 = 밴드별 need × 밴드 수
+        "target": tgt,
         "done": done, "seen": seen, "total": total,
         "pct": done / goal if goal else 0,
-        "bands": band_rows, "days": byday,
+        "bands": band_rows, "days": byday, "today": today, "nowBand": nowband,
         "calls": calls, "quota": k["dailyQuota"],
         "state": st, "etaDays": eta,
         "cfg": {kk: k[kk] for kk in
@@ -121,7 +128,7 @@ PAGE = """<!doctype html><meta charset="utf-8"><title>수집 현황</title>
  .bar{flex:1;height:14px;background:#8883;border-radius:3px;overflow:hidden}
  .fill{height:100%;background:#3b82f6;transition:width .4s}
  .fill.ok{background:#22c55e} .fill.warn{background:#f59e0b} .fill.bad{background:#ef4444}
- .val{width:120px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px;opacity:.7}
+ .val{width:200px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px;opacity:.7;white-space:nowrap}
  .tag{font-size:10px;padding:1px 5px;border-radius:3px;background:#8882;margin-left:4px}
  .warn{color:#f59e0b} .bad{color:#ef4444} .ok{color:#22c55e}
  table{border-collapse:collapse;width:100%;font-size:13px}
@@ -172,14 +179,17 @@ async function tick(){
         <div class=k>운행 ${num(s.moving)}대</div></div>`;
   h += '</div>';
 
-  // 밴드
-  h += '<h2>밴드별 (평일 5요일 합) — 컴퓨터가 꺼진 시간대는 영원히 0이다</h2>';
+  // 밴드 — 지금 채워지는 요일의 **누적** (모든 주의 해당 요일 합).
+  // 장부에 날짜가 없고 (밴드, 요일) 카운트만 쌓이므로 자연히 누적이다.
+  // 04시(운행일 경계)에 다음 요일 뷰로 넘어간다 — 자정 넘김은 전날 요일에 계속.
+  const KO = {mon:'월',tue:'화',wed:'수',thu:'목',fri:'금',sat:'토',sun:'일'};
+  h += `<h2>밴드별 — <b>${KO[d.today]||'?'}요일</b> 누적 (모든 주 합산 · 04시에 다음 요일로 전환)</h2>`;
   for(const b of d.bands){
     const label = `${String(b.from).padStart(2,'0')}-${String(b.to).padStart(2,'0')}시`;
-    const stale = b.obs===0;
-    h += `<div class=row><div class=lbl>${label}${b.peak?'<span class=tag>첨두</span>':''}${b.wrap?'<span class=tag>익일</span>':''}</div>`
-       + bar(b.pct, stale?'bad':b.pct>=1?'ok':'')
-       + `<div class=val>${num(b.obs)} ${stale?'<span class=bad>⚠ 관측 없음</span>':''}</div></div>`;
+    const cur = d.nowBand!=null && b.i===d.nowBand;
+    h += `<div class=row><div class=lbl>${label}${b.peak?'<span class=tag>첨두</span>':''}${b.wrap?'<span class=tag>익일</span>':''}${cur?'<span class=tag style="color:#3b82f6">진행 중</span>':''}</div>`
+       + bar(b.pct, b.pct>=1?'ok':'')
+       + `<div class=val>${num(b.obs)} / ${num(b.need)} · <b>${pct(b.pct)}</b></div></div>`;
   }
 
   // 요일 — 7종 전부 분리. 모든 요일이 주 1일씩만 얻는다 (목표 7샘플 = 요일당 7주)
@@ -189,8 +199,8 @@ async function tick(){
     h += `<tr><td width=40>${label}</td>
           <td class=n width=64><b>${pct(v.pct)}</b></td>
           <td width=250>${bar(v.pct, (k==='sat'||k==='sun')?'warn':'')}</td>
-          <td class=n style="white-space:nowrap">${num(v.done)} / ${num(d.dayGoal)} 셀</td>
-          <td class=n style="white-space:nowrap;opacity:.6">${num(v.obs)}건</td></tr>`;
+          <td class=n style="white-space:nowrap">충족 셀 ${num(v.done)} / ${num(d.dayGoal)}</td>
+          <td class=n style="white-space:nowrap;opacity:.6">관측 ${num(v.obs)} / ${num(d.dayNeed)}건</td></tr>`;
   }
   h += '</table>';
 
