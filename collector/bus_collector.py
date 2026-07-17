@@ -368,6 +368,14 @@ def main():
             STATE["retried"] = len(failed)
             STATE["night"] = False
             STATE["fetching"] = False
+            # 잔여 실패(재시도 후)만 이력에 남긴다 — 대시보드가 최근 오류 리스트로 보여준다.
+            # 회복된 재시도는 오류가 아니므로 제외. 최근 50건만 유지(메모리 상한).
+            if errs:
+                log = STATE.setdefault("errLog", [])
+                detail = " ".join(f"{k}×{v}" for k, v in sorted(errs.items(), key=lambda x: -x[1]))
+                log.append({"t": time.time(), "n": sum(errs.values()),
+                            "picked": len(picked), "detail": detail})
+                del log[:-50]
 
         # 실패는 항상 보인다. 조용히 데이터를 버리는 게 제일 나쁘다.
         nerr = sum(errs.values())
