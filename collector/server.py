@@ -38,6 +38,36 @@ STATE = {
 LOCK = threading.Lock()
 
 
+AVG_ROW_BYTES = 222  # 슬림 형식 행 평균 (✅ 실측) — 행 수 추정용
+
+
+def _obs_rate_per_day():
+    """하루 관측률(행/일) — 최근 1~2 운행일 jsonl 크기 ÷ 경과 시간.
+
+    행 수를 직접 세지 않고 크기 ÷ 평균 행 크기로 추정한다 (수백 MB 를 5초마다
+    세지 않기 위함). 오늘 운행일이 1시간 미만이면 전일만으로 잰다.
+    """
+    now = datetime.now(O.KST)
+    sd = O.service_day_of(now)
+    anchor = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    if now.hour < 4:
+        anchor -= timedelta(days=1)          # 운행일 시작(04시) 앵커
+    elapsed = (now - anchor).total_seconds()
+
+    window, size = 0.0, 0
+    p_today = os.path.join(O.DATA, f"bus-{sd:%Y-%m-%d}.jsonl")
+    p_prev = os.path.join(O.DATA, f"bus-{sd - timedelta(days=1):%Y-%m-%d}.jsonl")
+    if os.path.exists(p_today) and elapsed > 3600:
+        size += os.path.getsize(p_today)
+        window += elapsed
+    if os.path.exists(p_prev):
+        size += os.path.getsize(p_prev)
+        window += 86400
+    if window < 3600 or size == 0:
+        return None                          # 표본 부족 — ETA 표시 안 함
+    return (size / AVG_ROW_BYTES) / (window / 86400)
+
+
 # ── 커버리지 집계 ──────────────────────────────────────────────────
 def snapshot():
     k = O.cfg()
@@ -88,15 +118,31 @@ def snapshot():
         st = dict(STATE)
         st["errors"] = dict(STATE["errors"])
 
-    # 남은 기간 — 가정이 아니라 최근 실측 관측률로 역산
-    eta = None
-    if st["lastObs"] and total > 0 and st["started"]:
-        elapsed = (time.time() - st["started"]) / 86400.0
-        if elapsed > 0.002:  # 3분 이상 돌았을 때만
-            per_day = total / elapsed
-            remain = max(0, goal * tgt - total)
-            if per_day > 0:
-                eta = remain / per_day
+    # 남은 기간 — 밴드별 천장 도달 시점의 [최소, 최대] 범위.
+    #
+    # 속도: 최근 1~2 운행일 jsonl 크기 기반 (⚠️ 이전 판 버그 — total(역대 전체) ÷
+    # elapsed(재시작 후)라서 재시작마다 뻥튀기, 실제 ~100일이 24.9일로 표시됐다).
+    #
+    # 구조: (밴드, 요일) 셀은 그 요일(주 1회)에만 채워지고, 운행 구조상 천장이 있다
+    # (새벽·심야 ~82%, 낮 ~90% — 운행 안 하는 시간대의 셀은 영원히 빈다).
+    # 밴드마다 "천장까지 몇 주"를 계산해 가장 빠른/느린 밴드가 범위가 된다.
+    eta = eta_hi = None
+    per_day = _obs_rate_per_day()
+    if per_day:
+        band_tot = dict(c.execute("SELECT band, SUM(n) FROM cell GROUP BY band"))
+        tot_all = sum(band_tot.values())
+        need_bd = nseg * tgt                     # (밴드, 요일) 하나의 필요 관측 수
+        CEIL = {0: 0.82, nb - 1: 0.82}           # 04-07·20-03시 천장 — 나머지 0.90
+        weeks = []
+        for i in range(nb):
+            share = band_tot.get(i, 0) / tot_all if tot_all else 0  # 하루 관측 중 이 밴드 비중(실측 근사)
+            avg_pct = band_tot.get(i, 0) / (need_bd * 7)            # 7요일 평균 진행률
+            ceil = CEIL.get(i, 0.90)
+            if share > 0 and avg_pct < ceil:
+                weekly_gain = per_day * share / need_bd             # 요일 하나 기준 주당 증가
+                weeks.append((ceil - avg_pct) / weekly_gain)
+        if weeks:
+            eta, eta_hi = min(weeks) * 7, max(weeks) * 7            # 일 단위
 
     return {
         "routes": nroute, "segments": nseg, "goal": goal, "dayGoal": day_goal,
@@ -106,7 +152,7 @@ def snapshot():
         "pct": done / goal if goal else 0,
         "bands": band_rows, "days": byday, "today": today, "nowBand": nowband,
         "calls": calls, "quota": k["dailyQuota"],
-        "state": st, "etaDays": eta,
+        "state": st, "etaDays": eta, "etaDaysHi": eta_hi,
         "cfg": {kk: k[kk] for kk in
                 ("targetSamples", "maxRoutes", "dispatchRate",
                  "intervalSec", "serviceWindow", "dailyQuota")},
@@ -161,7 +207,8 @@ async function tick(){
   // 완성률
   h += `<div class=big>${pct(d.pct)}</div>`;
   h += `<div class=sub>${num(d.done)} / ${num(d.goal)} 셀 충족`
-     + (d.etaDays!=null ? ` · 남은 기간 약 <b>${d.etaDays.toFixed(1)}일</b> (현재 관측률 기준)` : '') + '</div>';
+     + (d.etaDays!=null ? ` · 남은 기간 약 <b>${Math.round(d.etaDays)}~${Math.round(d.etaDaysHi)}일</b>`
+       + ` (${(d.etaDays/7).toFixed(0)}~${(d.etaDaysHi/7).toFixed(0)}주 · 밴드별 천장 도달 기준, 최근 1~2일 관측률)` : '') + '</div>';
   h += bar(d.pct);
 
   // 건강
