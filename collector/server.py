@@ -80,13 +80,14 @@ def snapshot():
     routes = c.execute("SELECT COUNT(*), COALESCE(SUM(nstops),0) FROM route").fetchone()
     nroute, nstops = routes
     nseg = max(0, nstops - nroute)
-    wd = O.WEEKDAYS
-    ph = ",".join("?" * len(wd))
-    goal = nseg * nb * len(wd)     # 평일(월~금 분리) 기준 목표 셀
+    # 요일 7종을 전부 분리한 뒤로 토·일은 더 이상 '병목'이 아니다 — 월~일 모두
+    # 주 1회씩만 채워지는 동등한 처지다. 그래서 완성률 분모도 7요일 전체로 본다.
+    ndays = 7
     day_goal = nseg * nb           # 요일 하나 기준 — 요일별 진행률의 분모
+    goal = day_goal * ndays        # 전체 목표 셀 (구간 × 밴드 × 7요일)
 
-    done = c.execute(f"SELECT COUNT(*) FROM cell WHERE daytype IN ({ph}) AND n >= ?", (*wd, tgt)).fetchone()[0]
-    seen = c.execute(f"SELECT COUNT(*) FROM cell WHERE daytype IN ({ph})", wd).fetchone()[0]
+    done = c.execute("SELECT COUNT(*) FROM cell WHERE n >= ?", (tgt,)).fetchone()[0]
+    seen = c.execute("SELECT COUNT(*) FROM cell").fetchone()[0]
     total = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
 
     # 밴드별 — 오늘(운행일 기준) 요일만 본다. 자정~04시엔 전날 요일이 '오늘'이다
@@ -259,7 +260,7 @@ async function tick(){
     const v = d.days[k] || {obs:0,done:0,cells:0,pct:0};
     h += `<tr><td width=40>${label}</td>
           <td class=n width=64><b>${pct(v.pct)}</b></td>
-          <td width=250>${bar(v.pct, (k==='sat'||k==='sun')?'warn':'')}</td>
+          <td width=250>${bar(v.pct, v.pct>=1?'ok':'')}</td>
           <td class=n style="white-space:nowrap">충족 셀 ${num(v.done)} / ${num(d.dayGoal)}</td>
           <td class=n style="white-space:nowrap;opacity:.6">관측 ${num(v.obs)} / ${num(d.dayNeed)}건</td></tr>`;
   }
