@@ -123,21 +123,28 @@ def subway_snapshot():
     for name, sn, pairs in rows:
         judge[name] = round(sn / pairs, 1) if pairs else 0
 
-    # sumN 도 같이 — filled(n>=목표)는 7주째까지 0 이라 진행이 안 보인다.
+    # fillN = Σmin(n, 목표) — 진행률의 분자다.
+    # ⚠️ filled(n>=목표)를 진행률로 쓰면 7주차 전까지 **수학적으로 0%** 다:
+    #    지하철 셀은 요일별로 주 1회씩만 차서 6주차에도 전 셀이 n<7 → 0%,
+    #    그러다 7주차에 한꺼번에 100% 로 점프한다 (✅ 실측: 하루 뒤 3,671셀
+    #    전부 n=1 → 0.0%). "멈춘 것"과 "차는 중"이 구분되지 않는다.
+    #    min 으로 자르는 건 초과 관측이 빈 셀을 가리지 못하게 하려는 것.
     agg = {}
     with _DB_LOCK:
         rows = c.execute(
             """SELECT line, daytype, COUNT(*), COALESCE(SUM(n>=?),0),
-                      COUNT(DISTINCT trainNo), COUNT(DISTINCT statnId), COALESCE(SUM(n),0)
-               FROM subway_cell GROUP BY line, daytype""", (tgt,)).fetchall()
-    for name, dtp, s, f2, tr, st, sn in rows:
-        a = agg.setdefault(name, {"seen": 0, "filled": 0, "sumN": 0, "by": {},
+                      COUNT(DISTINCT trainNo), COUNT(DISTINCT statnId), COALESCE(SUM(n),0),
+                      COALESCE(SUM(MIN(n,?)),0)
+               FROM subway_cell GROUP BY line, daytype""", (tgt, tgt)).fetchall()
+    for name, dtp, s, f2, tr, st, sn, fn in rows:
+        a = agg.setdefault(name, {"seen": 0, "filled": 0, "sumN": 0, "fillN": 0, "by": {},
                                   "trains": 0, "stations": 0})
-        a["by"][dtp] = {"seen": s, "filled": f2, "sumN": sn,
+        a["by"][dtp] = {"seen": s, "filled": f2, "sumN": sn, "fillN": fn,
                         "days": round(sn / s, 1) if s else 0}   # 셀당 평균 관측 일수
         a["seen"] += s
         a["filled"] += f2
         a["sumN"] += sn
+        a["fillN"] += fn
         a["trains"] = max(a["trains"], tr)
         a["stations"] = max(a["stations"], st)
 
@@ -190,9 +197,10 @@ def subway_snapshot():
             for kid in (O.cfg().get("subwayKeys") or ["SEOUL_SUBWAY_KEY"])]
     lines = sorted(
         ({"name": n, "trains": a["trains"], "stations": a["stations"],
-          "seen": a["seen"], "filled": a["filled"], "sumN": a["sumN"], "target": tgt,
+          "seen": a["seen"], "filled": a["filled"], "sumN": a["sumN"],
+          "fillN": a["fillN"], "target": tgt,
           "judgeDays": judge.get(n, 0),
-          "byDay": {d: a["by"].get(d, {"seen": 0, "filled": 0, "sumN": 0, "days": 0})
+          "byDay": {d: a["by"].get(d, {"seen": 0, "filled": 0, "sumN": 0, "fillN": 0, "days": 0})
                     for d in DAYS7},
           "written": per_line_written.get(n, 0)}
          for n, a in agg.items()),
@@ -491,15 +499,17 @@ function renderSubway(d){
   const KOD = {mon:'월',tue:'화',wed:'수',thu:'목',fri:'금',sat:'토',sun:'일'};
   const D7 = ['mon','tue','wed','thu','fri','sat','sun'];
   const alive = sub.lastObs && (Date.now()/1000 - sub.lastObs) < 300;
-  const tot = sub.lines.reduce((a,L)=>({seen:a.seen+L.seen, filled:a.filled+L.filled, sumN:a.sumN+(L.sumN||0)}), {seen:0,filled:0,sumN:0});
+  const tot = sub.lines.reduce((a,L)=>({seen:a.seen+L.seen, filled:a.filled+L.filled,
+    sumN:a.sumN+(L.sumN||0), fillN:a.fillN+(L.fillN||0)}), {seen:0,filled:0,sumN:0,fillN:0});
   const tgtAll = sub.lines.length ? sub.lines[0].target : 7;
-  // ★ 진행률은 **셀 기준** — 버스와 같은 의미(목표를 채운 셀 / 관측된 셀).
-  // ⚠️ 지하철 셀은 하루 1샘플씩 균일하게 차서 목표(7일) 전까지 전부 0 이다.
-  //    그래서 옆에 '관측 일수 N/7일'을 같이 보여준다 — 진행이 멈춘 게 아니라
-  //    아직 채워지는 중임을 구분하려고. (Σn 기반 비율은 '평균 충전율'이지
-  //    '완성된 셀'이 아니라 완성률로 쓰면 안 된다.)
-  const rate = tot.seen ? tot.filled/tot.seen : 0;
-  const prog = L => L.seen ? L.filled/L.seen : 0;
+  // ★ 진행률은 **셀 기준**이되 부분 진행을 반영한다: Σmin(n,목표) / (셀 수 × 목표).
+  //   '목표를 채운 셀 / 관측된 셀'은 지하철에선 못 쓴다 — 셀이 요일별 주 1회씩
+  //   균일하게 차서 6주차에도 0%, 7주차에 100% 로 점프한다 (✅ 실측: 하루 뒤
+  //   3,671셀 전부 n=1 → 0.0%). 이건 셀을 안 쓰는 게 아니라 셀의 '충전 정도'를
+  //   세는 것이고, 매주 균일하게 오른다 (1주=14%, 7주=100%).
+  //   완료된 셀 수(filled)는 별도 숫자로 계속 보여준다.
+  const rate = tot.seen ? tot.fillN/(tot.seen*tgtAll) : 0;
+  const prog = L => L.seen ? (L.fillN||0)/(L.seen*L.target) : 0;
   const days = L => L.seen ? (L.sumN||0)/L.seen : 0;      // 셀당 평균 관측 일수
   let h = '<div class=sub><b>전 노선 일괄(ALL)</b> 도착정보 — 1콜에 19노선·555역 (✅ 경기·인천 포함). '
     + '<b>B안 셀</b> (노선,열차,역,요일)별 관측 일수 — trainNo 가 매일 반복이라 요일별 며칠이면 '
@@ -512,8 +522,8 @@ function renderSubway(d){
         <div class=k>도착·출발 관측</div></div>`;
   h += `<div class=card><div class=k>노선</div><div class=v>${num(sub.lines.length)}</div>
         <div class=k>관측된 노선 수</div></div>`;
-  h += `<div class=card><div class=k>셀 충족 (전체)</div><div class="v ${rate>=.9?'ok':''}">${pct(rate)}</div>
-        <div class=k>${num(tot.filled)} / ${num(tot.seen)} 셀 · 관측 ${(tot.seen?tot.sumN/tot.seen:0).toFixed(1)}/${tgtAll}일</div></div>`;
+  h += `<div class=card><div class=k>셀 충전율 (전체)</div><div class="v ${rate>=.9?'ok':''}">${pct(rate)}</div>
+        <div class=k>${num(tot.seen)}셀 · 평균 ${(tot.seen?tot.sumN/tot.seen:0).toFixed(1)}/${tgtAll}일 · 완료 ${num(tot.filled)}</div></div>`;
   // 판정 준비도 (§8.1 ④) — 셀 충족(7주)과 다른 신호. 쌍당 3 관측이면 σ 를 잴 수 있다
   const jt = sub.judgeTarget || 3;
   const jd = sub.lines.length ? Math.min(...sub.lines.map(L=>L.judgeDays||0)) : 0;
@@ -538,7 +548,7 @@ function renderSubway(d){
   const lt = (id,label,extra) => `<span onclick="setLineTab('${id.replace(/'/g,"\\'")}')" `
     + `style="cursor:pointer;padding:3px 9px;margin:0 3px 4px 0;border-radius:5px;display:inline-block;`
     + `${lineTab===id?'background:#3b82f6;color:#fff;font-weight:600':'background:#8882'}">${label}${extra||''}</span>`;
-  h += `<h2>노선별 수집률 — 셀 충족 (목표 ${tgt}일 · 요일 7종)</h2>`;
+  h += `<h2>노선별 수집률 — 셀 충전율 (목표 ${tgt}일 · 요일 7종)</h2>`;
   h += '<div style="margin-bottom:10px">' + lt('__all__','전체')
      + sub.lines.map(L=>lt(L.name, L.name, `<span style="opacity:.6;font-size:11px"> ${pct(prog(L))}</span>`)).join('') + '</div>';
 
@@ -546,21 +556,22 @@ function renderSubway(d){
     h += '<div class=sub>아직 셀 없음 — 수집이 돌면 노선이 자동으로 나타난다. '
        + '(오늘 기록이 늘고 있는데 셀이 0이면 공휴일이거나 첫 사이클 전이다.)</div>';
   } else if(lineTab === '__all__'){
-    h += '<table><tr style="opacity:.5"><td>노선</td><td class=n>셀 충족</td><td></td>'
-       + '<td class=n>충족/셀</td><td class=n>판정 준비</td><td class=n>열차·역</td><td class=n>오늘</td></tr>';
+    h += '<table><tr style="opacity:.5"><td>노선</td><td class=n>충전율</td><td></td>'
+       + '<td class=n>셀(완료)</td><td class=n>판정 준비</td><td class=n>열차·역</td><td class=n>오늘</td></tr>';
     for(const L of sub.lines){
       const p = prog(L), j = L.judgeDays||0;
       h += `<tr><td width=90>${L.name}</td>
             <td class=n width=54><b>${pct(p)}</b></td>
             <td width=150>${bar(p, p>=1?'ok':'')}</td>
-            <td class=n style="white-space:nowrap">${num(L.filled)}/${num(L.seen)}</td>
+            <td class=n style="white-space:nowrap">${num(L.seen)} <span style="opacity:.55">(${num(L.filled)})</span></td>
             <td class="n ${j>=jt?'ok':''}" style="white-space:nowrap">${j.toFixed(1)}/${jt}일</td>
             <td class=n style="white-space:nowrap;opacity:.6">${L.trains}·${L.stations}</td>
             <td class=n style="white-space:nowrap;opacity:.6">${num(L.written)}</td></tr>`;
     }
     h += '</table>';
-    h += `<div class=sub style="margin-top:6px"><b>셀 충족</b> = 목표(${tgt}일)를 채운 셀 ÷ 관측된 셀 — 버스와 같은 기준. `
-       + `⚠️ 지하철 셀은 하루 1샘플씩 균일하게 차서 ${tgt}주차 전까지 전부 0% 다. `
+    h += `<div class=sub style="margin-top:6px"><b>충전율</b> = Σmin(관측일, ${tgt}) ÷ (셀 수 × ${tgt}) — `
+       + `셀 기준이되 부분 진행을 반영한다. 매주 약 ${(100/tgt).toFixed(0)}%p 씩 오른다. `
+       + `괄호 안은 목표를 다 채운 셀 수 — 이건 ${tgt}주차에야 늘기 시작한다. `
        + `<b>판정 준비</b>는 다른 신호다 — (열차,역) 쌍당 평균 관측 일수(<b>요일 무관</b>)이고 `
        + `${jt}일이면 정시성 σ 를 잴 수 있다(§8.1 ④). 즉 <b>${jt}일째부터 §8 #1 판정이 가능</b>하고, `
        + `셀 충족 ${tgt}주를 기다릴 필요가 없다.</div>`;
@@ -569,17 +580,17 @@ function renderSubway(d){
     if(!L){ h += '<div class=sub>그 노선은 아직 관측되지 않았다.</div>'; }
     else {
       h += `<div class=sub><b>${L.name}</b> — 열차 ${num(L.trains)}대 · 역 ${num(L.stations)}개 · `
-         + `오늘 기록 ${num(L.written)}건 · 셀 충족 <b>${pct(prog(L))}</b> `
-         + `(${num(L.filled)}/${num(L.seen)}) · 관측 ${days(L).toFixed(1)}/${L.target}일</div>`;
-      h += '<table><tr style="opacity:.5"><td>요일</td><td class=n>셀 충족</td><td></td>'
-         + '<td class=n>충족/셀</td><td class=n>관측 일수</td></tr>';
+         + `오늘 기록 ${num(L.written)}건 · 충전율 <b>${pct(prog(L))}</b> `
+         + `(${num(L.seen)}셀 · 완료 ${num(L.filled)}) · 관측 ${days(L).toFixed(1)}/${L.target}일</div>`;
+      h += '<table><tr style="opacity:.5"><td>요일</td><td class=n>충전율</td><td></td>'
+         + '<td class=n>셀(완료)</td><td class=n>관측 일수</td></tr>';
       for(const dk of D7){
-        const v = L.byDay[dk] || {seen:0,filled:0,days:0};
-        const dp = v.seen ? v.filled/v.seen : 0;
+        const v = L.byDay[dk] || {seen:0,filled:0,fillN:0,days:0};
+        const dp = v.seen ? (v.fillN||0)/(v.seen*L.target) : 0;
         h += `<tr><td width=40>${KOD[dk]}</td>
               <td class=n width=54><b>${pct(dp)}</b></td>
               <td width=180>${bar(dp, dp>=1?'ok':(dk==='sat'||dk==='sun')?'warn':'')}</td>
-              <td class=n style="white-space:nowrap">${num(v.filled)}/${num(v.seen)}</td>
+              <td class=n style="white-space:nowrap">${num(v.seen)} <span style="opacity:.55">(${num(v.filled)})</span></td>
               <td class=n style="white-space:nowrap;opacity:.75">${(v.days||0).toFixed(1)} / ${L.target}일</td></tr>`;
       }
       h += '</table>';
