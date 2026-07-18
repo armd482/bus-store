@@ -148,36 +148,86 @@ def connect():
     return c
 
 
-def export_old_jsonl(prefix, keep_days):
-    """{prefix}-YYYY-MM-DD.jsonl 중 keep_days 밖의 것을 gzip 해 config.exportDir 로
-    옮기고 원본 삭제 — 용량 확보 + 백업. 버스·지하철 수집기가 공유한다.
+def _rclone(args):
+    """rclone 호출 → (성공?, stdout). rclone 이 없거나 실패하면 (False, "")."""
+    import subprocess
+    try:
+        r = subprocess.run(["rclone"] + args, capture_output=True, text=True, timeout=180)
+        return r.returncode == 0, r.stdout
+    except Exception as e:
+        print(f"[rclone] {' '.join(args)} 실패: {e}", flush=True)
+        return False, ""
 
-    exportDir 미설정이면 아무것도 안 한다. 실패하면 원본을 지우지 않는다
-    (다음 호출 때 재시도) — 데이터를 잃는 경로는 없다. .gz 는 rclone 크론이
-    구글드라이브로 올린다 (README). rebuild 는 bus-*.gz 만 읽으므로 같은
-    폴더에 shinbundang-*.gz 가 섞여도 무해하다.
+
+def _backup_verified(name, local_gz, remote):
+    """이 .gz 가 안전하게 백업됐나 — 원본 삭제의 전제.
+
+    remote(예 'gdrive:busdata') 설정 시: 드라이브에 있는지 확인 → 없으면 재업로드
+    시도 → 재확인. 그래도 없으면 False (원본을 안 지운다).
+    remote 미설정 시(윈도우 OneDrive 등): 로컬 .gz 존재로만 판단 — 동기화앱/크론이
+    올린다고 신뢰한다.
     """
-    export_dir = cfg().get("exportDir")
+    if not remote:
+        return os.path.exists(local_gz)
+    ok, out = _rclone(["lsf", remote, "--include", name])
+    if ok and name in out:
+        return True
+    _rclone(["copy", local_gz, remote])            # 없으면 재업로드 시도
+    ok, out = _rclone(["lsf", remote, "--include", name])
+    return ok and name in out
+
+
+def rotate_jsonl(prefix):
+    """2단 로테이션 — 백업(어제)과 삭제(그저께 이전)를 분리한다. 버스·지하철 공유.
+
+      오늘        : 손대지 않는다 (수집 중)
+      어제        : gzip 백업본을 exportDir 로(+remote 설정 시 드라이브 업로드).
+                    원본 jsonl 은 로컬에 유지 — 대시보드 ETA 가 어제 파일 크기를 쓴다
+      그저께 이전  : 백업이 **드라이브에 확인되면** 원본 jsonl 삭제. 확인 안 되면
+                    재업로드 시도, 그래도 실패하면 그대로 둔다 (데이터를 잃는 경로 없음).
+                    → 삭제 전 하루의 유예가 생겨 수동 백업 확인이 가능하다.
+
+    exportDir 미설정이면 no-op. .gz 는 rebuild 가 읽으므로 exportDir 에 계속 남긴다
+    (rebuild 는 bus-*.gz 만 읽어 shinbundang-*.gz 와 무관).
+    """
+    k = cfg()
+    export_dir = k.get("exportDir")
     if not export_dir:
         return
+    remote = k.get("driveRemote")   # 예 'gdrive:busdata'. null 이면 로컬 .gz 존재로만 판단
     import glob
     import gzip
     import shutil
-    try:
-        os.makedirs(export_dir, exist_ok=True)
-        for src in sorted(glob.glob(os.path.join(DATA, f"{prefix}-*.jsonl"))):
-            day = os.path.basename(src)[len(prefix) + 1:len(prefix) + 11]  # {prefix}-|YYYY-MM-DD|.jsonl
-            if day in keep_days:
+    base = service_day_of(datetime.now(KST))
+    today = base.strftime("%Y-%m-%d")
+    yest = (base - timedelta(days=1)).strftime("%Y-%m-%d")
+    os.makedirs(export_dir, exist_ok=True)
+    for src in sorted(glob.glob(os.path.join(DATA, f"{prefix}-*.jsonl"))):
+        day = os.path.basename(src)[len(prefix) + 1:len(prefix) + 11]  # {prefix}-|YYYY-MM-DD|.jsonl
+        if day >= today:
+            continue                                   # 오늘/미래 — 손대지 않음
+        name = os.path.basename(src) + ".gz"
+        dst = os.path.join(export_dir, name)
+        # ① 백업 보장 — .gz 가 없으면 만든다 (원본 유지)
+        if not os.path.exists(dst):
+            try:
+                with open(src, "rb") as fi, gzip.open(dst + ".tmp", "wb") as fo:
+                    shutil.copyfileobj(fi, fo)
+                os.replace(dst + ".tmp", dst)          # 원자적
+                print(f"[백업] {name} 생성 ({os.path.getsize(dst)/1e6:.1f}MB)", flush=True)
+            except OSError as e:
+                print(f"[백업] ⚠️ {name} 실패 (원본 보존): {e}", flush=True)
                 continue
-            dst = os.path.join(export_dir, os.path.basename(src) + ".gz")
-            with open(src, "rb") as fi, gzip.open(dst + ".tmp", "wb") as fo:
-                shutil.copyfileobj(fi, fo)
-            os.replace(dst + ".tmp", dst)   # 원자적 — 반쯤 쓴 .gz 가 안 남게
+        if remote:
+            _rclone(["copy", dst, remote])             # 백업 직후 즉시 업로드 시도
+        # ② 삭제는 그저께 이전만 — 어제는 원본 유지(ETA)
+        if day >= yest:
+            continue
+        if _backup_verified(name, dst, remote):
             os.remove(src)
-            print(f"[내보내기] {os.path.basename(src)} → {dst} "
-                  f"({os.path.getsize(dst)/1e6:.1f}MB)", flush=True)
-    except OSError as e:
-        print(f"[{datetime.now(KST):%H:%M:%S}] ⚠️ 내보내기 실패 ({prefix}, 원본 보존): {e}", flush=True)
+            print(f"[삭제] {os.path.basename(src)} (백업 확인됨)", flush=True)
+        else:
+            print(f"[삭제 보류] {os.path.basename(src)} — 백업 미확인, 원본 유지 (수동 확인 요망)", flush=True)
 
 
 def bump(conn, routeid, from_ord, to_ord, band, daytype, k=1):

@@ -175,13 +175,13 @@ def main():
     recorded = None  # 오늘을 수집일 장부에 이미 넣었는지 (하루 1회만 쓰면 됨)
     last_state = {}  # trainNo -> (statnId, trainSttus)
 
-    def export(t):
-        """오늘·어제만 남기고 shinbundang-*.jsonl 을 gzip → exportDir (구글드라이브 백업).
-        지하철 파일은 작아 gzip 이 즉시라 스레드 불필요."""
-        keep = {service_day(t), service_day(t - timedelta(days=1))}
-        O.export_old_jsonl("shinbundang", keep)
+    def export():
+        """shinbundang-*.jsonl 2단 로테이션(백업 어제 / 삭제 그저께) — 별도 스레드.
+        rclone 네트워크 호출이 있으니 폴링을 막지 않게 스레드로."""
+        __import__("threading").Thread(
+            target=O.rotate_jsonl, args=("shinbundang",), daemon=True).start()
 
-    export(now())   # 시작 시 1회 — 꺼져 있는 동안 쌓인 옛 파일 정리
+    export()   # 시작 시 1회 — 꺼져 있는 동안 쌓인 옛 파일 정리
 
     print(f"[{now():%H:%M:%S}] 수집 시작 · {LINE} · {INTERVAL_SEC}s 간격 · "
           f"일 상한 {DAILY_CAP}회 (오늘 이미 {read_calls(quota_day(now()))}회 사용)", flush=True)
@@ -193,7 +193,7 @@ def main():
         if d != day:  # 날이 바뀌면 위상 초기화 (카운터는 파일이 날짜별이라 자동)
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d} (전일 {read_calls(day)}콜 / {written}건)", flush=True)
             day, written, last_state = d, 0, {}
-            export(t)   # 그저께가 된 파일을 백업으로 내보낸다
+            export()   # 어제 백업 + 그저께 삭제(백업 확인 후)
             time.sleep(random.uniform(0, INTERVAL_SEC))
             continue
 

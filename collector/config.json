@@ -20,7 +20,10 @@
   "_dayTypes": "요일 7종 전부 분리 (2026-07-17 결정 — 기간 비용을 알고 용인). ⚠️ 각 요일은 주 1일씩만 얻으므로 목표 7샘플이면 요일당 7주 — 평일 통합(weekday, 1.4주) 대비 5배. 요일별 주행시간 차이를 직접 보기 위함. 되돌리려면 orchestrator.day_type 을 고치고 rebuild — 요일은 jsonl 의 t 에서 재계산되므로 데이터 손실 없음.",
 
   "exportDir": null,
-  "_exportDir": "지정하면 운행일 전환(04시)마다 그저께 이전의 bus-*.jsonl · shinbundang-*.jsonl 을 gzip(~10:1)해 이 폴더로 옮기고 원본을 지운다 — 버스·지하철 수집기가 공유. 로컬 디스크는 오늘+어제만 유지. OneDrive/구글드라이브 동기화 폴더를 주면 백업까지 자동. 옮긴 bus-*.gz 는 rebuild 가 그대로 읽는다(지하철은 장부가 없어 rebuild 무관). ⚠️ 리눅스/EC2 는 로컬 폴더 지정 + rclone **copy** 크론(README, --include \"*.jsonl.gz\" 라 둘 다 올라감) — move 로 클라우드에 올리고 로컬을 지우면 rebuild 가 과거를 못 본다 (축소 가드가 잡아주긴 하지만 애초에 copy 가 맞다). null 이면 끔. 윈도우 예: \"C:\\\\Users\\\\me\\\\OneDrive\\\\busdata\"",
+  "_exportDir": "지정하면 운행일 전환(04시)마다 bus-*.jsonl · shinbundang-*.jsonl 을 2단 로테이션한다 (버스·지하철 공유). ① 어제: gzip 백업본을 이 폴더로(+driveRemote 설정 시 드라이브 업로드), 원본 jsonl 은 로컬 유지(ETA 용). ② 그저께 이전: 백업이 드라이브에 확인되면 원본 삭제, 아니면 재업로드 시도→그래도 실패면 보류. → 삭제 전 하루 유예로 수동 백업 확인 가능. 로컬은 대략 오늘+어제 원본 + 전체 .gz. rebuild 는 bus-*.gz 를 읽으므로 exportDir 에 .gz 는 계속 남긴다. null 이면 끔. 윈도우 예: \"C:\\\\Users\\\\me\\\\OneDrive\\\\busdata\"",
+
+  "driveRemote": null,
+  "_driveRemote": "rclone 리모트 경로 (예 \"gdrive:busdata\"). 설정하면 ① 백업 직후 즉시 드라이브 업로드 ② 원본 삭제 전 드라이브에 실제로 있는지 rclone lsf 로 확인(없으면 재업로드, 그래도 없으면 삭제 보류). 이걸 쓰면 별도 rclone 크론이 불필요하다 (수집기가 직접 올린다). null 이면 로컬 .gz 존재로만 판단 — 윈도우 OneDrive 동기화폴더처럼 동기화앱이 알아서 올리는 경우.",
 
   "intervalSec": 30,
   "_intervalSec": "✅ 실측: 30초면 정류장 이동의 94.7%를 1칸으로 잡는다(2칸 이상 건너뜀 5.2%). 갱신주기 10~20초보다 성기게.",

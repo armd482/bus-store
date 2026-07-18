@@ -180,15 +180,13 @@ def main():
     last = {}       # vehicleno -> (nodeord, 그 정류장에서 처음 본 시각)
     picked, cyc, written = [], 0, 0
 
-    def kickoff_export(t):
-        """오늘·어제만 남기고 bus-*.jsonl 내보내기 — 별도 스레드 (gzip 수 초가 사이클을 막지 않게).
-        어제를 남기는 건 대시보드 ETA(_obs_rate_per_day)가 어제 파일 크기를 쓰기 때문."""
-        keep = {service_day(t),
-                (O.service_day_of(t) - timedelta(days=1)).strftime("%Y-%m-%d")}
+    def kickoff_export():
+        """bus-*.jsonl 2단 로테이션(백업 어제 / 삭제 그저께) — 별도 스레드.
+        rclone 네트워크 호출이 있으니 사이클을 막지 않게 스레드로 돌린다."""
         __import__("threading").Thread(
-            target=O.export_old_jsonl, args=("bus", keep), daemon=True).start()
+            target=O.rotate_jsonl, args=("bus",), daemon=True).start()
 
-    kickoff_export(now())   # 시작 시 1회 — 꺼져 있는 동안 쌓인 옛 파일 정리
+    kickoff_export()   # 시작 시 1회 — 꺼져 있는 동안 쌓인 옛 파일 정리
 
     print(f"[{now():%H:%M:%S}] 수집 시작 · 목표 {target}샘플 · 밴드 {nb}개 · "
           f"최대 {maxr}노선 · 상한 {quota:,} (오늘 {read_calls(quota_day(now())):,} 사용)", flush=True)
@@ -202,7 +200,7 @@ def main():
             day, last, written, picked = d, {}, 0, []
             with LOCK:
                 STATE["errLog"] = []   # 오류 로그 매일 초기화 — 어제 실패가 오늘 화면에 안 남게
-            kickoff_export(t)   # 그저께가 된 파일을 내보낸다
+            kickoff_export()   # 어제 백업 + 그저께 삭제(백업 확인 후)
             continue
         if not O.in_window(t, window):
             # ✅ 실측: 03-04시는 버스가 0이다. 관측 수는 폴링이 아니라
