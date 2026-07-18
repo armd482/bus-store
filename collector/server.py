@@ -93,8 +93,16 @@ def subway_snapshot():
     c = O.connect()
 
     # 노선은 관측된 것에서 자동 발견된다 — 일괄(ALL) 수집이라 config 에 노선 목록이 없다
+    # 판정 준비도 (§8.1 ④) — (열차,역) 쌍당 평균 관측 일수, **요일 무관**.
+    # 셀 충족(7주)과 다른 신호다: 정시성 σ 를 재는 데는 쌍당 3~5 관측이면 되므로
+    # 이걸 봐야 판정 시점을 안 놓친다. Σn ÷ 서로 다른 (열차,역) 쌍 수.
+    judge = {}
+    for name, sn, pairs in c.execute(
+            """SELECT line, COALESCE(SUM(n),0), COUNT(DISTINCT trainNo || '|' || statnId)
+               FROM subway_cell GROUP BY line"""):
+        judge[name] = round(sn / pairs, 1) if pairs else 0
+
     # sumN 도 같이 — filled(n>=목표)는 7주째까지 0 이라 진행이 안 보인다.
-    # 진행률 = Σn / (셀수 × 목표) 로 보면 첫날에도 1/7 = 14% 로 나온다.
     agg = {}
     for name, dtp, s, f2, tr, st, sn in c.execute(
             """SELECT line, daytype, COUNT(*), COALESCE(SUM(n>=?),0),
@@ -155,6 +163,7 @@ def subway_snapshot():
     lines = sorted(
         ({"name": n, "trains": a["trains"], "stations": a["stations"],
           "seen": a["seen"], "filled": a["filled"], "sumN": a["sumN"], "target": tgt,
+          "judgeDays": judge.get(n, 0),
           "byDay": {d: a["by"].get(d, {"seen": 0, "filled": 0, "sumN": 0, "days": 0})
                     for d in DAYS7},
           "written": per_line_written.get(n, 0)}
@@ -166,6 +175,7 @@ def subway_snapshot():
         "inService": subway_collector.in_service(now),
         "keys": keys, "lines": lines, "written": total_written,
         "lastObs": last_epoch, "lastStn": last_stn, "lastLine": last_line,
+        "judgeTarget": 3,   # §8.1 ④ — 쌍당 3 관측이면 σ 를 잴 수 있다
     }
 
 
@@ -442,6 +452,12 @@ function renderSubway(d){
         <div class=k>관측된 노선 수</div></div>`;
   h += `<div class=card><div class=k>셀 충족 (전체)</div><div class="v ${rate>=.9?'ok':''}">${pct(rate)}</div>
         <div class=k>${num(tot.filled)} / ${num(tot.seen)} 셀 · 관측 ${(tot.seen?tot.sumN/tot.seen:0).toFixed(1)}/${tgtAll}일</div></div>`;
+  // 판정 준비도 (§8.1 ④) — 셀 충족(7주)과 다른 신호. 쌍당 3 관측이면 σ 를 잴 수 있다
+  const jt = sub.judgeTarget || 3;
+  const jd = sub.lines.length ? Math.min(...sub.lines.map(L=>L.judgeDays||0)) : 0;
+  h += `<div class=card><div class=k>판정 준비도 (§8 #1)</div>
+        <div class="v ${jd>=jt?'ok':''}">${jd.toFixed(1)}<span style="font-size:13px">/${jt}일</span></div>
+        <div class=k>${jd>=jt?'정시성 판정 가능':'전 노선 최소값 (요일 무관)'}</div></div>`;
   h += '</div>';
 
   // 키별 쿼터 — 라운드로빈이라 고르게 소진돼야 정상
@@ -469,21 +485,23 @@ function renderSubway(d){
        + '(오늘 기록이 늘고 있는데 셀이 0이면 공휴일이거나 첫 사이클 전이다.)</div>';
   } else if(lineTab === '__all__'){
     h += '<table><tr style="opacity:.5"><td>노선</td><td class=n>셀 충족</td><td></td>'
-       + '<td class=n>충족/셀</td><td class=n>관측 일수</td><td class=n>열차·역</td><td class=n>오늘</td></tr>';
+       + '<td class=n>충족/셀</td><td class=n>판정 준비</td><td class=n>열차·역</td><td class=n>오늘</td></tr>';
     for(const L of sub.lines){
-      const p = prog(L), dv = days(L);
+      const p = prog(L), j = L.judgeDays||0;
       h += `<tr><td width=90>${L.name}</td>
             <td class=n width=54><b>${pct(p)}</b></td>
             <td width=150>${bar(p, p>=1?'ok':'')}</td>
             <td class=n style="white-space:nowrap">${num(L.filled)}/${num(L.seen)}</td>
-            <td class=n style="white-space:nowrap;opacity:.75">${dv.toFixed(1)}/${L.target}일</td>
+            <td class="n ${j>=jt?'ok':''}" style="white-space:nowrap">${j.toFixed(1)}/${jt}일</td>
             <td class=n style="white-space:nowrap;opacity:.6">${L.trains}·${L.stations}</td>
             <td class=n style="white-space:nowrap;opacity:.6">${num(L.written)}</td></tr>`;
     }
     h += '</table>';
     h += `<div class=sub style="margin-top:6px"><b>셀 충족</b> = 목표(${tgt}일)를 채운 셀 ÷ 관측된 셀 — 버스와 같은 기준. `
        + `⚠️ 지하철 셀은 하루 1샘플씩 균일하게 차서 ${tgt}주차 전까지 전부 0% 다. `
-       + `진행 여부는 옆의 <b>관측 일수</b>(셀당 평균)로 본다 — 이게 늘고 있으면 정상이다.</div>`;
+       + `<b>판정 준비</b>는 다른 신호다 — (열차,역) 쌍당 평균 관측 일수(<b>요일 무관</b>)이고 `
+       + `${jt}일이면 정시성 σ 를 잴 수 있다(§8.1 ④). 즉 <b>${jt}일째부터 §8 #1 판정이 가능</b>하고, `
+       + `셀 충족 ${tgt}주를 기다릴 필요가 없다.</div>`;
   } else {
     const L = sub.lines.find(x=>x.name===lineTab);
     if(!L){ h += '<div class=sub>그 노선은 아직 관측되지 않았다.</div>'; }
@@ -508,10 +526,15 @@ function renderSubway(d){
     }
   }
 
-  h += '<h2>판정 (§8 #1)</h2>';
-  h += '<div class=sub>각 열차의 실제 통과 시각(arvlCd 진입/도착/출발)을 계획 시각표와 대조 → 편차 분포. '
-    + '±30초면 절벽 성립, ±3분+면 절벽 무의미 → 차별점 재정의. 전 노선을 같이 재므로 '
-    + '<b>운영사별 정시성 차등</b>(신분당선 전용궤도 vs 코레일 지상구간 vs 서울교통공사 혼잡)까지 한 번에 본다.</div>';
+  h += '<h2>판정 규칙 (docs §8.1)</h2>';
+  h += '<div class=sub>① <b>시각 근접 매칭</b>으로 대조한다 — ✅ 실측상 실시간 <code>btrainNo</code>(숫자)와 '
+    + '시각표 <code>열차코드</code>(S902/K802) 형식이 어긋나고 <b>신분당선 PDF엔 열차번호가 아예 없어</b> ID 조인이 불가능하다. '
+    + '미매칭 비율도 같이 본다(그 자체가 "시각표를 안 지킨다"의 증거).<br>'
+    + '② 시각은 <code>t</code>(폴링, ±76초)가 아니라 <b><code>recptnDt</code></b>(BIS 수신, ~20초)를 쓴다 — '
+    + '해상도가 신호보다 거칠면 못 잰다.<br>'
+    + '③ 임계값은 배차 H 대비다: <b>오판율 ≈ 2σ/H</b> → σ≤0.05H 면 절벽 신뢰, σ≥0.3H 면 무의미. '
+    + '"±30초"는 H=10분에서 나온 값이라 <b>노선별 H와 함께</b> 판정한다.<br>'
+    + '⚠️ 측정 바닥 σ≈20초 > 첨두 기준선(15초) — H=5분 노선에선 <b>기각만 가능하고 증명은 불가</b>하다.</div>';
   return h;
 }
 
