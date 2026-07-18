@@ -82,6 +82,17 @@ def day_type(t):
     return ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[service_day_of(t).weekday()]
 
 
+def is_holiday(t):
+    """공휴일(운행일 기준)인가 — config "holidays" 날짜 목록.
+
+    평일에 낀 공휴일은 그 요일의 평상 운행이 아니다(대개 휴일 다이어) —
+    수요일 추석을 'wed' 표본으로 넣으면 요일별 주행시간이 오염된다.
+    장부(cell/subway_cell)에서만 제외하고 jsonl 엔 남긴다 — 목록이 틀렸어도
+    고치고 rebuild 하면 재분류된다.
+    """
+    return service_day_of(t).strftime("%Y-%m-%d") in set(cfg().get("holidays") or [])
+
+
 def band_of(t, bands):
     """시각 → 밴드 인덱스. 어느 밴드에도 없으면 None(커버리지에 안 넣음).
 
@@ -234,6 +245,15 @@ def rotate_jsonl(prefix):
             _rclone(["copy", dst, remote])             # 백업 직후 즉시 업로드 시도
         # ② 삭제는 그저께 이전만 — 어제는 원본 유지(ETA)
         if day >= yest:
+            continue
+        # 유예 보장 — 캐치업(며칠 꺼졌다 재기동)으로 방금 만든 .gz 는 같은 패스에서
+        # 바로 지우지 않는다. "삭제 전 하루 유예"(README) 가 정상 운영에서만이 아니라
+        # 항상 성립하게. 정상 흐름은 .gz 생성(어제 취급)→삭제(그저께 취급)가 하루
+        # 간격이라 이 가드를 그냥 통과한다.
+        try:
+            if time.time() - os.path.getmtime(dst) < 20 * 3600:
+                continue
+        except OSError:
             continue
         if _backup_verified(name, dst, remote):
             os.remove(src)
@@ -448,6 +468,7 @@ def rebuild(force, shrink_ok=False):
         band INTEGER NOT NULL, daytype TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (routeid, from_ord, to_ord, band, daytype))""")
     bad = total = 0
+    hols = set(cfg().get("holidays") or [])
     for p in files:
         opener = gzip.open if p.endswith(".gz") else open
         day_counts = {}   # 이 파일(하루)에서만 — 메모리 상한이 하루치로 묶인다
@@ -469,11 +490,17 @@ def rebuild(force, shrink_ok=False):
             # 요일은 저장값이 아니라 t 에서 다시 계산한다 — 분류 규칙이 바뀌어도
             # (weekday 통합 → 월~일 분리) 옛 행이 새 규칙으로 재분류되도록.
             try:
-                dt = day_type(datetime.fromisoformat(r["t"]))
+                dtm = datetime.fromisoformat(r["t"])
             except (KeyError, ValueError):
                 continue
-            key = (r["routeid"], fo, to, b, dt)
-            day_counts[key] = day_counts.get(key, 0) + 1
+            if service_day_of(dtm).strftime("%Y-%m-%d") in hols:
+                continue  # 공휴일 — 수집기와 같은 기준으로 장부에서 제외 (jsonl 은 진실로 유지)
+            dt = day_type(dtm)
+            # 수집기와 같은 인접 구간 분해 — 2칸 이상 건너뛴 전이를 (fo,to) 셀로
+            # 넣으면 분모(인접 구간수)와 어긋난다. bus_collector 의 bump 로직 참조.
+            for o in range(fo, to):
+                key = (r["routeid"], o, o + 1, b, dt)
+                day_counts[key] = day_counts.get(key, 0) + 1
         c.executemany("""INSERT INTO cell_stage(routeid,from_ord,to_ord,band,daytype,n)
                          VALUES(?,?,?,?,?,?)
                          ON CONFLICT(routeid,from_ord,to_ord,band,daytype)
