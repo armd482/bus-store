@@ -115,55 +115,67 @@ def mac_run_dir():
     return dst
 
 
-def mac_plist_path():
-    return os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
+# 리눅스와 같은 이유로 두 에이전트를 함께 관리한다 (버스 + 지하철)
+MAC_AGENTS = (
+    (LABEL, "server.py", "server"),
+    (LABEL + ".subway", "subway_collector.py", "subway"),
+)
 
 
-def mac_target():
-    return f"gui/{os.getuid()}/{LABEL}"
+def mac_plist_path(label=LABEL):
+    return os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
+
+
+def mac_target(label=LABEL):
+    return f"gui/{os.getuid()}/{label}"
 
 
 def mac_install():
     d = mac_run_dir()
     os.makedirs(os.path.join(d, "logs"), exist_ok=True)
-    run(["launchctl", "bootout", mac_target()], ok_fail=True)  # 돌던 게 있으면 먼저 내리고
-    ensure_pool(d)                                             # 풀이 비었으면 fetch_routes 부터
-    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+    for label, _, _ in MAC_AGENTS:
+        run(["launchctl", "bootout", mac_target(label)], ok_fail=True)  # 돌던 게 있으면 먼저
+    ensure_pool(d)                                                      # 풀이 비었으면 fetch_routes 부터
+    for label, script, logname in MAC_AGENTS:
+        with open(mac_plist_path(label), "w") as f:
+            f.write(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>{LABEL}</string>
-  <key>ProgramArguments</key><array><string>{PY}</string><string>server.py</string></array>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key><array><string>{PY}</string><string>{script}</string></array>
   <key>WorkingDirectory</key><string>{d}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>{d}/logs/server.log</string>
-  <key>StandardErrorPath</key><string>{d}/logs/server.err</string>
+  <key>StandardOutPath</key><string>{d}/logs/{logname}.log</string>
+  <key>StandardErrorPath</key><string>{d}/logs/{logname}.err</string>
 </dict></plist>
-"""
-    with open(mac_plist_path(), "w") as f:
-        f.write(plist)
-    run(["launchctl", "enable", mac_target()], ok_fail=True)
-    run(["launchctl", "bootout", mac_target()], ok_fail=True)  # 이미 떠 있으면 교체
-    run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path()])
-    print(f"설치·시작됨. 대시보드: http://localhost:877")
+""")
+        run(["launchctl", "enable", mac_target(label)], ok_fail=True)
+        run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path(label)], ok_fail=True)
+    print("설치·시작됨 (버스+지하철). 대시보드: http://localhost:877")
+    print("⚠️ 지하철은 .env 의 SEOUL_SUBWAY_KEY(·KEY2·KEY3)가 있어야 돈다")
     follow(os.path.join(d, "logs", "server.log"))
 
 
 def mac_stop():
-    run(["launchctl", "bootout", mac_target()], ok_fail=True)   # 지금 내리고
-    run(["launchctl", "disable", mac_target()], ok_fail=True)   # 재부팅에도 안 뜨게
+    for label, _, _ in MAC_AGENTS:
+        run(["launchctl", "bootout", mac_target(label)], ok_fail=True)   # 지금 내리고
+        run(["launchctl", "disable", mac_target(label)], ok_fail=True)   # 재부팅에도 안 뜨게
     kill_manual()
-    print("완전 종료. 재부팅해도 안 살아난다 — 다시 켜려면: python3 service.py start")
+    print("완전 종료 (버스+지하철). 재부팅해도 안 살아난다 — 다시 켜려면: python3 service.py start")
 
 
 def mac_start():
     if not os.path.exists(mac_plist_path()):
         sys.exit("등록이 없다 — 먼저: python3 service.py install")
-    run(["launchctl", "enable", mac_target()], ok_fail=True)
-    run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path()], ok_fail=True)
-    run(["launchctl", "kickstart", mac_target()], ok_fail=True)
-    print("시작됨.")
+    for label, _, _ in MAC_AGENTS:
+        if not os.path.exists(mac_plist_path(label)):
+            continue
+        run(["launchctl", "enable", mac_target(label)], ok_fail=True)
+        run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path(label)], ok_fail=True)
+        run(["launchctl", "kickstart", mac_target(label)], ok_fail=True)
+    print("시작됨 (버스+지하철).")
     follow(os.path.join(mac_workdir(), "logs", "server.log"))
 
 
@@ -173,25 +185,37 @@ def mac_logs():
 
 def mac_uninstall():
     mac_stop()
-    try:
-        os.remove(mac_plist_path())
-    except OSError:
-        pass
-    print("등록 제거됨.")
+    for label, _, _ in MAC_AGENTS:
+        try:
+            os.remove(mac_plist_path(label))
+        except OSError:
+            pass
+    print("등록 제거됨 (버스+지하철).")
 
 
 def mac_status():
-    r = run(["launchctl", "print", mac_target()], ok_fail=True)
-    if r.returncode != 0:
-        print("에이전트: 안 떠 있음 (등록 없음이거나 stop 상태)")
-    else:
-        state = next((l.strip() for l in r.stdout.splitlines() if "state =" in l), "?")
-        print(f"에이전트: {state}")
+    for label, _, _ in MAC_AGENTS:
+        r = run(["launchctl", "print", mac_target(label)], ok_fail=True)
+        if r.returncode != 0:
+            print(f"{label:<30} 안 떠 있음 (등록 없음이거나 stop 상태)")
+        else:
+            state = next((l.strip() for l in r.stdout.splitlines() if "state =" in l), "?")
+            print(f"{label:<30} {state}")
 
 
 # ── 리눅스 — systemd (user) ──────────────────────────────────────────
-def lx_unit_path():
-    return os.path.expanduser("~/.config/systemd/user/findpath.service")
+# 유닛 두 개를 한 명령으로 관리한다 — 지하철(§8 #1 존폐 항목)이 수동 설치에
+# 의존하면 "대시보드는 안내하는데 install 은 안 만드는" 간극이 생긴다.
+#   findpath         = server.py (버스 수집 + 대시보드)
+#   findpath-subway  = subway_collector.py (전 노선 도착정보)
+LX_UNITS = (
+    ("findpath", "server.py --port 8080", "findpath collector (bus + dashboard)"),
+    ("findpath-subway", "subway_collector.py", "findpath subway collector"),
+)
+
+
+def lx_unit_path(name="findpath"):
+    return os.path.expanduser(f"~/.config/systemd/user/{name}.service")
 
 
 def lx_install():
@@ -199,60 +223,70 @@ def lx_install():
     # ⚠️ --port 8080 필수 — 기본 877 은 특권 포트(<1024)라 리눅스 일반 유저는 bind 못 한다
     #    (✅ 실전: EC2 에서 PermissionError 크래시 루프. 손으로 고쳐도 install 재실행이
     #    유닛을 재생성하며 되돌리므로 여기 박아둔다).
-    with open(lx_unit_path(), "w") as f:
-        f.write(f"""[Unit]
-Description=findpath collector
+    for name, script, desc in LX_UNITS:
+        with open(lx_unit_path(name), "w") as f:
+            f.write(f"""[Unit]
+Description={desc}
 [Service]
 WorkingDirectory={HERE}
-ExecStart={PY} server.py --port 8080
+ExecStart={PY} {script}
 Restart=always
 RestartSec=10
 [Install]
 WantedBy=default.target
 """)
-    run(["systemctl", "--user", "stop", "findpath"], ok_fail=True)  # 돌던 게 있으면 먼저 내리고
-    ensure_pool(HERE)                                               # 풀이 비었으면 fetch_routes 부터
+        run(["systemctl", "--user", "stop", name], ok_fail=True)  # 돌던 게 있으면 먼저 내리고
+    ensure_pool(HERE)                                             # 풀이 비었으면 fetch_routes 부터
     user = os.environ.get("USER", "")
     run(["loginctl", "enable-linger", user], ok_fail=True)  # 부팅 자동 실행 (로그인 불요)
     run(["systemctl", "--user", "daemon-reload"])
-    run(["systemctl", "--user", "enable", "--now", "findpath"])
-    print("설치·시작됨. 대시보드: http://localhost:8080 (리눅스는 877이 특권 포트라 8080)")
+    for name, _, _ in LX_UNITS:
+        run(["systemctl", "--user", "enable", "--now", name])
+    print("설치·시작됨 (버스+지하철). 대시보드: http://localhost:8080 (리눅스는 877이 특권 포트라 8080)")
+    print("⚠️ 지하철은 .env 의 SEOUL_SUBWAY_KEY(·KEY2·KEY3)가 있어야 돈다 — 없으면 로그에 '키 없음'")
     lx_logs()
 
 
 def lx_stop():
-    run(["systemctl", "--user", "disable", "--now", "findpath"], ok_fail=True)
+    for name, _, _ in LX_UNITS:
+        run(["systemctl", "--user", "disable", "--now", name], ok_fail=True)
     kill_manual()
-    print("완전 종료. 재부팅해도 안 살아난다 — 다시 켜려면: python3 service.py start")
+    print("완전 종료 (버스+지하철). 재부팅해도 안 살아난다 — 다시 켜려면: python3 service.py start")
 
 
 def lx_start():
-    run(["systemctl", "--user", "enable", "--now", "findpath"])
-    print("시작됨.")
+    for name, _, _ in LX_UNITS:
+        run(["systemctl", "--user", "enable", "--now", name], ok_fail=True)
+    print("시작됨 (버스+지하철).")
     lx_logs()
 
 
 def lx_logs():
-    print("로그 스트리밍 (Ctrl-C = 보기만 종료, 수집은 계속)", flush=True)
+    print("로그 스트리밍 — 버스+지하철 (Ctrl-C = 보기만 종료, 수집은 계속)", flush=True)
     try:
-        subprocess.run(["journalctl", "--user", "-u", "findpath", "-f", "-n", "10"])
+        args = ["journalctl", "--user", "-f", "-n", "10"]
+        for name, _, _ in LX_UNITS:
+            args += ["-u", name]
+        subprocess.run(args)
     except KeyboardInterrupt:
         print("\n보기 종료 — 수집은 계속 돈다. 다시 보려면: python3 service.py logs", flush=True)
 
 
 def lx_uninstall():
     lx_stop()
-    try:
-        os.remove(lx_unit_path())
-    except OSError:
-        pass
+    for name, _, _ in LX_UNITS:
+        try:
+            os.remove(lx_unit_path(name))
+        except OSError:
+            pass
     run(["systemctl", "--user", "daemon-reload"], ok_fail=True)
-    print("등록 제거됨.")
+    print("등록 제거됨 (버스+지하철).")
 
 
 def lx_status():
-    r = run(["systemctl", "--user", "is-active", "findpath"], ok_fail=True)
-    print(f"서비스: {r.stdout.strip() or '없음'}")
+    for name, _, _ in LX_UNITS:
+        r = run(["systemctl", "--user", "is-active", name], ok_fail=True)
+        print(f"{name:<18} {r.stdout.strip() or '없음'}")
 
 
 # ── 윈도우 — 작업 스케줄러 + 감시 루프 배치 ─────────────────────────
@@ -267,9 +301,20 @@ def win_install():
     # ⚠️ --log 로 파일에도 남긴다 (서버 내부 tee) — 죽은 뒤 사인을 보기 위함.
     #    셸 리다이렉트(>>)로 하면 스케줄러가 띄우는 cmd 창이 텅 비어 버린다 (✅ 실전):
     #    창에는 그대로 흐르고 파일에는 복사본이 남아야 한다.
+    # 지하철은 별도 창에서 같이 띄운다 — 리눅스의 두 유닛과 같은 구성.
+    # start "" 로 새 창을 열어 각자 감시 루프를 돌린다 (한쪽이 죽어도 다른 쪽 유지).
+    with open(os.path.join(HERE, "run_subway.bat"), "w") as f:
+        f.write(f"""@echo off
+cd /d "{HERE}"
+:loop
+"{PY}" subway_collector.py
+timeout /t 30
+goto loop
+""")
     with open(win_bat_path(), "w") as f:
         f.write(f"""@echo off
 cd /d "{HERE}"
+start "findpath-subway" cmd /c run_subway.bat
 :loop
 "{PY}" server.py --log logs\\server.log
 timeout /t 10

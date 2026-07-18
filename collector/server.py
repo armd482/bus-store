@@ -47,8 +47,26 @@ LOCK = threading.Lock()
 AVG_ROW_BYTES = 222  # 슬림 형식 행 평균 (✅ 실측) — 행 수 추정용
 DAYS7 = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")  # 버스·지하철 공통 요일 7종
 
-# 지하철 jsonl 증분 리더 상태 — /api 마다 풀스캔하지 않기 위한 캐시 (subway_snapshot)
+# 지하철 jsonl 증분 리더 상태 — /api 마다 풀스캔하지 않기 위한 캐시 (subway_snapshot).
+# ⚠️ ThreadingHTTPServer 라 /api 가 동시에 여러 스레드에서 온다 — 락 없이 갱신하면
+#    offset·카운트가 이중 가산된다. 표시용이라 치명적이진 않지만 락이 한 줄이다.
 _SUB_TAIL = {}
+_SUB_LOCK = threading.Lock()
+
+# 대시보드용 sqlite 연결 하나를 공유한다 — /api(5초)마다 connect() 하면 매번
+# CREATE TABLE·PRAGMA 가 돌고 연결이 닫히지 않은 채 GC 로 넘어간다.
+# ThreadingHTTPServer 는 요청마다 새 스레드라 thread-local 로는 재사용이 안 되므로,
+# check_same_thread=False 로 하나를 만들고 _DB_LOCK 으로 직렬화한다.
+# 읽기 전용이고 WAL 이라 수집기의 쓰기를 막지 않는다.
+_DB = None
+_DB_LOCK = threading.Lock()
+
+
+def db():
+    global _DB
+    if _DB is None:
+        _DB = O.connect(check_same_thread=False)
+    return _DB
 
 
 def _obs_rate_per_day():
@@ -90,24 +108,28 @@ def subway_snapshot():
     qday = subway_collector.quota_day(now)
     tgt = O.cfg().get("targetSamples", 7)
     cap = subway_collector.DAILY_CAP
-    c = O.connect()
+    c = db()
 
     # 노선은 관측된 것에서 자동 발견된다 — 일괄(ALL) 수집이라 config 에 노선 목록이 없다
     # 판정 준비도 (§8.1 ④) — (열차,역) 쌍당 평균 관측 일수, **요일 무관**.
     # 셀 충족(7주)과 다른 신호다: 정시성 σ 를 재는 데는 쌍당 3~5 관측이면 되므로
     # 이걸 봐야 판정 시점을 안 놓친다. Σn ÷ 서로 다른 (열차,역) 쌍 수.
     judge = {}
-    for name, sn, pairs in c.execute(
+    with _DB_LOCK:                # 연결을 공유하므로 커서 소진까지 락을 쥔다
+        rows = c.execute(
             """SELECT line, COALESCE(SUM(n),0), COUNT(DISTINCT trainNo || '|' || statnId)
-               FROM subway_cell GROUP BY line"""):
+               FROM subway_cell GROUP BY line""").fetchall()
+    for name, sn, pairs in rows:
         judge[name] = round(sn / pairs, 1) if pairs else 0
 
     # sumN 도 같이 — filled(n>=목표)는 7주째까지 0 이라 진행이 안 보인다.
     agg = {}
-    for name, dtp, s, f2, tr, st, sn in c.execute(
+    with _DB_LOCK:
+        rows = c.execute(
             """SELECT line, daytype, COUNT(*), COALESCE(SUM(n>=?),0),
                       COUNT(DISTINCT trainNo), COUNT(DISTINCT statnId), COALESCE(SUM(n),0)
-               FROM subway_cell GROUP BY line, daytype""", (tgt,)):
+               FROM subway_cell GROUP BY line, daytype""", (tgt,)).fetchall()
+    for name, dtp, s, f2, tr, st, sn in rows:
         a = agg.setdefault(name, {"seen": 0, "filled": 0, "sumN": 0, "by": {},
                                   "trains": 0, "stations": 0})
         a["by"][dtp] = {"seen": s, "filled": f2, "sumN": sn,
@@ -123,38 +145,43 @@ def subway_snapshot():
     #    풀스캔이면 t4g.micro 에서 /api 가 초 단위로 늘어진다. 지난 호출 이후
     #    추가된 바이트만 이어 읽어 누적한다 (파일 교체/축소 시엔 처음부터).
     path = os.path.join(O.DATA, f"{subway_collector.PREFIX}-{day}.jsonl")
+    #    /api 는 동시에 여러 스레드에서 오므로 이어읽기 전체를 락으로 감싼다 —
+    #    안 그러면 두 스레드가 같은 구간을 읽어 카운트가 이중 가산된다.
     cache = _SUB_TAIL
-    if cache.get("path") != path:
-        cache.update(path=path, offset=0, per_line={}, total=0,
-                     last_t=None, last_stn=None, last_line=None)
-    try:
-        size = os.path.getsize(path)
-        if size < cache["offset"]:
-            cache.update(offset=0, per_line={}, total=0)
-        if size > cache["offset"]:
-            with open(path, "rb") as fh:
-                fh.seek(cache["offset"])
-                for raw in fh:
-                    if not raw.endswith(b"\n"):
-                        break              # 쓰다 만 마지막 줄 — 다음 호출에서 마저 읽는다
-                    cache["offset"] += len(raw)
-                    cache["total"] += 1
-                    try:
-                        r = json.loads(raw.decode("utf-8"))
-                    except (ValueError, UnicodeDecodeError):
-                        continue
-                    ln = r.get("line")
-                    cache["per_line"][ln] = cache["per_line"].get(ln, 0) + 1
-                    cache["last_t"], cache["last_stn"], cache["last_line"] = \
-                        r.get("t"), r.get("statnNm"), ln
-    except OSError:
-        pass
-    per_line_written, total_written = cache["per_line"], cache["total"]
-    last_stn, last_line = cache["last_stn"], cache["last_line"]
-    last_epoch = None
-    if cache["last_t"]:
+    with _SUB_LOCK:
+        if cache.get("path") != path:
+            cache.update(path=path, offset=0, per_line={}, total=0,
+                         last_t=None, last_stn=None, last_line=None)
         try:
-            last_epoch = datetime.fromisoformat(cache["last_t"]).timestamp()
+            size = os.path.getsize(path)
+            if size < cache["offset"]:
+                cache.update(offset=0, per_line={}, total=0)
+            if size > cache["offset"]:
+                with open(path, "rb") as fh:
+                    fh.seek(cache["offset"])
+                    for raw in fh:
+                        if not raw.endswith(b"\n"):
+                            break          # 쓰다 만 마지막 줄 — 다음 호출에서 마저 읽는다
+                        cache["offset"] += len(raw)
+                        cache["total"] += 1
+                        try:
+                            r = json.loads(raw.decode("utf-8"))
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        ln = r.get("line")
+                        cache["per_line"][ln] = cache["per_line"].get(ln, 0) + 1
+                        cache["last_t"], cache["last_stn"], cache["last_line"] = \
+                            r.get("t"), r.get("statnNm"), ln
+        except OSError:
+            pass
+        # 락 안에서 스냅샷을 뜬다 — per_line 딕트를 그대로 넘기면 다음 호출이
+        # 같은 객체를 갱신하는 중에 직렬화될 수 있다
+        per_line_written, total_written = dict(cache["per_line"]), cache["total"]
+        last_stn, last_line, last_t = cache["last_stn"], cache["last_line"], cache["last_t"]
+    last_epoch = None
+    if last_t:
+        try:
+            last_epoch = datetime.fromisoformat(last_t).timestamp()
         except ValueError:
             pass
 
@@ -182,14 +209,15 @@ def subway_snapshot():
 # ── 커버리지 집계 ──────────────────────────────────────────────────
 def snapshot():
     k = O.cfg()
-    c = O.connect()
+    c = db()
     bands = k["timebands"]
     nb, tgt = len(bands), k["targetSamples"]
 
     # 구간수는 노선별 max(nstops-1, 0) 의 합 — SUM(nstops)-COUNT(*) 로 하면 조회
     # 실패로 nstops=0 인 노선이 분모를 -1 씩 깎는다 (fetch_routes 의 산식과 동일하게).
-    routes = c.execute(
-        "SELECT COUNT(*), COALESCE(SUM(MAX(nstops-1,0)),0) FROM route").fetchone()
+    with _DB_LOCK:
+        routes = c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(MAX(nstops-1,0)),0) FROM route").fetchone()
     nroute, nseg = routes
     # 요일 7종을 전부 분리한 뒤로 토·일은 더 이상 '병목'이 아니다 — 월~일 모두
     # 주 1회씩만 채워지는 동등한 처지다. 그래서 완성률 분모도 7요일 전체로 본다.
@@ -198,16 +226,20 @@ def snapshot():
     goal = day_goal * ndays        # 전체 목표 셀 (구간 × 밴드 × 7요일)
 
     # 한 번의 스캔으로 — 5초마다 오는 /api 가 셀 수백만 규모에서도 버티도록
-    seen, total, done = c.execute(
-        "SELECT COUNT(*), COALESCE(SUM(n),0), COALESCE(SUM(n >= ?),0) FROM cell", (tgt,)).fetchone()
+    with _DB_LOCK:
+        seen, total, done = c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(n),0), COALESCE(SUM(n >= ?),0) FROM cell",
+            (tgt,)).fetchone()
 
     # 밴드별 — 오늘(운행일 기준) 요일만 본다. 자정~04시엔 전날 요일이 '오늘'이다
     # (01:30 관측은 전날 막차 — day_type 이 운행일 경계로 처리한다).
     now = datetime.now(O.KST)
     today = O.day_type(now)
     nowband = O.band_of(now, bands)
-    byband = {b: (n, cells) for b, n, cells in c.execute(
-        "SELECT band, SUM(n), COUNT(*) FROM cell WHERE daytype=? GROUP BY band", (today,))}
+    with _DB_LOCK:
+        byband = {b: (n, cells) for b, n, cells in c.execute(
+            "SELECT band, SUM(n), COUNT(*) FROM cell WHERE daytype=? GROUP BY band",
+            (today,)).fetchall()}
     band_rows = []
     band_need = nseg * tgt  # 이 요일·밴드에서 채워야 할 관측 수 = 구간수 × 목표샘플
     for i, (a, b) in enumerate(bands):
@@ -222,8 +254,11 @@ def snapshot():
     # 요일별 — 분모는 요일 하나 기준(day_goal). 단일 GROUP BY 로 한 번에
     # (요일마다 별도 COUNT 쿼리를 치면 스캔 7회 — 셀이 커지면 /api 가 느려진다).
     byday = {}
-    for d, n, cells, full in c.execute(
-            "SELECT daytype, SUM(n), COUNT(*), SUM(n >= ?) FROM cell GROUP BY daytype", (tgt,)):
+    with _DB_LOCK:
+        day_rows = c.execute(
+            "SELECT daytype, SUM(n), COUNT(*), SUM(n >= ?) FROM cell GROUP BY daytype",
+            (tgt,)).fetchall()
+    for d, n, cells, full in day_rows:
         byday[d] = {"obs": n, "cells": cells, "done": full, "pct": full / day_goal if day_goal else 0}
 
     # 쿼터는 달력일 키다 (data.go.kr 자정 리셋) — 운행일(service_day)이 아니다
@@ -251,7 +286,9 @@ def snapshot():
     if per_day and win_days < 1.0:
         eta_measuring = True                     # 표본은 있으나 창이 얇다
     elif per_day:
-        band_tot = dict(c.execute("SELECT band, SUM(n) FROM cell GROUP BY band"))
+        with _DB_LOCK:
+            band_tot = dict(c.execute(
+                "SELECT band, SUM(n) FROM cell GROUP BY band").fetchall())
         tot_all = sum(band_tot.values())
         need_bd = nseg * tgt                     # (밴드, 요일) 하나의 필요 관측 수
         CEIL = {0: 0.82, nb - 1: 0.82}           # 04-07·20-04시 천장 — 나머지 0.90

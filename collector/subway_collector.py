@@ -62,9 +62,13 @@ LINES = {
 INTERVAL_SEC = 76
 DAILY_CAP = 950   # 키당 1,000회/일에 마진
 
-# 운행시간 밖은 열차가 없다 — 콜만 태우므로 건너뛴다
-SERVICE_START_H = 5
-SERVICE_END_H = 1  # 익일 01시
+# 운행시간 밖은 열차가 없다 — 콜만 태우므로 건너뛴다.
+# ⚠️ 끝을 01시로 박았던 게 버스 tail_min 과 같은 실수였다: 01시는 막차 **출발**
+#    무렵이고 종착역 도착은 그 뒤다(주말 ~02시). 그 꼬리가 매일 구조적으로
+#    빠지는데, 하필 심야 막차가 §6.3 이 "절벽이 성립하는" 부류다.
+#    → config.subwayServiceWindow 로 빼고 기본을 [5, 26](05시~익일 02시)으로.
+#    과하게 여는 비용은 빈 응답 몇 콜, 좁게 닫는 비용은 데이터 영구 손실.
+SERVICE_WINDOW = (5, 26)   # [시작시, 끝시) — 24 초과 = 익일
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "data")
@@ -96,8 +100,9 @@ def now():
 
 
 def in_service(t):
-    h = t.hour
-    return h >= SERVICE_START_H or h < SERVICE_END_H
+    """운행 창 안인가 — config.subwayServiceWindow 우선, 없으면 SERVICE_WINDOW.
+    24를 넘는 끝값은 익일이다 ([5,26] = 05:00~익일 02:00). O.in_window 와 같은 규칙."""
+    return O.in_window(t, O.cfg().get("subwayServiceWindow") or list(SERVICE_WINDOW))
 
 
 def service_day(t):

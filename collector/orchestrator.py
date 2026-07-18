@@ -116,9 +116,11 @@ def in_window(t, window):
     return (a <= h < b) if b <= 24 else (h >= a or h < b - 24)
 
 
-def connect():
+def connect(check_same_thread=True):
+    """check_same_thread=False 는 여러 스레드가 한 연결을 공유할 때만 —
+    호출부가 락으로 직렬화할 책임을 진다 (server.py 의 읽기 전용 연결)."""
     os.makedirs(DATA, exist_ok=True)
-    c = sqlite3.connect(DB, timeout=30)
+    c = sqlite3.connect(DB, timeout=30, check_same_thread=check_same_thread)
     c.execute("PRAGMA journal_mode=WAL")  # 수집기가 쓰는 중에도 status 가 읽히도록
     c.execute("""
       CREATE TABLE IF NOT EXISTS cell (
@@ -329,6 +331,19 @@ def _hm(s):
     return int(s[:2]) * 60 + int(s[2:4])
 
 
+def tail_fn():
+    """config 를 **한 번만** 읽어 nstops → 꼬리(분) 함수를 만든다.
+
+    ⚠️ maybe_running 안에서 cfg() 를 부르면 pick_routes 가 노선마다(경기 2,200개)
+    config.json 을 다시 파싱한다. 재선정이 시간당 1회라 치명적이진 않지만
+    한 줄로 없앨 수 있는 낭비다 — 호출부가 이걸 만들어 넘긴다.
+    """
+    k = cfg()
+    per = k.get("tailPerStopMin", 1.5)
+    lo, hi = k.get("tailMinMin", 90), k.get("tailMaxMin", 300)
+    return lambda nstops: (min(hi, max(lo, int((nstops or 0) * per))) if nstops else hi)
+
+
 def maybe_running(startvt, endvt, t, nstops=None, tail_min=None):
     """지금 이 노선에 버스가 있을 법한가 — **1차 필터일 뿐이다.**
 
@@ -355,10 +370,7 @@ def maybe_running(startvt, endvt, t, nstops=None, tail_min=None):
     if a is None or b is None:
         return True
     if tail_min is None:
-        k = cfg()
-        per = k.get("tailPerStopMin", 1.5)
-        lo, hi = k.get("tailMinMin", 90), k.get("tailMaxMin", 300)
-        tail_min = min(hi, max(lo, int((nstops or 0) * per))) if nstops else hi
+        tail_min = tail_fn()(nstops)   # 단독 호출용. 루프에선 호출부가 tail_fn 을 재사용한다
     # ⚠️ 절대 분으로 계산한다. b 에 꼬리를 더한 뒤 % 1440 부터 하면, 꼬리가 창 끝을
     #    시작 시각 너머로 밀 때 자정 넘김 판정이 뒤집힌다 — 36번(a=05:00, b=00:50,
     #    꼬리 265)이면 b→05:15 가 되어 "05:00~05:15 만 운행"으로 읽혔다.
@@ -388,6 +400,7 @@ def pick_routes(conn, n, target, nbands, t=None, max_empty=6):
         # 긴 노선일수록 막차 출발 후 오래 달리므로 고정 꼬리는 장거리를 잘라낸다.
         meta = {r[0]: r[1:] for r in conn.execute(
             "SELECT routeid, startvt, endvt, emptyStreak, nstops FROM route")}
+        tail = tail_fn()                       # config 는 여기서 한 번만 읽는다
         out = []
         for p in live:
             m = meta.get(p["routeid"])
@@ -395,7 +408,7 @@ def pick_routes(conn, n, target, nbands, t=None, max_empty=6):
                 out.append(p)
                 continue
             s, e, streak, nstops = m
-            if not maybe_running(s, e, t, nstops=nstops):
+            if not maybe_running(s, e, t, tail_min=tail(nstops)):
                 continue                       # 운행시간 밖
             if (streak or 0) >= max_empty:
                 p["cold"] = True               # 계속 비어 있음 — 후순위
