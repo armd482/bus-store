@@ -22,6 +22,7 @@
 사용:
   python3 orchestrator.py status           진행률
   python3 orchestrator.py routes           다음 사이클에 폴링할 노선
+  python3 orchestrator.py holidays         장부에서 빠지는 공휴일 (--refresh 로 재조회)
   python3 orchestrator.py reset --yes      관측 카운트 전체 초기화 (아래 주의)
   python3 orchestrator.py rebuild --yes    장부를 jsonl 데이터에서 재계산
 
@@ -41,6 +42,8 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+import holidays as H   # 공휴일 자동 조회 (대체·임시공휴일 포함) — 목록을 박지 않는다
+
 # ⚠️ 윈도우 방어. 모든 스크립트가 이 모듈을 import 하므로 여기서 한 번만 한다.
 #    윈도우의 기본 stdout 인코딩은 cp949 라 로그의 한글·이모지에서 UnicodeEncodeError 로 죽는다.
 #    ✅ 재현: PYTHONIOENCODING=cp949 → "⚠️ 실패" 출력에서 크래시.
@@ -59,8 +62,24 @@ DB = os.path.join(DATA, "coverage.sqlite")
 CONFIG = os.path.join(HERE, "config.json")
 
 
+_CFG = {"at": None, "v": None}
+
+
 def cfg():
-    return json.load(open(CONFIG, encoding="utf-8"))
+    """config.json — mtime 이 그대로면 파싱을 재사용한다.
+
+    ⚠️ 매번 파싱하던 것이 조용한 낭비였다: is_holiday 는 관측 행마다 불리므로
+    rebuild 가 수백만 번 config.json 을 다시 읽었다. 핫 리로드(수집 중 설정을
+    고치면 다음 사이클에 반영)는 mtime 비교로 그대로 유지된다.
+    """
+    try:
+        m = os.path.getmtime(CONFIG)
+    except OSError:
+        m = None
+    if _CFG["v"] is None or m != _CFG["at"]:
+        _CFG["v"] = json.load(open(CONFIG, encoding="utf-8"))
+        _CFG["at"] = m
+    return _CFG["v"]
 
 
 def service_day_of(t):
@@ -82,15 +101,41 @@ def day_type(t):
     return ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[service_day_of(t).weekday()]
 
 
+def holiday_set(offline=False):
+    """지금 적용할 공휴일 집합 — **자동 조회분 ∪ config 수동 목록**.
+
+    offline=True 면 네트워크를 건드리지 않고 캐시만 본다 — 대시보드(/api)처럼
+    5초마다 불리는 경로용. 갱신은 수집 루프가 맡는다.
+
+    자동: holidays.py 가 특일정보(공식) → 구글 iCal 순으로 받아 캐시한다.
+    대체공휴일·임시공휴일이 포함되고, 목록을 코드나 config 에 박지 않는다
+    (박으면 15주 수집 중에 반드시 어긋난다 — 임시공휴일은 갑자기 지정된다).
+    수동: config "holidays" 는 **덮어쓰기**다. 피드 반영이 늦은 임시공휴일을
+    즉시 얹는 탈출구이고, 비어 있는 게 정상이다.
+
+    네트워크가 죽어도 캐시로 돌고 캐시도 없으면 빈 집합이다 — 공휴일을 못
+    받았다고 수집을 멈추지 않는다 (그 손실이 오염보다 크다. 나중에 rebuild).
+    """
+    try:
+        auto = H.cached() if offline else H.load()
+    except Exception as e:                       # 어떤 이유로도 수집을 멈추지 않는다
+        print(f"[공휴일] 조회 예외 — 수동 목록만 사용: {type(e).__name__} {e}", flush=True)
+        auto = set()
+    return auto | set(cfg().get("holidays") or [])
+
+
 def is_holiday(t):
-    """공휴일(운행일 기준)인가 — config "holidays" 날짜 목록.
+    """공휴일(운행일 기준)인가.
 
     평일에 낀 공휴일은 그 요일의 평상 운행이 아니다(대개 휴일 다이어) —
     수요일 추석을 'wed' 표본으로 넣으면 요일별 주행시간이 오염된다.
     장부(cell/subway_cell)에서만 제외하고 jsonl 엔 남긴다 — 목록이 틀렸어도
     고치고 rebuild 하면 재분류된다.
+
+    ⚠️ 루프에서는 holiday_set() 을 한 번 받아 쓸 것 — 행마다 부르면 집합을
+    매번 다시 만든다 (rebuild 가 그렇게 느려졌었다).
     """
-    return service_day_of(t).strftime("%Y-%m-%d") in set(cfg().get("holidays") or [])
+    return service_day_of(t).strftime("%Y-%m-%d") in holiday_set()
 
 
 def band_of(t, bands):
@@ -245,7 +290,17 @@ def rotate_jsonl(prefix):
     base = service_day_of(datetime.now(KST))
     today = base.strftime("%Y-%m-%d")
     yest = (base - timedelta(days=1)).strftime("%Y-%m-%d")
-    os.makedirs(export_dir, exist_ok=True)
+    # ⚠️ exportDir 은 EC2 절대경로(/home/ubuntu/…)라 다른 기계에선 만들지 못할 수 있다.
+    #    같은 config 를 맥/윈도우에서 쓰면 rotateHour 마다 이 스레드가 예외로 죽는데,
+    #    데몬 스레드라 조용히 사라져 백업이 안 도는 걸 아무도 모른다. 안내하고 건너뛴다
+    #    (수집 자체는 계속 돈다 — 로테이션은 부가 기능이다).
+    try:
+        os.makedirs(export_dir, exist_ok=True)
+    except OSError as e:
+        print(f"[백업] ⚠️ exportDir 을 못 만든다 — 로테이션 건너뜀: {export_dir} ({e})\n"
+              f"        이 기계에서 백업이 필요 없으면 config 의 exportDir 을 null 로 둘 것.",
+              flush=True)
+        return
     for src in sorted(glob.glob(os.path.join(DATA, f"{prefix}-*.jsonl"))):
         day = os.path.basename(src)[len(prefix) + 1:len(prefix) + 11]  # {prefix}-|YYYY-MM-DD|.jsonl
         if day >= today:
@@ -533,7 +588,7 @@ def rebuild(force, shrink_ok=False):
         PRIMARY KEY (routeid, from_ord, to_ord, band, daytype))""")
     bad = total = 0
     k = cfg()
-    hols = set(k.get("holidays") or [])
+    hols = holiday_set()   # 자동 조회 ∪ 수동 — 수집기와 같은 기준. 루프 밖에서 한 번만
     bands = k["timebands"]
     for p in files:
         opener = gzip.open if p.endswith(".gz") else open
@@ -620,6 +675,7 @@ def rebuild_subway(force):
                  f"수집기를 먼저 멈출 것. 정말이면: python3 orchestrator.py rebuild-subway --yes")
     days = {}   # (line, trainNo, statnId, daytype) -> {운행일...}
     bad = 0
+    hols = holiday_set()   # ⚠️ 루프 밖에서 한 번만 — 행마다 부르면 집합을 매번 새로 만든다
     for p in files:
         opener = gzip.open if p.endswith(".gz") else open
         for line in opener(p, mode="rt", encoding="utf-8"):
@@ -635,7 +691,7 @@ def rebuild_subway(force):
                 t = datetime.fromisoformat(r["t"])
             except (KeyError, ValueError):
                 continue
-            if is_holiday(t):
+            if service_day_of(t).strftime("%Y-%m-%d") in hols:
                 continue                      # 수집기와 같은 기준 — 평일 다이어가 아니다
             key = (ln, tn, sid, day_type(t))
             days.setdefault(key, set()).add(service_day_of(t).strftime("%Y-%m-%d"))
@@ -666,8 +722,22 @@ def main():
         rebuild("--yes" in sys.argv[2:], "--shrink-ok" in sys.argv[2:])
     elif cmd == "rebuild-subway":
         rebuild_subway("--yes" in sys.argv[2:])
+    elif cmd == "holidays":
+        # 지금 장부에서 빠지는 날들. --refresh 로 캐시를 무시하고 다시 받는다.
+        if "--refresh" in sys.argv[2:]:
+            H.refresh(key=H.data_go_kr_key())
+        auto, manual = H.load(), set(cfg().get("holidays") or [])
+        d = H.info()
+        print(f"공휴일 {len(auto | manual)}일 (자동 {len(auto)} · 수동 {len(manual)}) · "
+              f"출처 {d['source'] or '없음'} · 갱신 {d['updated'] or '—'}")
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+        for x in sorted(auto | manual):
+            if x >= today:
+                tags = ("수동" if x in manual else "") + (" 오늘" if x == today else "")
+                print(f"  {x} {tags}".rstrip())
     else:
-        sys.exit(f"모르는 명령: {cmd}  (status | routes | reset | rebuild | rebuild-subway)")
+        sys.exit(f"모르는 명령: {cmd}  "
+                 "(status | routes | holidays | reset | rebuild | rebuild-subway)")
 
 
 if __name__ == "__main__":

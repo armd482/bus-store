@@ -22,6 +22,7 @@ import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import holidays as H
 import orchestrator as O
 
 try:
@@ -307,6 +308,20 @@ def snapshot():
             hi = max([w for w in weeks if w <= cap], default=weeks[0])
             eta, eta_hi = weeks[0] * 7, hi * 7                     # 일 단위
 
+    # 공휴일 — 오늘이 공휴일이면 관측은 쌓이되 장부엔 안 들어간다. 그 사실이
+    # 화면에 없으면 "수집은 도는데 진행률이 안 오른다"로 보여 고장으로 오인한다.
+    # ⚠️ 캐시만 읽는다(offline) — /api 는 5초마다 오므로 여기서 갱신을 시도하면
+    #    그 한 번이 대시보드를 수십 초 멈춘 것처럼 보이게 한다. 갱신은 수집 루프가 한다.
+    try:
+        hinfo = H.info()                    # network=False 기본
+        sday = O.service_day_of(datetime.now(O.KST)).strftime("%Y-%m-%d")
+        hset = O.holiday_set(offline=True)
+        hol = {"count": len(hset), "source": hinfo["source"], "updated": hinfo["updated"],
+               "today": sday in hset,
+               "next": next((d for d in sorted(hset) if d >= sday), None)}
+    except Exception:
+        hol = {"count": 0, "source": None, "updated": None, "today": False, "next": None}
+
     return {
         "routes": nroute, "segments": nseg, "goal": goal, "dayGoal": day_goal,
         "dayNeed": nseg * nb * tgt,  # 요일 하나의 필요 관측 건수 = 밴드별 need × 밴드 수
@@ -314,7 +329,7 @@ def snapshot():
         "done": done, "seen": seen, "total": total,
         "pct": done / goal if goal else 0,
         "bands": band_rows, "days": byday, "today": today, "nowBand": nowband,
-        "calls": calls, "quota": k["dailyQuota"],
+        "calls": calls, "quota": k["dailyQuota"], "holidays": hol,
         "state": st, "etaDays": eta, "etaDaysHi": eta_hi, "etaMeasuring": eta_measuring,
         "subway": subway_snapshot(),
         "cfg": {kk: k[kk] for kk in
@@ -405,7 +420,17 @@ function renderBus(d){
         <div class=k>사이클 ${s.lastCycleSec?s.lastCycleSec.toFixed(0)+'s':'—'} · ${s.picked}노선${s.night?' (심야)':''}</div></div>`;
   h += `<div class=card><div class=k>총 관측</div><div class=v>${num(d.total)}</div>
         <div class=k>운행 ${num(s.moving)}대</div></div>`;
+  // 공휴일 — 오늘이면 관측은 쌓이되 **장부엔 안 들어간다**. 이걸 안 보이게 두면
+  // "수집은 도는데 진행률이 안 오른다"가 고장으로 오인된다.
+  const HOL = d.holidays || {};
+  h += `<div class=card><div class=k>공휴일 (장부 제외)</div>
+        <div class="v ${HOL.today?'warn':''}">${HOL.today?'오늘 해당':'평상일'}</div>
+        <div class=k>${HOL.count||0}일 등록 · 출처 ${HOL.source||'없음'}${HOL.next?' · 다음 '+HOL.next:''}</div></div>`;
   h += '</div>';
+  if(HOL.today)
+    h += '<div class=sub style="color:#f59e0b">⚠️ 오늘은 공휴일 — 관측은 그대로 jsonl 에 쌓이지만 '
+       + '장부(셀)에는 넣지 않는다. 휴일 다이어라 요일 표본을 오염시키기 때문. '
+       + '진행률이 안 오르는 것이 정상이다.</div>';
 
   // 밴드 — 지금 채워지는 요일의 **누적** (모든 주의 해당 요일 합).
   const KO = {mon:'월',tue:'화',wed:'수',thu:'목',fri:'금',sat:'토',sun:'일'};
