@@ -421,23 +421,27 @@ function renderSubway(d){
   const alive = sub.lastObs && (Date.now()/1000 - sub.lastObs) < 300;
   const tot = sub.lines.reduce((a,L)=>({seen:a.seen+L.seen, filled:a.filled+L.filled, sumN:a.sumN+(L.sumN||0)}), {seen:0,filled:0,sumN:0});
   const tgtAll = sub.lines.length ? sub.lines[0].target : 7;
-  // 진행률 = Σ관측일 / (셀수 × 목표). filled(목표 도달 셀)는 7주째까지 0 이라 진행이 안 보인다.
-  const rate = tot.seen ? Math.min(1, tot.sumN/(tot.seen*tgtAll)) : 0;
-  const prog = L => L.seen ? Math.min(1, (L.sumN||0)/(L.seen*L.target)) : 0;
+  // ★ 진행률은 **셀 기준** — 버스와 같은 의미(목표를 채운 셀 / 관측된 셀).
+  // ⚠️ 지하철 셀은 하루 1샘플씩 균일하게 차서 목표(7일) 전까지 전부 0 이다.
+  //    그래서 옆에 '관측 일수 N/7일'을 같이 보여준다 — 진행이 멈춘 게 아니라
+  //    아직 채워지는 중임을 구분하려고. (Σn 기반 비율은 '평균 충전율'이지
+  //    '완성된 셀'이 아니라 완성률로 쓰면 안 된다.)
+  const rate = tot.seen ? tot.filled/tot.seen : 0;
+  const prog = L => L.seen ? L.filled/L.seen : 0;
+  const days = L => L.seen ? (L.sumN||0)/L.seen : 0;      // 셀당 평균 관측 일수
   let h = '<div class=sub><b>전 노선 일괄(ALL)</b> 도착정보 — 1콜에 19노선·555역 (✅ 경기·인천 포함). '
     + '<b>B안 셀</b> (노선,열차,역,요일)별 관측 일수 — trainNo 가 매일 반복이라 요일별 며칠이면 '
     + '각 열차 정시성 분포가 나온다 (docs §8 #1).</div>';
 
   h += '<h2>건강 상태</h2><div class=grid>';
-  h += `<div class=card><div class=k>마지막 관측</div><div class="v ${alive?'ok':(sub.inService?'bad':'')}">${
-        sub.lastObs? Math.round(Date.now()/1000-sub.lastObs)+'초 전':'—'}</div>
+  h += `<div class=card><div class=k>마지막 관측</div><div class=v id=sublastobs>—</div>
         <div class=k>${sub.lastLine||''} ${sub.lastStn||'—'}${sub.inService?'':' · 운행 밖'}</div></div>`;
   h += `<div class=card><div class=k>오늘 기록</div><div class=v>${num(sub.written)}</div>
         <div class=k>도착·출발 관측</div></div>`;
   h += `<div class=card><div class=k>노선</div><div class=v>${num(sub.lines.length)}</div>
         <div class=k>관측된 노선 수</div></div>`;
-  h += `<div class=card><div class=k>진행률 (전체)</div><div class="v ${rate>=.9?'ok':''}">${pct(rate)}</div>
-        <div class=k>셀 ${num(tot.seen)} · 충족 ${num(tot.filled)}</div></div>`;
+  h += `<div class=card><div class=k>셀 충족 (전체)</div><div class="v ${rate>=.9?'ok':''}">${pct(rate)}</div>
+        <div class=k>${num(tot.filled)} / ${num(tot.seen)} 셀 · 관측 ${(tot.seen?tot.sumN/tot.seen:0).toFixed(1)}/${tgtAll}일</div></div>`;
   h += '</div>';
 
   // 키별 쿼터 — 라운드로빈이라 고르게 소진돼야 정상
@@ -456,7 +460,7 @@ function renderSubway(d){
   const lt = (id,label,extra) => `<span onclick="setLineTab('${id.replace(/'/g,"\\'")}')" `
     + `style="cursor:pointer;padding:3px 9px;margin:0 3px 4px 0;border-radius:5px;display:inline-block;`
     + `${lineTab===id?'background:#3b82f6;color:#fff;font-weight:600':'background:#8882'}">${label}${extra||''}</span>`;
-  h += `<h2>노선별 수집률 — 진행률 = 누적 관측일 ÷ 목표(${tgt}일) · 요일 7종</h2>`;
+  h += `<h2>노선별 수집률 — 셀 충족 (목표 ${tgt}일 · 요일 7종)</h2>`;
   h += '<div style="margin-bottom:10px">' + lt('__all__','전체')
      + sub.lines.map(L=>lt(L.name, L.name, `<span style="opacity:.6;font-size:11px"> ${pct(prog(L))}</span>`)).join('') + '</div>';
 
@@ -464,37 +468,39 @@ function renderSubway(d){
     h += '<div class=sub>아직 셀 없음 — 수집이 돌면 노선이 자동으로 나타난다. '
        + '(오늘 기록이 늘고 있는데 셀이 0이면 공휴일이거나 첫 사이클 전이다.)</div>';
   } else if(lineTab === '__all__'){
-    h += '<table><tr style="opacity:.5"><td>노선</td><td class=n>진행률</td><td></td>'
-       + '<td class=n>셀(충족)</td><td class=n>열차·역</td><td class=n>오늘 기록</td></tr>';
+    h += '<table><tr style="opacity:.5"><td>노선</td><td class=n>셀 충족</td><td></td>'
+       + '<td class=n>충족/셀</td><td class=n>관측 일수</td><td class=n>열차·역</td><td class=n>오늘</td></tr>';
     for(const L of sub.lines){
-      const p = prog(L);
+      const p = prog(L), dv = days(L);
       h += `<tr><td width=90>${L.name}</td>
             <td class=n width=54><b>${pct(p)}</b></td>
-            <td width=200>${bar(p, p>=1?'ok':'')}</td>
-            <td class=n style="white-space:nowrap">${num(L.seen)} <span style="opacity:.5">(${num(L.filled)})</span></td>
+            <td width=150>${bar(p, p>=1?'ok':'')}</td>
+            <td class=n style="white-space:nowrap">${num(L.filled)}/${num(L.seen)}</td>
+            <td class=n style="white-space:nowrap;opacity:.75">${dv.toFixed(1)}/${L.target}일</td>
             <td class=n style="white-space:nowrap;opacity:.6">${L.trains}·${L.stations}</td>
             <td class=n style="white-space:nowrap;opacity:.6">${num(L.written)}</td></tr>`;
     }
     h += '</table>';
-    h += `<div class=sub style="margin-top:6px">진행률 = 셀당 평균 관측 일수 ÷ ${tgt}일. `
-       + `<b>셀</b>은 관측된 (열차,역,요일) 조합 수, 괄호는 목표를 채운 수 — 목표가 ${tgt}일이라 `
-       + `${tgt}주차부터 채워지기 시작한다. 오늘 기록이 늘고 있으면 수집은 정상이다.</div>`;
+    h += `<div class=sub style="margin-top:6px"><b>셀 충족</b> = 목표(${tgt}일)를 채운 셀 ÷ 관측된 셀 — 버스와 같은 기준. `
+       + `⚠️ 지하철 셀은 하루 1샘플씩 균일하게 차서 ${tgt}주차 전까지 전부 0% 다. `
+       + `진행 여부는 옆의 <b>관측 일수</b>(셀당 평균)로 본다 — 이게 늘고 있으면 정상이다.</div>`;
   } else {
     const L = sub.lines.find(x=>x.name===lineTab);
     if(!L){ h += '<div class=sub>그 노선은 아직 관측되지 않았다.</div>'; }
     else {
       h += `<div class=sub><b>${L.name}</b> — 열차 ${num(L.trains)}대 · 역 ${num(L.stations)}개 · `
-         + `오늘 기록 ${num(L.written)}건 · 진행률 <b>${pct(prog(L))}</b> (셀 ${num(L.seen)}, 충족 ${num(L.filled)})</div>`;
-      h += '<table><tr style="opacity:.5"><td>요일</td><td class=n>진행률</td><td></td>'
-         + '<td class=n>관측 일수</td><td class=n>셀(충족)</td></tr>';
+         + `오늘 기록 ${num(L.written)}건 · 셀 충족 <b>${pct(prog(L))}</b> `
+         + `(${num(L.filled)}/${num(L.seen)}) · 관측 ${days(L).toFixed(1)}/${L.target}일</div>`;
+      h += '<table><tr style="opacity:.5"><td>요일</td><td class=n>셀 충족</td><td></td>'
+         + '<td class=n>충족/셀</td><td class=n>관측 일수</td></tr>';
       for(const dk of D7){
         const v = L.byDay[dk] || {seen:0,filled:0,days:0};
-        const dp = Math.min(1, (v.days||0)/L.target);
+        const dp = v.seen ? v.filled/v.seen : 0;
         h += `<tr><td width=40>${KOD[dk]}</td>
               <td class=n width=54><b>${pct(dp)}</b></td>
-              <td width=210>${bar(dp, dp>=1?'ok':(dk==='sat'||dk==='sun')?'warn':'')}</td>
-              <td class=n style="white-space:nowrap">${v.days||0} / ${L.target}일</td>
-              <td class=n style="white-space:nowrap;opacity:.6">${num(v.seen)} (${num(v.filled)})</td></tr>`;
+              <td width=180>${bar(dp, dp>=1?'ok':(dk==='sat'||dk==='sun')?'warn':'')}</td>
+              <td class=n style="white-space:nowrap">${num(v.filled)}/${num(v.seen)}</td>
+              <td class=n style="white-space:nowrap;opacity:.75">${(v.days||0).toFixed(1)} / ${L.target}일</td></tr>`;
       }
       h += '</table>';
       h += `<div class=sub style="margin-top:6px">셀 = (열차, 역) 조합 · <b>관측 일수</b> = 그 요일에 며칠 봤나 `
@@ -513,14 +519,25 @@ function renderSubway(d){
 // 수집기가 요청 사이클 중이면 '데이터 요청 중' 태그를 함께 띄운다.
 // (사이클의 대부분이 요청 시간이라, 타이머를 통째로 바꾸면 거의 항상 가려진다)
 function paintObs(){
+  if(!S) return;
+  // 버스 — 사이클 30~45s 라 180s 넘으면 멈춘 것
   const el = document.getElementById('lastobs');
-  if(!el || !S) return;
-  const s = S.state;
-  const secs = s.lastObs ? Math.round(Date.now()/1000 - s.lastObs) : null;
-  const alive = secs != null && secs < 180;
-  el.className = 'v ' + (alive ? 'ok' : 'bad');
-  el.innerHTML = (secs != null ? secs + '초 전' : '—')
-    + (s.fetching ? ' <span class=tag style="background:#3b82f622;color:#3b82f6">데이터 요청 중</span>' : '');
+  if(el){
+    const s = S.state;
+    const secs = s.lastObs ? Math.round(Date.now()/1000 - s.lastObs) : null;
+    el.className = 'v ' + (secs != null && secs < 180 ? 'ok' : 'bad');
+    el.innerHTML = (secs != null ? secs + '초 전' : '—')
+      + (s.fetching ? ' <span class=tag style="background:#3b82f622;color:#3b82f6">데이터 요청 중</span>' : '');
+  }
+  // 지하철 — 폴링 76s(키 수에 따라 더 김)라 300s 를 임계로. 운행 시간 밖이면 회색
+  const se = document.getElementById('sublastobs');
+  if(se && S.subway){
+    const sub = S.subway;
+    const secs = sub.lastObs ? Math.round(Date.now()/1000 - sub.lastObs) : null;
+    const alive = secs != null && secs < 300;
+    se.className = 'v ' + (alive ? 'ok' : (sub.inService ? 'bad' : ''));
+    se.textContent = secs != null ? secs + '초 전' : '—';
+  }
 }
 tick(); setInterval(tick, 5000); setInterval(paintObs, 1000);
 </script>
