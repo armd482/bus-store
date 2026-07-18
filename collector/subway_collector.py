@@ -45,12 +45,12 @@ OUT_DIR = os.path.join(HERE, "data")
 ENV_FILE = os.path.join(HERE, "..", "..", "bus-test", ".env.local")
 
 
-def load_key():
-    """자기 폴더의 .env 를 먼저 본다. (plist 에 키를 박지 않기 위해)
+def load_key(envname="SEOUL_SUBWAY_KEY"):
+    """env 변수 또는 .env 에서 인증키를 읽는다 (노선마다 다른 키를 줄 수 있게 envname 파라미터).
 
-    launchd 로 뜬 프로세스는 ~/Desktop 을 못 읽는다(macOS TCC).
+    launchd 로 뜬 프로세스는 ~/Desktop 을 못 읽는다(macOS TCC) → 자기 폴더 .env 를 본다.
     """
-    key = os.environ.get("SEOUL_SUBWAY_KEY")
+    key = os.environ.get(envname)
     if key:
         return key
     for path in (os.path.join(HERE, ".env"), ENV_FILE):
@@ -58,7 +58,7 @@ def load_key():
             with open(path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line.startswith("SEOUL_SUBWAY_KEY="):
+                    if line.startswith(envname + "="):
                         return line.split("=", 1)[1].strip().strip('"').strip("'")
         except OSError:
             continue
@@ -87,34 +87,8 @@ def daytype(t):
     return "sun" if wd == 6 else "sat" if wd == 5 else "weekday"
 
 
-# ── 수집일 장부 — 요일별로 며칠 관측했나 (수집률의 분자) ──────────────────
-# 지하철 수집률 = 요일별 수집 일수 / 목표. trainNo 가 매일 반복되므로 하루당
-# 열차·역별 1샘플씩 쌓이고, 요일별 N일이면 정시성 분포가 나온다. 옛 jsonl 은
-# gzip 으로 내보내지므로(백업) 누적 일수는 이 작은 장부에 따로 남긴다.
-def days_ledger_path():
-    return os.path.join(OUT_DIR, ".subway-days.json")
-
-
-def record_day(dt, day):
-    """오늘(운행일)을 그 요일 목록에 넣는다 — 이미 있으면 no-op (중복 방지)."""
-    p = days_ledger_path()
-    try:
-        led = json.load(open(p, encoding="utf-8"))
-    except (OSError, ValueError):
-        led = {}
-    days = set(led.get(dt, []))
-    if day in days:
-        return
-    days.add(day)
-    led[dt] = sorted(days)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(led, f)
-    os.replace(tmp, p)
-
-
-def fetch(key):
-    url = f"{BASE}/{key}/json/realtimePosition/0/1000/{urllib.parse.quote(LINE)}"
+def fetch(key, line):
+    url = f"{BASE}/{key}/json/realtimePosition/0/1000/{urllib.parse.quote(line)}"
     with urllib.request.urlopen(url, timeout=20) as r:
         return json.loads(r.read().decode())
 
@@ -138,113 +112,130 @@ def quota_day(t):
     return t.strftime("%Y-%m-%d")
 
 
-def calls_path(day):
-    return os.path.join(OUT_DIR, f".calls-{day}")
+# 카운터는 **키(env 변수명) 단위** — 한 키를 여러 노선이 공유하면 합산돼 상한을 지킨다.
+def calls_path(keyid, day):
+    return os.path.join(OUT_DIR, f".subwaycalls-{keyid}-{day}")
 
 
-def read_calls(day):
+def read_calls(keyid, day):
     try:
-        with open(calls_path(day)) as f:
+        with open(calls_path(keyid, day)) as f:
             return int(f.read().strip() or 0)
     except (OSError, ValueError):
         return 0
 
 
-def bump_calls(day):
-    n = read_calls(day) + 1
-    tmp = calls_path(day) + ".tmp"
+def bump_calls(keyid, day):
+    n = read_calls(keyid, day) + 1
+    tmp = calls_path(keyid, day) + ".tmp"
     with open(tmp, "w") as f:
         f.write(str(n))
-    os.replace(tmp, calls_path(day))  # 원자적 — 재시작 중 깨진 카운터 방지
+    os.replace(tmp, calls_path(keyid, day))  # 원자적 — 재시작 중 깨진 카운터 방지
     return n
 
 
-def main():
-    key = load_key()
-    if not key:
-        sys.exit(f"SEOUL_SUBWAY_KEY 없음. export 하거나 {ENV_FILE} 에 넣으세요.")
+def resolve_lines():
+    """config.subwayLines → [{name, prefix, keyid, key}]. 키 없는 노선은 건너뛴다."""
+    k = O.cfg()
+    lines = k.get("subwayLines") or [{"name": LINE, "prefix": "shinbundang", "key": "SEOUL_SUBWAY_KEY"}]
+    out = []
+    for ln in lines:
+        keyid = ln.get("key", "SEOUL_SUBWAY_KEY")
+        key = load_key(keyid)
+        if not key:
+            print(f"⚠️ {ln['name']}: 키 {keyid} 없음 — 건너뜀", flush=True)
+            continue
+        out.append({"name": ln["name"], "prefix": ln.get("prefix", "shinbundang"),
+                    "keyid": keyid, "key": key})
+    return out
 
+
+def main():
     os.makedirs(OUT_DIR, exist_ok=True)
+    lines = resolve_lines()
+    if not lines:
+        sys.exit("수집할 지하철 노선이 없다 — config.subwayLines 와 .env 의 키를 확인.")
+    conn = O.connect()
 
     # 매일 위상을 흔든다 (§3.3.3). 고정 간격이면 매일 같은 시각만 샘플링된다.
-    jitter_base = random.Random(service_day(now())).uniform(0, INTERVAL_SEC)
-    time.sleep(jitter_base)
+    time.sleep(random.Random(service_day(now())).uniform(0, INTERVAL_SEC))
 
     day = service_day(now())
-    written = 0
-    recorded = None  # 오늘을 수집일 장부에 이미 넣었는지 (하루 1회만 쓰면 됨)
-    last_state = {}  # trainNo -> (statnId, trainSttus)
+    written = {ln["name"]: 0 for ln in lines}
+    last_state = {ln["name"]: {} for ln in lines}      # 노선별 trainNo -> (statnId, trainSttus)
+    bumped = {ln["name"]: set() for ln in lines}       # 노선별 오늘 셀 bump 한 (trainNo, statnId) — 하루 1회
 
     def export():
-        """shinbundang-*.jsonl 2단 로테이션(백업 어제 / 삭제 그저께) — 별도 스레드.
-        rclone 네트워크 호출이 있으니 폴링을 막지 않게 스레드로."""
-        __import__("threading").Thread(
-            target=O.rotate_jsonl, args=("shinbundang",), daemon=True).start()
+        """노선별 jsonl 2단 로테이션 — 별도 스레드 (rclone 네트워크 호출)."""
+        for ln in lines:
+            __import__("threading").Thread(
+                target=O.rotate_jsonl, args=(ln["prefix"],), daemon=True).start()
 
-    export()   # 시작 시 1회 — 꺼져 있는 동안 쌓인 옛 파일 정리
+    export()   # 시작 시 1회
 
-    print(f"[{now():%H:%M:%S}] 수집 시작 · {LINE} · {INTERVAL_SEC}s 간격 · "
-          f"일 상한 {DAILY_CAP}회 (오늘 이미 {read_calls(quota_day(now()))}회 사용)", flush=True)
+    names = " · ".join(f"{ln['name']}({ln['keyid']})" for ln in lines)
+    print(f"[{now():%H:%M:%S}] 지하철 수집 시작 · {names} · {INTERVAL_SEC}s 간격 · 노선당 상한 {DAILY_CAP}회", flush=True)
 
     while True:
         t = now()
         d = service_day(t)
-
-        if d != day:  # 날이 바뀌면 위상 초기화 (카운터는 파일이 날짜별이라 자동)
-            print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d} (전일 {read_calls(day)}콜 / {written}건)", flush=True)
-            day, written, last_state = d, 0, {}
-            export()   # 어제 백업 + 그저께 삭제(백업 확인 후)
+        if d != day:
+            print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d}", flush=True)
+            day = d
+            for ln in lines:
+                written[ln["name"]] = 0
+                last_state[ln["name"]] = {}
+                bumped[ln["name"]] = set()
+            export()
             time.sleep(random.uniform(0, INTERVAL_SEC))
             continue
-
         if not in_service(t):
             time.sleep(300)
             continue
 
-        qday = quota_day(t)  # 쿼터는 달력일 — 운행일(day)과 자정~04시에 갈린다
-        calls = read_calls(qday)
-        if calls >= DAILY_CAP:
-            print(f"[{t:%H:%M:%S}] 일 상한 {calls}/{DAILY_CAP} 도달 — 자정 리셋까지 대기", flush=True)
-            time.sleep(300)
-            continue
-
-        try:
-            calls = bump_calls(qday)  # 호출 전에 센다 — 죽어도 과다호출로 새지 않게
-            payload = fetch(key)
-            rows, err = rows_of(payload)
-            if err:
-                # 열차 0대(심야)와 진짜 에러를 구분해서 남긴다
-                print(f"[{t:%H:%M:%S}] 응답없음: {err} (콜 {calls})", flush=True)
-            else:
-                path = os.path.join(OUT_DIR, f"shinbundang-{day}.jsonl")
+        qday = quota_day(t)
+        dt = daytype(t)
+        did_bump = False
+        for ln in lines:
+            name, keyid = ln["name"], ln["keyid"]
+            if read_calls(keyid, qday) >= DAILY_CAP:
+                continue                               # 이 키의 상한 도달 — 다음 노선
+            try:
+                bump_calls(keyid, qday)                # 호출 전에 센다
+                rows, err = rows_of(fetch(ln["key"], name))
+                if err:
+                    print(f"[{t:%H:%M:%S}] {name} 응답없음: {err}", flush=True)
+                    continue
+                path = os.path.join(OUT_DIR, f"{ln['prefix']}-{day}.jsonl")
+                ls, bset = last_state[name], bumped[name]
                 with open(path, "a", encoding="utf-8") as f:
                     for r in rows:
-                        tn = r.get("trainNo")
-                        state = (r.get("statnId"), r.get("trainSttus"))
-                        if last_state.get(tn) == state:
-                            continue  # 상태 안 바뀜 → 같은 관측
-                        last_state[tn] = state
+                        tn, sid = r.get("trainNo"), r.get("statnId")
+                        state = (sid, r.get("trainSttus"))
+                        if ls.get(tn) == state:
+                            continue                   # 상태 안 바뀜 → 같은 관측
+                        ls[tn] = state
                         f.write(json.dumps({
-                            "t": t.isoformat(),
-                            "recptnDt": r.get("recptnDt"),
-                            "trainNo": tn,
-                            "statnId": r.get("statnId"),
-                            "statnNm": r.get("statnNm"),
-                            "statnTid": r.get("statnTid"),
-                            "statnTnm": r.get("statnTnm"),
-                            "updnLine": r.get("updnLine"),
-                            "trainSttus": r.get("trainSttus"),
-                            "directAt": r.get("directAt"),
-                            "lstcarAt": r.get("lstcarAt"),
+                            "t": t.isoformat(), "line": name, "recptnDt": r.get("recptnDt"),
+                            "trainNo": tn, "statnId": sid, "statnNm": r.get("statnNm"),
+                            "statnTid": r.get("statnTid"), "statnTnm": r.get("statnTnm"),
+                            "updnLine": r.get("updnLine"), "trainSttus": r.get("trainSttus"),
+                            "directAt": r.get("directAt"), "lstcarAt": r.get("lstcarAt"),
                         }, ensure_ascii=False) + "\n")
-                        written += 1
-                if written and recorded != day:
-                    record_day(daytype(t), day)   # 오늘 실관측 확보 → 수집일 장부에 1회 기록
-                    recorded = day
-                if calls % 20 == 0:
-                    print(f"[{t:%H:%M:%S}] 콜 {calls}/{DAILY_CAP} · 기록 {written}건 · 열차 {len(rows)}대", flush=True)
-        except Exception as e:
-            print(f"[{t:%H:%M:%S}] 실패: {type(e).__name__}: {e}", flush=True)
+                        written[name] += 1
+                        # 셀 bump — (노선,열차,역)을 오늘 처음 볼 때만 (n = 관측 일수)
+                        if tn and sid and (tn, sid) not in bset:
+                            O.bump_subway(conn, name, tn, sid, dt)
+                            bset.add((tn, sid))
+                            did_bump = True
+            except Exception as e:
+                print(f"[{t:%H:%M:%S}] {name} 실패: {type(e).__name__}: {e}", flush=True)
+        if did_bump:
+            conn.commit()
+        cal = " ".join(f"{ln['name']}:{read_calls(ln['keyid'], qday)}" for ln in lines)
+        if int(t.timestamp()) // INTERVAL_SEC % 20 == 0:
+            wr = " ".join(f"{n}:{w}" for n, w in written.items())
+            print(f"[{t:%H:%M:%S}] 콜[{cal}] 기록[{wr}]", flush=True)
 
         time.sleep(INTERVAL_SEC + random.uniform(-3, 3))
 

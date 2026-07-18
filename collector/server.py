@@ -76,54 +76,71 @@ def _obs_rate_per_day():
 
 
 def subway_snapshot():
-    """지하철 수집 현황 — 별도 프로세스라 디스크(카운터 + 오늘 jsonl)에서만 읽는다.
-
-    파일은 운행일(shinbundang-{service_day}), 쿼터는 달력일(.calls-{quota_day}) —
-    subway_collector 와 같은 경계를 쓴다. 오늘 파일은 하루치라 항상 작아 전체 스캔 OK.
+    """지하철 수집 현황 (B안 셀) — 노선별로 집계한다. 셀은 coverage.sqlite 의 subway_cell,
+    실시간 현황(마지막 관측)은 오늘 노선별 jsonl 에서. 쿼터는 키(env명) 단위 카운터.
     """
     if subway_collector is None:
         return {"present": False}
     now = datetime.now(O.KST)
     day = subway_collector.service_day(now)
-    calls = subway_collector.read_calls(subway_collector.quota_day(now))
-    path = os.path.join(O.DATA, f"shinbundang-{day}.jsonl")
-    written, trains, last_t, last_nm = 0, set(), None, None
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                written += 1
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                trains.add(r.get("trainNo"))
-                last_t, last_nm = r.get("t"), r.get("statnNm")
-    except OSError:
-        pass
-    last_epoch = None
-    if last_t:
-        try:
-            last_epoch = datetime.fromisoformat(last_t).timestamp()
-        except ValueError:
-            pass
-    # 수집률 — 요일별 수집 일수 (수렴의 분자). 옛 jsonl 은 백업으로 내보내지므로
-    # 누적 일수는 별도 장부(.subway-days.json)에서 읽는다.
-    try:
-        ledger = json.load(open(os.path.join(O.DATA, ".subway-days.json"), encoding="utf-8"))
-    except (OSError, ValueError):
-        ledger = {}
+    qday = subway_collector.quota_day(now)
     tgt = O.cfg().get("targetSamples", 7)
-    coverage = {dt: {"days": len(ledger.get(dt, [])), "target": tgt}
-                for dt in ("weekday", "sat", "sun")}
+    cap = subway_collector.DAILY_CAP
+    lines_cfg = O.cfg().get("subwayLines") or [{"name": subway_collector.LINE,
+                                                "prefix": "shinbundang", "key": "SEOUL_SUBWAY_KEY"}]
+    c = O.connect()
+
+    lines = []
+    any_started = False
+    for ln in lines_cfg:
+        name, prefix = ln["name"], ln.get("prefix", "shinbundang")
+        keyid = ln.get("key", "SEOUL_SUBWAY_KEY")
+        calls = subway_collector.read_calls(keyid, qday)
+        # 셀 집계 (요일별 seen/filled) — subway_cell 에서
+        by = {}
+        seen = filled = 0
+        for dtp, s, f2 in c.execute(
+                "SELECT daytype, COUNT(*), COALESCE(SUM(n>=?),0) FROM subway_cell WHERE line=? GROUP BY daytype",
+                (tgt, name)):
+            by[dtp] = {"seen": s, "filled": f2}
+            seen += s
+            filled += f2
+        roster = c.execute(
+            "SELECT COUNT(DISTINCT trainNo), COUNT(DISTINCT statnId) FROM subway_cell WHERE line=?",
+            (name,)).fetchone()
+        # 실시간 현황 — 오늘 노선 jsonl 끝
+        path = os.path.join(O.DATA, f"{prefix}-{day}.jsonl")
+        written, last_t, last_nm = 0, None, None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    written += 1
+                    try:
+                        r = json.loads(line)
+                        last_t, last_nm = r.get("t"), r.get("statnNm")
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+        last_epoch = None
+        if last_t:
+            try:
+                last_epoch = datetime.fromisoformat(last_t).timestamp()
+            except ValueError:
+                pass
+        started = calls > 0 or written > 0 or seen > 0
+        any_started = any_started or started
+        lines.append({
+            "name": name, "keyid": keyid, "calls": calls, "cap": cap,
+            "trains": roster[0], "stations": roster[1],
+            "seen": seen, "filled": filled, "target": tgt,
+            "byDay": {d: by.get(d, {"seen": 0, "filled": 0}) for d in ("weekday", "sat", "sun")},
+            "written": written, "lastObs": last_epoch, "lastStn": last_nm,
+        })
     return {
-        "present": True,
-        "started": calls > 0 or written > 0 or any(ledger.values()),
-        "line": subway_collector.LINE,
-        "calls": calls, "cap": subway_collector.DAILY_CAP,
-        "written": written, "trains": len(trains - {None}),
-        "lastObs": last_epoch, "lastStn": last_nm,
+        "present": True, "started": any_started,
         "inService": subway_collector.in_service(now),
-        "coverage": coverage,
+        "lines": lines,
     }
 
 
@@ -369,41 +386,44 @@ function renderSubway(d){
   if(!sub || !sub.present)
     return '<div class=sub>이 서버엔 지하철 수집기가 없다 (subway_collector 미탑재).</div>';
   if(!sub.started)
-    return '<div class=sub>지하철 수집기가 아직 안 돎 — <code>.env</code> 에 SEOUL_SUBWAY_KEY 를 넣고 '
+    return '<div class=sub>지하철 수집기가 아직 안 돎 — <code>.env</code> 에 SEOUL_SUBWAY_KEY(·KEY2) 를 넣고 '
       + 'systemd 유닛(findpath-subway)을 걸 것. §8 #1(지하철 정시성)이 프로젝트 존폐 항목이라 우선순위가 높다.</div>';
-  const alive = sub.lastObs && (Date.now()/1000 - sub.lastObs) < 300;  // 75s 폴링이라 여유롭게 5분
-  const q = sub.calls/sub.cap;
-  let h = `<div class=sub><b>${sub.line}</b> 실시간 위치 — 정시성 검증용 (docs §8 #1 · §3.3.3). 판교 등 경기 구간 포함 ✅</div>`;
-  h += '<h2>건강 상태</h2><div class=grid>';
-  h += `<div class=card><div class=k>쿼터 (달력일)</div><div class="v ${q>.95?'bad':q>.85?'warn':''}">${num(sub.calls)}</div>
-        <div class=k>/ ${num(sub.cap)} (${pct(q)})</div></div>`;
-  h += `<div class=card><div class=k>마지막 관측</div><div class="v ${alive?'ok':(sub.inService?'bad':'')}">${
-        sub.lastObs? Math.round(Date.now()/1000-sub.lastObs)+'초 전':'—'}</div>
-        <div class=k>${sub.lastStn||'—'}${sub.inService?'':' · 운행 시간 밖'}</div></div>`;
-  h += `<div class=card><div class=k>오늘 기록</div><div class=v>${num(sub.written)}</div>
-        <div class=k>상태 변화 관측</div></div>`;
-  h += `<div class=card><div class=k>열차</div><div class=v>${num(sub.trains)}</div>
-        <div class=k>오늘 본 trainNo</div></div>`;
-  h += '</div>';
+  const KOD = {weekday:'평일',sat:'토',sun:'일'};
+  let h = '<div class=sub>노선별 실시간 위치 — <b>B안 셀</b> (노선,열차,역,요일)별 관측 일수. '
+    + 'trainNo 가 매일 반복이라 요일별 며칠이면 각 열차 정시성 분포가 나온다 (docs §8 #1). 판교 등 경기 구간 포함 ✅</div>';
 
-  // 수집률 — 요일별 수집 일수 / 목표. trainNo 반복이라 요일별 며칠이면 수렴.
-  const cov = sub.coverage || {};
-  h += '<h2>수집률 — 요일별 수집 일수 (trainNo 반복이라 며칠이면 수렴)</h2><table>';
-  for(const [k,label] of [['weekday','평일'],['sat','토요일'],['sun','일요일']]){
-    const v = cov[k] || {days:0,target:7};
-    const p = v.target ? v.days/v.target : 0;
-    h += `<tr><td width=70>${label}</td>
-          <td class=n width=54><b>${pct(Math.min(1,p))}</b></td>
-          <td width=250>${bar(Math.min(1,p), p>=1?'ok':(k==='sat'||k==='sun')?'warn':'')}</td>
-          <td class=n style="white-space:nowrap">${v.days} / ${v.target}일</td></tr>`;
+  for(const L of sub.lines){
+    const alive = L.lastObs && (Date.now()/1000 - L.lastObs) < 300;
+    const q = L.calls/L.cap;
+    const rate = L.seen ? L.filled/L.seen : 0;
+    h += `<h2>${L.name} <span class=tag>${L.keyid}</span></h2>`;
+    h += '<div class=grid>';
+    h += `<div class=card><div class=k>쿼터 (달력일)</div><div class="v ${q>.95?'bad':q>.85?'warn':''}">${num(L.calls)}</div>
+          <div class=k>/ ${num(L.cap)} (${pct(q)})</div></div>`;
+    h += `<div class=card><div class=k>마지막 관측</div><div class="v ${alive?'ok':(sub.inService?'bad':'')}">${
+          L.lastObs? Math.round(Date.now()/1000-L.lastObs)+'초 전':'—'}</div>
+          <div class=k>${L.lastStn||'—'}${sub.inService?'':' · 운행 밖'}</div></div>`;
+    h += `<div class=card><div class=k>로스터</div><div class=v>${num(L.trains)}<span style="font-size:13px">열차</span></div>
+          <div class=k>${num(L.stations)}역 관측됨</div></div>`;
+    h += `<div class=card><div class=k>셀 충족</div><div class="v ${rate>=.9?'ok':''}">${pct(rate)}</div>
+          <div class=k>${num(L.filled)} / ${num(L.seen)} 셀 (목표 ${L.target})</div></div>`;
+    h += '</div>';
+    // 요일별 셀 충족
+    h += '<table style="margin-top:4px">';
+    for(const dk of ['weekday','sat','sun']){
+      const v = L.byDay[dk] || {seen:0,filled:0};
+      const p = v.seen ? v.filled/v.seen : 0;
+      h += `<tr><td width=50>${KOD[dk]}</td>
+            <td class=n width=54><b>${pct(p)}</b></td>
+            <td width=240>${bar(p, p>=1&&v.seen?'ok':(dk!=='weekday')?'warn':'')}</td>
+            <td class=n style="white-space:nowrap">${num(v.filled)} / ${num(v.seen)} 셀</td></tr>`;
+    }
+    h += '</table>';
   }
-  h += '</table>';
-  h += '<div class=sub style="margin-top:6px">⚠️ 토·일은 주 1일씩만 얻는다. §8 #3(토요일=평일 시각표인가 공휴일인가)을 이 3분리가 답한다.</div>';
-
-  h += '<h2>수집 목적</h2>';
-  h += '<div class=sub>trainNo 로 열차를 식별해 여러 날 관측을 겹치면 각 열차의 실제 통과 시각 분포가 나온다 → '
-    + '운영사 계획 시각표(PDF)와 대조해 <b>정시성</b>을 판정한다. 신분당선 20대라 며칠이면 수렴한다. '
-    + '이 판정이 §8 #1 — 열차가 ±3분씩 흔들리면 시각표 기반 절벽이 무의미해져 차별점이 사라진다.</div>';
+  h += '<h2>판정 (§8 #1)</h2>';
+  h += '<div class=sub>각 열차의 실제 통과 시각을 계획 시각표(PDF)와 대조 → 편차 분포. '
+    + '±30초면 절벽 성립, ±3분+면 절벽 무의미 → 차별점 재정의. '
+    + '<b>신분당선</b>(전용궤도·유리) vs <b>수인분당선</b>(코레일·지상구간·불리) 대조로 노선별 정시성 차등까지 본다.</div>';
   return h;
 }
 

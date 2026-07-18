@@ -123,6 +123,18 @@ def connect():
     # 대시보드가 5초마다 요일·밴드 필터 쿼리를 친다 — 셀이 수백만이 되면
     # daytype 풀스캔이 /api 를 초 단위로 늘린다.
     c.execute("CREATE INDEX IF NOT EXISTS cell_day ON cell(daytype)")
+    # 지하철 셀 (B안) — (노선, 열차, 역, 요일)별 관측 일수. trainNo 가 매일 반복이라
+    # 요일별 며칠이면 각 열차의 정시성 분포가 나온다 (§8 #1). n = 관측한 서로 다른 날 수.
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS subway_cell (
+        line     TEXT NOT NULL,
+        trainNo  TEXT NOT NULL,
+        statnId  TEXT NOT NULL,
+        daytype  TEXT NOT NULL,
+        n        INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (line, trainNo, statnId, daytype)
+      )""")
+    c.execute("CREATE INDEX IF NOT EXISTS subway_cell_line ON subway_cell(line)")
     # 노선 풀 — fetch_routes.py 가 채운다
     c.execute("""
       CREATE TABLE IF NOT EXISTS route (
@@ -235,6 +247,14 @@ def bump(conn, routeid, from_ord, to_ord, band, daytype, k=1):
       INSERT INTO cell(routeid,from_ord,to_ord,band,daytype,n) VALUES(?,?,?,?,?,?)
       ON CONFLICT(routeid,from_ord,to_ord,band,daytype) DO UPDATE SET n=n+?
     """, (routeid, from_ord, to_ord, band, daytype, k, k))
+
+
+def bump_subway(conn, line, trainNo, statnId, daytype):
+    """지하철 셀 +1 — 하루 1회만 호출할 것 (수집기가 당일 첫 관측에서 dedup). n = 관측 일수."""
+    conn.execute("""
+      INSERT INTO subway_cell(line,trainNo,statnId,daytype,n) VALUES(?,?,?,?,1)
+      ON CONFLICT(line,trainNo,statnId,daytype) DO UPDATE SET n=n+1
+    """, (line, trainNo, statnId, daytype))
 
 
 def route_progress(conn, target, nbands):
