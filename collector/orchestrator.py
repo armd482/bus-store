@@ -559,10 +559,16 @@ def rebuild_subway(force):
     """
     import glob
     import gzip
-    files = sorted(glob.glob(os.path.join(DATA, "subway-*.jsonl")))
+    # 옛 노선별 파일(shinbundang-*/suinbundang-* — realtimePosition 시절)도 읽는다.
+    # 형식은 달라도 line·trainNo·statnId·t 는 동일해 관측 일수 계산엔 그대로 유효하다 —
+    # 일괄(ALL) 전환 이전에 쌓인 날들을 버리면 그만큼 수렴이 늦어진다.
+    files = []
+    for pre in ("subway", "shinbundang", "suinbundang"):
+        files += sorted(glob.glob(os.path.join(DATA, f"{pre}-*.jsonl")))
     exp = cfg().get("exportDir")
     if exp:
-        files += sorted(glob.glob(os.path.join(exp, "subway-*.jsonl.gz")))
+        for pre in ("subway", "shinbundang", "suinbundang"):
+            files += sorted(glob.glob(os.path.join(exp, f"{pre}-*.jsonl.gz")))
     if not force:
         sys.exit(f"subway jsonl {len(files)}개에서 subway_cell 을 재계산해 교체한다.\n"
                  f"수집기를 먼저 멈출 것. 정말이면: python3 orchestrator.py rebuild-subway --yes")

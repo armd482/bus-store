@@ -278,7 +278,7 @@ def main():
 
         qday = quota_day(t)
         dt = daytype(t)
-        # 공휴일(운행일 기준) — 평일 다이어가 아니므로 weekday 표본에 안 섞는다.
+        # 공휴일(운행일 기준) — 평일 다이어가 아니므로 요일 표본에 안 섞는다.
         # jsonl 엔 그대로 남는다 (config.holidays 가 틀렸으면 고치고 재집계 가능).
         hol = O.is_holiday(t)
         path = os.path.join(OUT_DIR, f"{PREFIX}-{day}.jsonl")
