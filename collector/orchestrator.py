@@ -350,6 +350,109 @@ def bump(conn, routeid, from_ord, to_ord, band, daytype, k=1):
     """, (routeid, from_ord, to_ord, band, daytype, k, k))
 
 
+# ── 지하철 관제 시각 (§8.1) ────────────────────────────────────────
+# 정시성 판정은 t(우리 폴링 시각)가 아니라 recptnDt(관제 수신 시각)를 쓴다.
+# 그런데 원본 API 에 두 가지 함정이 있다 (✅ 2026-07-18 실측 119,151행).
+PREDICTIVE_AHEAD = 60      # 이 이상 '미래'면 예측성 피드로 본다 (초)
+STALE_MAX = 1800           # |recptnDt − t| 가 이보다 크면 죽은 레코드 — 판정 제외
+
+
+def recptn_of(r):
+    """행의 recptnDt 를 datetime 으로 — 자정 날짜 오류를 보정한다.
+
+    ⚠️ 원본 API 는 자정을 넘긴 뒤에도 recptnDt 의 **날짜만 당일로** 찍는다:
+    00:01:38 에 폴링한 행이 recptnDt=<오늘> 23:58:38 로 온다 (실제로는 어제
+    23:58:38). 그대로 쓰면 24시간 가까이 어긋난 값이 판정에 섞인다
+    (✅ 846행 / 119,151). 1시간 넘게 미래면 하루를 뺀다 — 정상 오차는
+    분 단위라 이 임계값에서 오분류가 없다.
+    """
+    try:
+        b = datetime.strptime(r["recptnDt"], "%Y-%m-%d %H:%M:%S")
+    except (KeyError, TypeError, ValueError):
+        return None
+    try:
+        t = datetime.fromisoformat(r["t"]).replace(tzinfo=None)
+    except (KeyError, ValueError):
+        return b
+    if (b - t).total_seconds() > 3600:
+        b -= timedelta(days=1)
+    return b
+
+
+def stale(r):
+    """판정에 못 쓰는 행인가 — API 가 되돌려주는 '죽은' 레코드.
+
+    종착역처럼 지금 열차가 없는 역은 원본이 **어젯밤 막차 기록을 계속 반환한다**
+    (✅ 실측: 14:18 폴링에 8호선 암사 recptnDt=전날 23:57 — 14시간 전).
+    이걸 정시성에 넣으면 거대한 이상치가 된다.
+
+    분포가 깨끗하게 갈려 임계값이 애매하지 않다 (✅ 119,151행):
+    99%가 19분 이내, 그 위는 곧장 16시간대 — 그 사이가 비어 있다.
+    """
+    b = recptn_of(r)
+    if b is None:
+        return True
+    try:
+        t = datetime.fromisoformat(r["t"]).replace(tzinfo=None)
+    except (KeyError, ValueError):
+        return True
+    return abs((b - t).total_seconds()) > STALE_MAX
+
+
+def audit_subway(paths=None):
+    """지하철 원본 감사 — 노선별 recptnDt 성격과 죽은 레코드 비율 (§8.1).
+
+    판정 전에 반드시 볼 것. recptnDt 가 폴링 시각보다 **미래**인 노선은 그 값이
+    실측이 아니라 예측이라는 뜻이고, 예측을 시각표와 비교하면 순환 논증이 된다
+    (운영사가 시각표로 예측을 만들었다면 편차 0 이 나온다).
+    """
+    import glob
+    import gzip
+    import statistics
+    if not paths:
+        paths = sorted(glob.glob(os.path.join(DATA, "subway-*.jsonl")))
+        exp = cfg().get("exportDir")
+        if exp:
+            paths += sorted(glob.glob(os.path.join(exp, "subway-*.jsonl.gz")))
+    if not paths:
+        sys.exit("subway jsonl 이 없다.")
+    off, n_stale, n = {}, {}, 0
+    for p in paths:
+        opener = gzip.open if p.endswith(".gz") else open
+        for line in opener(p, mode="rt", encoding="utf-8"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            b = recptn_of(r)
+            if b is None:
+                continue
+            try:
+                t = datetime.fromisoformat(r["t"]).replace(tzinfo=None)
+            except (KeyError, ValueError):
+                continue
+            ln = r.get("line")
+            n += 1
+            if stale(r):
+                n_stale[ln] = n_stale.get(ln, 0) + 1
+                continue                      # 죽은 레코드는 성격 판정에서도 뺀다
+            off.setdefault(ln, []).append((b - t).total_seconds())
+    print(f"파일 {len(paths)}개 · {n:,}행\n")
+    print(f"{'노선':<10}{'중앙값':>8}{'미래%':>7}{'죽은%':>7}{'행':>9}  판정")
+    flagged = []
+    for ln, d in sorted(off.items(), key=lambda x: -statistics.median(x[1])):
+        fut = sum(1 for x in d if x > PREDICTIVE_AHEAD) / len(d)
+        dead = n_stale.get(ln, 0) / (len(d) + n_stale.get(ln, 0))
+        verdict = "⚠️ 예측성 — 시각표 대조 전 판정 금지" if fut > 0.5 else "실측"
+        if fut > 0.5:
+            flagged.append(ln)
+        print(f"{ln:<10}{statistics.median(d):>8.0f}{fut:>6.0%}{dead:>6.1%}{len(d):>9,}  {verdict}")
+    print("\n중앙값 = recptnDt − 폴링시각(초). 음수 = 과거(실측), 양수 = 미래(예측).")
+    if flagged:
+        print(f"⚠️ {', '.join(flagged)}: recptnDt 가 미래다. §8.1 — 이 노선은 "
+              f"시각표(§9 #1)와 대조해 예측 근거를 확인하기 전까지 정시성 판정에 쓰지 말 것.")
+
+
 def bump_subway(conn, line, trainNo, statnId, daytype, day):
     """지하철 셀 +1 — n = 관측 일수. **같은 운행일에 두 번 불러도 한 번만 오른다.**
 
@@ -742,6 +845,8 @@ def main():
         rebuild("--yes" in sys.argv[2:], "--shrink-ok" in sys.argv[2:])
     elif cmd == "rebuild-subway":
         rebuild_subway("--yes" in sys.argv[2:])
+    elif cmd == "audit-subway":
+        audit_subway([p for p in sys.argv[2:] if not p.startswith("-")])
     elif cmd == "holidays":
         # 지금 장부에서 빠지는 날들. --refresh 로 캐시를 무시하고 다시 받는다.
         if "--refresh" in sys.argv[2:]:
