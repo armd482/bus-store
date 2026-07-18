@@ -72,6 +72,22 @@ def get(key, op, retries=3, **kw):
     raise last
 
 
+def get_all(key, op, **kw):
+    """전 페이지 수집 — numOfRows(500)를 채워 오면 다음 페이지를 이어 받는다.
+
+    ⚠️ pageNo=1 고정이면 500개 넘는 응답이 **조용히 절단**된다 — 지금 데이터로는
+    (시군 최대 노선수·노선 최대 정류소수 모두 500 미만) 안 걸리지만, 침묵 손실은
+    '실패는 조용히 넘어가지 않는다'(§2.1) 원칙 위반이라 구조로 막는다.
+    """
+    out, page = [], 1
+    while True:
+        batch = get(key, op, numOfRows=500, pageNo=page, **kw)
+        out += batch
+        if len(batch) < 500:
+            return out
+        page += 1
+
+
 def _vt(x):
     """운행시각 정규화: 450/'450' → '0450'. 형식이 아니면 None
     (없는 값은 maybe_running 이 True 로 열어 폴링으로 확인한다)."""
@@ -87,7 +103,7 @@ def main():
     conn = O.connect()
 
     for city in k["cityCodes"]:
-        routes = get(key, "getRouteNoList", cityCode=city, numOfRows=500, pageNo=1)
+        routes = get_all(key, "getRouteNoList", cityCode=city)
         print(f"[{city}] 노선 {len(routes)}개 — 정류소·운행시간 조회 중…", flush=True)
         fails = []
 
@@ -102,8 +118,8 @@ def main():
             except Exception as ex:
                 fails.append((rid, "info", str(ex)[:30]))
             try:
-                n = len(get(key, "getRouteAcctoThrghSttnList",
-                            cityCode=city, routeId=rid, numOfRows=500))
+                n = len(get_all(key, "getRouteAcctoThrghSttnList",
+                                cityCode=city, routeId=rid))
             except Exception as ex:
                 fails.append((rid, "stops", str(ex)[:30]))
             return rid, (n, s, e)

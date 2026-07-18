@@ -29,8 +29,8 @@
    파일이나 행을 지워도 장부는 모른다. 장부만 남으면 "이미 채웠다"고 믿어
    그 구간을 다시 안 찍는다: 영구 구멍. 데이터를 지웠으면:
      전부 지웠다  → reset --yes  (장부도 0으로)
-     일부만 지웠다 → rebuild --yes (남은 jsonl 로 장부 재계산 — 행에 band/daytype
-                     이 박혀 있어 정확히 재현된다)
+     일부만 지웠다 → rebuild --yes (남은 jsonl 로 장부 재계산 — 밴드·요일은 t 에서
+                     현 config 규칙으로 재분류된다)
    반대로 장부만 지우면 재수집할 뿐이라 안전하다 (중복 데이터, 쿼터 낭비).
 """
 
@@ -96,7 +96,7 @@ def is_holiday(t):
 def band_of(t, bands):
     """시각 → 밴드 인덱스. 어느 밴드에도 없으면 None(커버리지에 안 넣음).
 
-    ⚠️ 24를 넘는 끝값은 익일이다: [20, 27] = 20:00~03:00.
+    ⚠️ 24를 넘는 끝값은 익일이다: [20, 28] = 20:00~04:00(운행일 경계).
     이걸 처리 안 하면 00:30 관측이 어느 밴드에도 안 걸려 영원히 안 채워진다.
     """
     h = t.hour
@@ -403,7 +403,8 @@ def status():
             rounds = max(1, (len(prog) - len(done_routes)) / rate)
             weeks_per_round = tgt / per_cell_day  # 각 요일은 주 1회씩만 발생 → 주 단위
             print(f"\n  추정: 라운드 {rounds:.1f}회 × {weeks_per_round:.1f}주 = 약 {rounds*weeks_per_round:.0f}주")
-            print(f"        ⚠️ 요일 7종 전부 분리라 모든 요일이 주 1일씩만 채워진다 — 목표 {tgt}샘플이면 요일당 {tgt}주가 하한.")
+            print(f"        (각 요일은 주 1일씩만 오지만 셀당 관측이 ~{per_cell_day:.1f}건/일이라 "
+                  f"{tgt}샘플은 대개 그 요일 하루 안에 찬다 — 기간은 로테이션 라운드 수가 지배)")
 
     print(f"\n=== 진행 중 상위/하위 ===")
     live = sorted([p for p in prog if p["pct"] < 1.0], key=lambda p: -p["pct"])
@@ -437,8 +438,10 @@ def reset(force):
 def rebuild(force, shrink_ok=False):
     """장부(cell)를 jsonl 데이터에서 재계산 — 데이터 일부를 지웠거나 장부가 의심될 때.
 
-    행에 band 가 저장돼 있어 수집 당시 규칙이 고정되고, 요일은 t 에서 재계산한다.
-    band 가 없는 행(밴드 밖 03-04시 관측)은 원래도 장부에 안 들어갔으므로 건너뛴다.
+    밴드·요일 **둘 다 t 에서 현 config 규칙으로 재계산**한다 — 분류 규칙이 바뀌면
+    (weekday 통합→7종 분리, 밴드 [20,27]→[20,28] 등) 옛 행도 새 규칙으로 재분류되게.
+    행에 저장된 band/daytype 은 행 자체를 읽을 때의 참고용이다. 그래서 밴드 경계를
+    넓힌 뒤 rebuild 하면 예전에 밴드 밖이던 03시대 관측도 장부로 회수된다.
     emptyStreak/lastSeen 은 jsonl 에 이력이 없으므로 건드리지 않는다.
     ⚠️ 수집기를 멈추고 돌릴 것 — 재계산 중 들어온 관측은 교체 때 유실된다.
 
@@ -468,7 +471,9 @@ def rebuild(force, shrink_ok=False):
         band INTEGER NOT NULL, daytype TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (routeid, from_ord, to_ord, band, daytype))""")
     bad = total = 0
-    hols = set(cfg().get("holidays") or [])
+    k = cfg()
+    hols = set(k.get("holidays") or [])
+    bands = k["timebands"]
     for p in files:
         opener = gzip.open if p.endswith(".gz") else open
         day_counts = {}   # 이 파일(하루)에서만 — 메모리 상한이 하루치로 묶인다
@@ -478,21 +483,21 @@ def rebuild(force, shrink_ok=False):
             except ValueError:
                 bad += 1  # 강제종료로 잘린 마지막 줄 등 — 한 줄 손상은 한 줄만 버린다
                 continue
-            b = r.get("band")
-            if b is None:
-                continue
             try:
                 fo, to = int(r["from_ord"]), int(r["to_ord"])
             except (KeyError, TypeError, ValueError):
                 continue
             if to <= fo:
                 continue  # 회차 아티팩트(168→1 등) — 수집기와 같은 기준으로 거른다
-            # 요일은 저장값이 아니라 t 에서 다시 계산한다 — 분류 규칙이 바뀌어도
-            # (weekday 통합 → 월~일 분리) 옛 행이 새 규칙으로 재분류되도록.
+            # 밴드·요일은 저장값이 아니라 t 에서 다시 계산한다 — 분류 규칙이 바뀌어도
+            # (weekday 통합 → 월~일 분리, 밴드 [20,27] → [20,28]) 옛 행이 재분류되도록.
             try:
                 dtm = datetime.fromisoformat(r["t"])
             except (KeyError, ValueError):
                 continue
+            b = band_of(dtm, bands)
+            if b is None:
+                continue  # 현 밴드 밖 — 장부 대상 아님
             if service_day_of(dtm).strftime("%Y-%m-%d") in hols:
                 continue  # 공휴일 — 수집기와 같은 기준으로 장부에서 제외 (jsonl 은 진실로 유지)
             dt = day_type(dtm)

@@ -1,7 +1,7 @@
 # 수집 관리 프로그램 — 설계
 
 > **상태:** 수집기·조율기·서버 구현됨. **운영(배포·자동시작)만 미정** — 대상 기계가 정해져야 함.
-> **코드:** `find-path/collector/` (원본) · `~/findpath-collector/` (실행용 복사본)
+> **코드:** `find-path/collector/` (원본) · `~/findpath/collector/` (macOS 실행용 복사본 — `service.py` 가 만든다)
 > **관련:** [`transit-routing-gtfs.md`](transit-routing-gtfs.md) §3.1(API 제약) · §4.4(수집 산수) · §3.3(지하철)
 > **작성:** 2026-07-16 — 아래 ✅ 는 전부 그날 실측한 것이다.
 
@@ -297,7 +297,7 @@ python3: can't open file '.../Desktop/.../bus_collector.py': [Errno 1] Operation
 |---|---|---|
 | `cityCodes` | 경기 31개 시군 (2,200 노선) | 범위. 서울은 별도 API(§9 #5) |
 | `targetSamples` | 7 | **"언제 멈추나"만 정한다** — 수집 동작은 같으므로 나중에 바꿔도 된다 |
-| `timebands` | `[4,7] [7,9] [9,12] [12,15] [15,17] [17,20] [20,27]` | ⚠️ **수집 기간을 지배한다.** 19개면 41 평일, 7개면 10 평일. `27` = 익일 03시 |
+| `timebands` | `[4,7] [7,9] [9,12] [12,15] [15,17] [17,20] [20,28]` | ⚠️ **수집 기간을 지배한다.** 19개면 41 평일, 7개면 10 평일. `28` = 익일 04시(운행일 경계) — 27로 두면 03시대 첫차·막차가 장부 밖 |
 | `serviceWindow` | **`[0,24]` 24시간** | ✅ 전수 실측: **버스가 0인 시간대는 없다** → §2.6 |
 | `dispatchRate` | 6/s | ⚠️ **사이클 = 노선수 ÷ rate.** §2.2 |
 | `maxRoutes` | **170** | 쿼터가 정함. 180 이면 21h×180 + 3h×100 = **489,600 (50만의 98%)** 로 빠듯 → 170 = 464,400 (93%) |
@@ -320,7 +320,7 @@ python3: can't open file '.../Desktop/.../bus_collector.py': [Errno 1] Operation
 
 ## 7. 데이터
 
-### 7.1 현재 보유 (`~/findpath-collector/data/`)
+### 7.1 현재 보유 (2026-07-16 당시 — 경로도 지금은 `~/findpath/collector/data/`)
 
 | | |
 |---|---|
@@ -330,6 +330,8 @@ python3: can't open file '.../Desktop/.../bus_collector.py': [Errno 1] Operation
 | 쿼터 사용 | 10,880 / 470,000 |
 
 ### 7.2 기록 형식
+
+> **⚠️ 추기 (2026-07-18):** 아래 예시는 07-16 당시 형식이다. 현행은 **최소 필드**(`t·t_prev·routeid·vehicleno·from_ord·to_ord·nodeid·band·daytype`)로 슬림화됐고(행 381B → ~220B — 노선명·정류장명·좌표는 `route` 테이블 조인) `daytype` 도 `weekday` 통합이 아니라 **7종(mon~sun)** 이다. 현행 스펙과 장부 계상 규칙(인접 구간 분해·공휴일 제외)은 [`../collector/README.md`](../collector/README.md) "기록 형식" 참조.
 
 **버스** — 정류장을 넘은 순간만. 통과 시각은 `(t_prev, t]` 안에 있다:
 

@@ -46,6 +46,9 @@ LOCK = threading.Lock()
 
 AVG_ROW_BYTES = 222  # 슬림 형식 행 평균 (✅ 실측) — 행 수 추정용
 
+# 지하철 jsonl 증분 리더 상태 — /api 마다 풀스캔하지 않기 위한 캐시 (subway_snapshot)
+_SUB_TAIL = {}
+
 
 def _obs_rate_per_day():
     """(하루 관측률 행/일, 측정 창 일수) — 최근 1~2 운행일 jsonl 크기 ÷ 경과 시간.
@@ -101,24 +104,43 @@ def subway_snapshot():
         a["trains"] = max(a["trains"], tr)
         a["stations"] = max(a["stations"], st)
 
-    # 오늘 jsonl — 노선별 기록 수와 마지막 관측 (일괄이라 파일 하나)
-    per_line_written, last_epoch, last_stn, last_line = {}, None, None, None
-    total_written = 0
+    # 오늘 jsonl — 노선별 기록 수와 마지막 관측 (일괄이라 파일 하나).
+    # ⚠️ 매 /api(5초)마다 전체를 다시 읽지 않는다 — 일괄 수집은 하루 수만 행이라
+    #    풀스캔이면 t4g.micro 에서 /api 가 초 단위로 늘어진다. 지난 호출 이후
+    #    추가된 바이트만 이어 읽어 누적한다 (파일 교체/축소 시엔 처음부터).
+    path = os.path.join(O.DATA, f"{subway_collector.PREFIX}-{day}.jsonl")
+    cache = _SUB_TAIL
+    if cache.get("path") != path:
+        cache.update(path=path, offset=0, per_line={}, total=0,
+                     last_t=None, last_stn=None, last_line=None)
     try:
-        with open(os.path.join(O.DATA, f"{subway_collector.PREFIX}-{day}.jsonl"), encoding="utf-8") as fh:
-            for line in fh:
-                total_written += 1
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                per_line_written[r.get("line")] = per_line_written.get(r.get("line"), 0) + 1
-                last_t, last_stn, last_line = r.get("t"), r.get("statnNm"), r.get("line")
+        size = os.path.getsize(path)
+        if size < cache["offset"]:
+            cache.update(offset=0, per_line={}, total=0)
+        if size > cache["offset"]:
+            with open(path, "rb") as fh:
+                fh.seek(cache["offset"])
+                for raw in fh:
+                    if not raw.endswith(b"\n"):
+                        break              # 쓰다 만 마지막 줄 — 다음 호출에서 마저 읽는다
+                    cache["offset"] += len(raw)
+                    cache["total"] += 1
+                    try:
+                        r = json.loads(raw.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    ln = r.get("line")
+                    cache["per_line"][ln] = cache["per_line"].get(ln, 0) + 1
+                    cache["last_t"], cache["last_stn"], cache["last_line"] = \
+                        r.get("t"), r.get("statnNm"), ln
     except OSError:
-        last_t = None
-    if last_t:
+        pass
+    per_line_written, total_written = cache["per_line"], cache["total"]
+    last_stn, last_line = cache["last_stn"], cache["last_line"]
+    last_epoch = None
+    if cache["last_t"]:
         try:
-            last_epoch = datetime.fromisoformat(last_t).timestamp()
+            last_epoch = datetime.fromisoformat(cache["last_t"]).timestamp()
         except ValueError:
             pass
 
@@ -147,9 +169,11 @@ def snapshot():
     bands = k["timebands"]
     nb, tgt = len(bands), k["targetSamples"]
 
-    routes = c.execute("SELECT COUNT(*), COALESCE(SUM(nstops),0) FROM route").fetchone()
-    nroute, nstops = routes
-    nseg = max(0, nstops - nroute)
+    # 구간수는 노선별 max(nstops-1, 0) 의 합 — SUM(nstops)-COUNT(*) 로 하면 조회
+    # 실패로 nstops=0 인 노선이 분모를 -1 씩 깎는다 (fetch_routes 의 산식과 동일하게).
+    routes = c.execute(
+        "SELECT COUNT(*), COALESCE(SUM(MAX(nstops-1,0)),0) FROM route").fetchone()
+    nroute, nseg = routes
     # 요일 7종을 전부 분리한 뒤로 토·일은 더 이상 '병목'이 아니다 — 월~일 모두
     # 주 1회씩만 채워지는 동등한 처지다. 그래서 완성률 분모도 7요일 전체로 본다.
     ndays = 7
@@ -213,7 +237,7 @@ def snapshot():
         band_tot = dict(c.execute("SELECT band, SUM(n) FROM cell GROUP BY band"))
         tot_all = sum(band_tot.values())
         need_bd = nseg * tgt                     # (밴드, 요일) 하나의 필요 관측 수
-        CEIL = {0: 0.82, nb - 1: 0.82}           # 04-07·20-03시 천장 — 나머지 0.90
+        CEIL = {0: 0.82, nb - 1: 0.82}           # 04-07·20-04시 천장 — 나머지 0.90
         weeks = []
         for i in range(nb):
             share = band_tot.get(i, 0) / tot_all if tot_all else 0  # 하루 관측 중 이 밴드 비중(실측 근사)
@@ -340,7 +364,7 @@ function renderBus(d){
   }
 
   // 요일 — 7종 전부 분리
-  h += `<h2>요일별 완성률 (전부 분리) — 각 요일은 주 1일씩만 얻는다: 목표 ${d.target}샘플이면 요일당 ${d.target}주</h2><table>`;
+  h += `<h2>요일별 완성률 (전부 분리) — 각 요일은 주 1일씩만 온다 (셀 ${d.target}샘플은 대개 그 요일 하루 안에 참 · 기간은 로테이션 라운드가 지배)</h2><table>`;
   for(const [k,label] of [['mon','월'],['tue','화'],['wed','수'],['thu','목'],['fri','금'],['sat','토'],['sun','일']]){
     const v = d.days[k] || {obs:0,done:0,cells:0,pct:0};
     h += `<tr><td width=40>${label}</td>

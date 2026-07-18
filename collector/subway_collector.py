@@ -55,11 +55,12 @@ LINES = {
     "1092": "우이신설선", "1093": "서해선", "1094": "신림선",
 }
 
-# 1,000회/일 한도에 마진을 둔다. ⚠️ 운행창 20시간(72,000s) ÷ 950회 = 75.8초 —
-# 75로 내림하면 캡이 운행창보다 먼저 차서(950×75s=19.8h) 하필 막차 직전 ~12분이
-# 매일 비었다. 76으로 올림해 캡보다 창이 먼저 끝나게 한다 (950×76s=20.06h ≥ 20h).
+# 갱신주기(10~20초)보다 성기게 — 최소 간격. ⚠️ 실제 간격은 키 수로 다시 계산한다
+# (main 참조): 사이클 = 3콜이라 키 N개 = 316N회/일. 3키라야 76초가 나오고, 키가
+# 적은데 76초로 돌면 캡이 하루를 못 채워(1키 = 316회×76s ≈ 6.7h) 저녁 첨두부터
+# 매일 비는 구조적 구멍이 된다 — §1.2(꺼진 밴드는 영원히 0)와 같은 문제.
 INTERVAL_SEC = 76
-DAILY_CAP = 950
+DAILY_CAP = 950   # 키당 1,000회/일에 마진
 
 # 운행시간 밖은 열차가 없다 — 콜만 태우므로 건너뛴다
 SERVICE_START_H = 5
@@ -214,8 +215,13 @@ def main():
         sys.exit("지하철 인증키가 없다 — config.subwayKeys 와 .env 를 확인.")
     conn = O.connect()
 
+    # 간격은 키 수가 정한다 — 같은 콜 예산으로 하루(운행창 20h = 72,000s)를 고르게
+    # 덮는 게 목표다. 짧게 돌다 캡으로 멈추면 저녁 첨두가 매일 비는 구조적 구멍.
+    cycles_per_day = max(1, DAILY_CAP * len(keys) // 3)   # 사이클 = 3콜(1,000건 × 3페이지)
+    interval = max(INTERVAL_SEC, 72000 // cycles_per_day + 1)
+
     # 매일 위상을 흔든다 (§3.3.3). 고정 간격이면 매일 같은 시각만 샘플링된다.
-    time.sleep(random.Random(service_day(now())).uniform(0, INTERVAL_SEC))
+    time.sleep(random.Random(service_day(now())).uniform(0, interval))
 
     day = service_day(now())
     written = 0
@@ -243,7 +249,9 @@ def main():
     export()   # 시작 시 1회
 
     print(f"[{now():%H:%M:%S}] 지하철 수집 시작 · 전 노선 일괄(ALL) · 키 {len(keys)}개"
-          f"({', '.join(k for k, _ in keys)}) · {INTERVAL_SEC}s 간격 · 키당 상한 {DAILY_CAP}회", flush=True)
+          f"({', '.join(k for k, _ in keys)}) · {interval}s 간격"
+          f"{' (키 부족 — 76s 를 내려면 3키)' if interval > INTERVAL_SEC else ''}"
+          f" · 키당 상한 {DAILY_CAP}회", flush=True)
 
     while True:
         t = now()
@@ -252,7 +260,7 @@ def main():
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d} (전일 기록 {written:,}건)", flush=True)
             day, written, last_state, bumped = d, 0, {}, set()
             export()
-            time.sleep(random.uniform(0, INTERVAL_SEC))
+            time.sleep(random.uniform(0, interval))
             continue
         if not in_service(t):
             time.sleep(300)
@@ -283,7 +291,7 @@ def main():
             got += len(rows)
             with open(path, "a", encoding="utf-8") as f:
                 for r in rows:
-                    cd = r.get("arvlCd")
+                    cd = str(r.get("arvlCd") or "")     # str 정규화 — 숫자로 오면 필터가 전부 새는 것 방지
                     if cd not in ARRIVED:
                         continue                        # 전역 상태·운행중 — 그 역 관측이 아니다
                     tn, sid = r.get("btrainNo"), r.get("statnId")
@@ -292,7 +300,7 @@ def main():
                     if last_state.get((tn, sid)) == cd:
                         continue                        # 상태 안 바뀜 → 같은 관측
                     last_state[(tn, sid)] = cd
-                    line = LINES.get(r.get("subwayId"), r.get("subwayId"))
+                    line = LINES.get(str(r.get("subwayId")), r.get("subwayId"))
                     f.write(json.dumps({
                         "t": t.isoformat(), "line": line, "recptnDt": r.get("recptnDt"),
                         "trainNo": tn, "statnId": sid, "statnNm": r.get("statnNm"),
@@ -313,12 +321,12 @@ def main():
             print(f"[{t:%H:%M:%S}] 전 키 일 상한 도달 — 자정 리셋까지 대기", flush=True)
             time.sleep(300)
             continue
-        if int(t.timestamp()) // INTERVAL_SEC % 20 == 0:
+        if int(t.timestamp()) // interval % 20 == 0:
             cal = " ".join(f"{kid}:{read_calls(kid, qday)}" for kid, _ in keys)
             print(f"[{t:%H:%M:%S}] 콜[{cal}] · 응답 {got}건 · 오늘 기록 {written:,}건 "
                   f"· 셀 {len(bumped):,}", flush=True)
 
-        time.sleep(INTERVAL_SEC + random.uniform(-3, 3))
+        time.sleep(interval + random.uniform(-3, 3))
 
 
 if __name__ == "__main__":

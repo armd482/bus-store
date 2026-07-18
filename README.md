@@ -38,7 +38,7 @@ collector/
   bus_collector.py          버스 위치 폴링 → 정류장 통과 시각 기록
   orchestrator.py           커버리지 DB + 미커버 우선 노선 선택 + 운행시간 필터
   fetch_routes.py           노선 풀 구축 (커버리지의 분모)
-  subway_collector.py       지하철 위치 → 정시성 검증용
+  subway_collector.py       지하철 도착 일괄(전 노선) → 정시성 검증용
   config.json               목표·밴드·쿼터 — 각 값이 무엇을 지배하는지 주석
   README.md                 수집기 운영 (제어 · TCC · 쿼터)
 ```

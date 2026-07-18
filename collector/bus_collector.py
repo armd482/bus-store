@@ -137,7 +137,8 @@ def fetch(key, city, routeid):
       {"response":{"header":{"resultCode":99,"resultMsg":"가용한 세션이 존재하지 않습니다. (30/30)"},"body":""}}
     → HTTP 200 이고 예외도 안 난다. resultCode 를 안 보면 조용히 데이터를 버린다.
     ✅ 실측: 제약은 "30 TPS"가 아니라 **동시 세션 30개**다. 응답이 ~3초이므로
-       실효 처리량은 30÷3s = 초당 10건이 상한. 우리 프로세스 전체의 워커 합이 30을 넘으면 안 된다.
+       실효 처리량은 30÷3s = 초당 10건이 상한. 우리 프로세스 전체의 **in-flight 합**이
+       30을 넘으면 안 된다 (워커 수가 아니라 세마포어 maxInflight 가 지킨다 — config).
     """
     q = urllib.parse.urlencode({"serviceKey": key, "_type": "json", "cityCode": city,
                                 "routeId": routeid, "numOfRows": 200})
@@ -200,11 +201,20 @@ def main():
             day, last, written, picked = d, {}, 0, []
             with LOCK:
                 STATE["errLog"] = []   # 오류 로그 매일 초기화 — 어제 실패가 오늘 화면에 안 남게
+            # emptyStreak 도 매일 리셋 — 리셋 조건이 '폴링돼서 버스가 보이는 것'뿐이라,
+            # 콜드가 된 노선은 슬롯이 차 있는 한 다시 폴링될 기회가 없어 영구 고착된다
+            # (성긴 배차 노선은 운행 중에도 6사이클 연속 0대가 가능하다). 하루 단위로
+            # 재기회를 주면 고착이 최대 하루로 묶인다.
+            conn.execute("UPDATE route SET emptyStreak = 0")
+            conn.commit()
             kickoff_export()   # 어제 백업 + 그저께 삭제(백업 확인 후)
             continue
         if not O.in_window(t, window):
-            # ✅ 실측: 03-04시는 버스가 0이다. 관측 수는 폴링이 아니라
-            #    버스 통과 횟수로 정해지므로 여기 폴링하면 순손실.
+            # serviceWindow 밖 — 현재 설정은 [0,24](24시간)라 이 분기는 안 탄다.
+            # ⚠️ 전수 실측상 "버스가 0인 시간대는 없다"(config _serviceWindow —
+            #    '03-04시는 0'이라던 초기 판단은 194개 표본의 오판). 창을 좁힐 때만 유효.
+            with LOCK:
+                STATE["night"] = True
             time.sleep(300)
             continue
 
@@ -268,6 +278,9 @@ def main():
         obs = now()
         band = O.band_of(obs, bands)
         dtype = O.day_type(obs)
+        # 공휴일(운행일 기준) — 평일 다이어가 아니므로 요일 표본에 안 섞는다.
+        # jsonl 엔 그대로 남는다 (config.holidays 를 고치면 rebuild 로 재분류).
+        hol = O.is_holiday(obs)
         rows, bumps = [], []
         moving = 0
         errs = {}
@@ -303,7 +316,7 @@ def main():
                     continue
                 # 최소 필드만 저장한다 (행 381B → ~220B).
                 #   필수: 통과 구간 (t_prev, t] + 차량(소요시간 체인 키) + 노선/구간
-                #   장부: band/daytype — rebuild 가 수집 당시 규칙으로 재계산하기 위함
+                #   참고: band/daytype — 행 단독 해석용. rebuild 는 t 에서 현 규칙으로 재계산
                 #   안전: nodeid — ord 는 노선 개편 시 흔들릴 수 있다
                 # routeno/routetp/cityCode/nodenm/좌표는 coverage.sqlite 의
                 # route 테이블에서 routeid 로 조인한다 — 행마다 반복 저장하지 않는다.
@@ -314,8 +327,15 @@ def main():
                     "nodeid": b.get("nodeid"),
                     "band": band, "daytype": dtype,
                 })
-                if band is not None:
-                    bumps.append((routeid, prev[0], ordv, band, dtype))
+                if band is not None and not hol:
+                    # 장부는 **인접 구간 단위**로 계상한다. 2칸 이상 건너뛴 전이(5.2%)를
+                    # (31,33) 같은 비인접 셀로 넣으면 분모(인접 구간수 = nstops-1)와
+                    # 어긋나고, 정류장 간격이 짧아 늘 건너뛰어지는 구간은 영영 미충족으로
+                    # 남는다. 통과는 (t_prev, t] 안에서 전부 일어났으므로 사이의 각 인접
+                    # 구간에 1관측씩 준다 — 구간 폭이 넓은 관측일 뿐 거짓은 아니다.
+                    # 원본 행(jsonl)은 전이 그대로 둔다. rebuild 도 같은 분해를 쓴다.
+                    for o in range(prev[0], ordv):
+                        bumps.append((routeid, o, o + 1, band, dtype))
 
         if rows:
             with open(os.path.join(O.DATA, f"bus-{day}.jsonl"), "a", encoding="utf-8") as f:
