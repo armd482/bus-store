@@ -329,24 +329,45 @@ def _hm(s):
     return int(s[:2]) * 60 + int(s[2:4])
 
 
-def maybe_running(startvt, endvt, t, tail_min=90):
+def maybe_running(startvt, endvt, t, nstops=None, tail_min=None):
     """지금 이 노선에 버스가 있을 법한가 — **1차 필터일 뿐이다.**
 
     ⚠️ 확실히 아닌 것만 거른다. 진짜 판정은 관측이 한다(emptyStreak).
 
     `endvehicletime` 은 막차 **출발** 시각이다. 그 뒤로도 종점까지 달린다.
-    ✅ 실측: 36번은 00:50 출발 + 177정류소 → 05:16 도착 추정.
-    노선 소요시간은 어느 API 도 주지 않으므로(§4.4 결측) 정확히 계산할 수 없다.
-    → tail_min 만큼 넉넉히 열어두고, 실제로 비었는지는 폴링해서 안다.
+    ✅ 실측: 36번은 00:50 출발 + 177정류소 → 05:16 도착 추정 = 꼬리 **266분**.
+
+    ⚠️ 고정 90분은 그 실측과 자기모순이었다 — 00:50+90 = 02:20 에 창이 닫혀
+    05:16 까지 달리는 36번이 02:20 부터 후보에서 빠졌다. 1단계에서 빠지면
+    emptyStreak(2단계 관측)이 볼 기회 자체가 없어, collector-design §2.6 이
+    경고한 실패("36번을 버리고 차고의 낮 노선을 찍는다")가 기본값에서 재현됐다.
+    하필 심야 장거리 = 광역/직행좌석 = 문서가 "버스 차별점이 성립하는 유일한
+    부류"로 지목한 노선들이다.
+
+    → 꼬리를 **정류소 수에 비례**시킨다: nstops × tailPerStopMin (기본 1.5분),
+      하한 90분. 36번(177정류소)이면 266분으로 실측과 맞는다.
+      nstops 를 모르면 상한(tailMaxMin, 기본 300분)으로 넉넉히 연다 —
+      과하게 여는 쪽이 안전하다(빈 응답 몇 콜 vs 데이터 영구 손실).
 
     운행시간 정보가 없으면 True(폴링해서 확인).
     """
     a, b = _hm(startvt), _hm(endvt)
     if a is None or b is None:
         return True
+    if tail_min is None:
+        k = cfg()
+        per = k.get("tailPerStopMin", 1.5)
+        lo, hi = k.get("tailMinMin", 90), k.get("tailMaxMin", 300)
+        tail_min = min(hi, max(lo, int((nstops or 0) * per))) if nstops else hi
+    # ⚠️ 절대 분으로 계산한다. b 에 꼬리를 더한 뒤 % 1440 부터 하면, 꼬리가 창 끝을
+    #    시작 시각 너머로 밀 때 자정 넘김 판정이 뒤집힌다 — 36번(a=05:00, b=00:50,
+    #    꼬리 265)이면 b→05:15 가 되어 "05:00~05:15 만 운행"으로 읽혔다.
+    end = b + (1440 if b < a else 0) + tail_min   # 막차 출발(자정 넘으면 +1일) + 꼬리
+    if end - a >= 1440:
+        return True                               # 창이 하루를 통째로 덮는다
+    end %= 1440
     now = t.hour * 60 + t.minute
-    b = (b + tail_min) % 1440
-    return (a <= now <= b) if a <= b else (now >= a or now <= b)
+    return (a <= now <= end) if a <= end else (now >= a or now <= end)
 
 
 def pick_routes(conn, n, target, nbands, t=None, max_empty=6):
@@ -363,16 +384,18 @@ def pick_routes(conn, n, target, nbands, t=None, max_empty=6):
     prog = route_progress(conn, target, nbands)
     live = [p for p in prog if p["pct"] < 1.0]
     if t is not None:
+        # nstops 도 같이 — 막차 꼬리를 정류소 수에 비례시킨다 (maybe_running 참조).
+        # 긴 노선일수록 막차 출발 후 오래 달리므로 고정 꼬리는 장거리를 잘라낸다.
         meta = {r[0]: r[1:] for r in conn.execute(
-            "SELECT routeid, startvt, endvt, emptyStreak FROM route")}
+            "SELECT routeid, startvt, endvt, emptyStreak, nstops FROM route")}
         out = []
         for p in live:
             m = meta.get(p["routeid"])
             if not m:
                 out.append(p)
                 continue
-            s, e, streak = m
-            if not maybe_running(s, e, t):
+            s, e, streak, nstops = m
+            if not maybe_running(s, e, t, nstops=nstops):
                 continue                       # 운행시간 밖
             if (streak or 0) >= max_empty:
                 p["cold"] = True               # 계속 비어 있음 — 후순위
@@ -474,10 +497,16 @@ def rebuild(force, shrink_ok=False):
     import glob
     import gzip
     files = sorted(glob.glob(os.path.join(DATA, "bus-*.jsonl")))
-    # exportDir 로 내보낸 .gz 도 진실의 일부다 — 같이 재계산한다
+    # exportDir 로 내보낸 .gz 도 진실의 일부다 — 같이 재계산한다.
+    # ⚠️ 단 **같은 날짜의 로컬 원본이 있으면 .gz 는 건너뛴다.** 로테이션 정책상
+    #    어제 파일은 .gz 백업을 만든 뒤에도 원본을 로컬에 남기므로(ETA 용), 둘 다
+    #    읽으면 그날 관측이 **두 번 세어져** 셀 n 이 부풀고 실제보다 일찍 '충족'된다.
+    #    (삭제 보류된 그저께도 같은 상태가 된다.) ✅ 재현: 1건이 n=2 로 들어감.
+    have = {os.path.basename(p) for p in files}
     exp = cfg().get("exportDir")
     if exp:
-        files += sorted(glob.glob(os.path.join(exp, "bus-*.jsonl.gz")))
+        files += [p for p in sorted(glob.glob(os.path.join(exp, "bus-*.jsonl.gz")))
+                  if os.path.basename(p)[:-3] not in have]   # .gz 떼면 원본 이름
     if not force:
         sys.exit(f"jsonl {len(files)}개 파일에서 장부를 다시 계산해 cell 을 통째로 교체한다.\n"
                  f"수집기를 먼저 멈출 것. 정말이면: python3 orchestrator.py rebuild --yes")
@@ -565,10 +594,14 @@ def rebuild_subway(force):
     files = []
     for pre in ("subway", "shinbundang", "suinbundang"):
         files += sorted(glob.glob(os.path.join(DATA, f"{pre}-*.jsonl")))
+    # 버스와 같은 이유로 같은 날짜의 로컬 원본이 있으면 .gz 는 건너뛴다.
+    # (여기선 날짜를 집합으로 세어 n 이 안 부풀지만, 같은 파일을 두 번 읽는 낭비는 없앤다.)
+    have = {os.path.basename(p) for p in files}
     exp = cfg().get("exportDir")
     if exp:
         for pre in ("subway", "shinbundang", "suinbundang"):
-            files += sorted(glob.glob(os.path.join(exp, f"{pre}-*.jsonl.gz")))
+            files += [p for p in sorted(glob.glob(os.path.join(exp, f"{pre}-*.jsonl.gz")))
+                      if os.path.basename(p)[:-3] not in have]
     if not force:
         sys.exit(f"subway jsonl {len(files)}개에서 subway_cell 을 재계산해 교체한다.\n"
                  f"수집기를 먼저 멈출 것. 정말이면: python3 orchestrator.py rebuild-subway --yes")

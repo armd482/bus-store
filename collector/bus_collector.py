@@ -178,7 +178,12 @@ def main():
     window = k["serviceWindow"]
 
     day = service_day(now())
-    last = {}       # vehicleno -> (nodeord, 그 정류장에서 처음 본 시각)
+    # (routeid, vehicleno) -> (nodeord, 그 정류장에서 처음 본 시각).
+    # ⚠️ 키에 routeid 가 필요하다 — 같은 차량이 당일 다른 노선으로 재배차되면
+    #    (경기 시내버스 운영에서 실제로 있다) 이전 노선의 nodeord 가 새 노선의
+    #    전이 계산에 섞여 엉뚱한 구간 통과가 기록된다. ordv<=prev 와 4×interval
+    #    가드가 대부분 걸러주지만, 순번이 우연히 증가 방향이면 통과한다.
+    last = {}
     picked, cyc, written = [], 0, 0
 
     rotated_day = None   # 로테이션을 마친 운행일 — 하루 한 번만 돌게
@@ -304,8 +309,9 @@ def main():
                     continue  # 순번 없는 항목 — 전이 계산 불가
                 if not v:
                     continue  # 차량번호 없음 — last[None] 으로 서로 다른 버스가 섞인다
-                prev = last.get(v)
-                last[v] = (ordv, obs)
+                vk = (routeid, v)          # 노선까지 포함해야 재배차 오염이 없다
+                prev = last.get(vk)
+                last[vk] = (ordv, obs)
                 if prev is None or ordv <= prev[0]:
                     # 처음 보거나, 같은 정류장이거나, **역방향** — 역방향은 회차 아티팩트다:
                     # 종점 도착 후 재출발하면 ord 가 168→1 로 떨어진다 (✅ 실측 0.07%).
