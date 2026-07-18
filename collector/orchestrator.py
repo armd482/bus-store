@@ -190,9 +190,14 @@ def connect(check_same_thread=True):
         statnId  TEXT NOT NULL,
         daytype  TEXT NOT NULL,
         n        INTEGER NOT NULL DEFAULT 0,
+        last_day TEXT,
         PRIMARY KEY (line, trainNo, statnId, daytype)
       )""")
     c.execute("CREATE INDEX IF NOT EXISTS subway_cell_line ON subway_cell(line)")
+    # 기존 DB 마이그레이션 — last_day 는 "이 셀을 마지막으로 센 운행일"이고,
+    # 하루 1회 제약을 메모리가 아니라 **디스크**에 두기 위한 것이다 (bump_subway 참조).
+    if "last_day" not in {r[1] for r in c.execute("PRAGMA table_info(subway_cell)")}:
+        c.execute("ALTER TABLE subway_cell ADD COLUMN last_day TEXT")
     # 노선 풀 — fetch_routes.py 가 채운다
     c.execute("""
       CREATE TABLE IF NOT EXISTS route (
@@ -345,12 +350,24 @@ def bump(conn, routeid, from_ord, to_ord, band, daytype, k=1):
     """, (routeid, from_ord, to_ord, band, daytype, k, k))
 
 
-def bump_subway(conn, line, trainNo, statnId, daytype):
-    """지하철 셀 +1 — 하루 1회만 호출할 것 (수집기가 당일 첫 관측에서 dedup). n = 관측 일수."""
+def bump_subway(conn, line, trainNo, statnId, daytype, day):
+    """지하철 셀 +1 — n = 관측 일수. **같은 운행일에 두 번 불러도 한 번만 오른다.**
+
+    ⚠️ 하루 1회 제약이 수집기 메모리(bumped 집합)에만 있었을 때 셀이 통째로
+    0 이 되는 경로가 있었다 (✅ 재현): jsonl 은 행마다 즉시 append 되지만 bump 는
+    사이클 끝에서 commit 된다. 사이클 도중 죽으면 jsonl 은 남고 DB 는 롤백되는데,
+    재시작 때 seed_today 가 **그 jsonl 로** dedup 집합을 채워 "이미 셌다"고 판단
+    → 그날 셀이 영영 0. 재시작이 잦을수록(install/stop) 확실히 터진다.
+
+    그래서 제약을 디스크로 내린다. day 가 같으면 UPDATE 가 스킵되므로 재시작 후
+    다시 시도해도 안전하고, 죽어서 놓친 bump 는 다음 사이클에 저절로 복구된다.
+    """
     conn.execute("""
-      INSERT INTO subway_cell(line,trainNo,statnId,daytype,n) VALUES(?,?,?,?,1)
-      ON CONFLICT(line,trainNo,statnId,daytype) DO UPDATE SET n=n+1
-    """, (line, trainNo, statnId, daytype))
+      INSERT INTO subway_cell(line,trainNo,statnId,daytype,n,last_day) VALUES(?,?,?,?,1,?)
+      ON CONFLICT(line,trainNo,statnId,daytype) DO UPDATE SET
+        n = n + 1, last_day = excluded.last_day
+      WHERE subway_cell.last_day IS NOT excluded.last_day
+    """, (line, trainNo, statnId, daytype, day))
 
 
 def route_progress(conn, target, nbands):
@@ -698,8 +715,11 @@ def rebuild_subway(force):
     c = connect()
     old = c.execute("SELECT COALESCE(SUM(n),0) FROM subway_cell").fetchone()[0]
     c.execute("DELETE FROM subway_cell")
-    c.executemany("INSERT INTO subway_cell(line,trainNo,statnId,daytype,n) VALUES(?,?,?,?,?)",
-                  [k + (len(v),) for k, v in days.items()])
+    # last_day = 그 셀에서 관측한 **마지막 운행일**. 이걸 안 채우면 재집계 직후
+    # 수집기가 같은 날을 한 번 더 세서 n 이 1 부풀어 오른다.
+    c.executemany(
+        "INSERT INTO subway_cell(line,trainNo,statnId,daytype,n,last_day) VALUES(?,?,?,?,?,?)",
+        [k + (len(v), max(v)) for k, v in days.items()])
     c.commit()
     print(f"지하철 셀 재계산: 파일 {len(files)}개 → 셀 {len(days):,}개 "
           f"(관측일 합 {sum(len(v) for v in days.values()):,} · 이전 {old:,})"

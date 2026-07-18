@@ -174,17 +174,16 @@ def bump_calls(keyid, day):
 
 
 def seed_today(day):
-    """재시작 복원 — 오늘 jsonl 에서 마지막 상태와 (열차,역) dedup 집합을 되살린다.
+    """재시작 복원 — 오늘 jsonl 에서 (열차,역)별 마지막 arvlCd 를 되살린다.
+    없으면 첫 사이클에 전 열차의 중복 행이 한 벌 남는다.
 
-    ⚠️ 이게 없으면 KeepAlive/systemd 재시작마다 메모리 dedup(bumped)이 비어
-    같은 날 같은 (열차,역)을 다시 bump → subway_cell.n(관측 '일수')이 부풀어
-    §8 #1 수렴 판정이 실제보다 이르게 참이 된다. 콜 카운터를 디스크에 두는 것과
-    같은 이유다 — 셀 불변식("하루 1회")도 재시작을 견뎌야 한다.
-    last_state 복원은 덤 — 없으면 첫 사이클에 전 열차의 중복 행이 한 벌 남는다.
-    (bump 직후·commit 전에 죽은 극소수는 여기서 억제돼 미세 과소계상 쪽으로
-    떨어진다 — 부풀리는 쪽보다 안전하다.)
+    ⚠️ 예전엔 여기서 셀 dedup 집합(bumped)도 함께 복원해 수집기가 그걸로
+    "오늘 이미 셌다"를 판단했다. 그게 셀이 통째로 0 이 되는 원인이었다 —
+    jsonl 은 행마다 즉시 남지만 bump 는 사이클 끝에 commit 되므로, 도중에
+    죽으면 jsonl 만 남고 그 행들이 그대로 억제 조건이 된다. 지금은 하루 1회
+    제약이 subway_cell.last_day(디스크)에 있다 — O.bump_subway 참조.
     """
-    ls, bset = {}, set()
+    ls = {}
     try:
         with open(os.path.join(OUT_DIR, f"{PREFIX}-{day}.jsonl"), encoding="utf-8") as f:
             for line in f:
@@ -195,10 +194,9 @@ def seed_today(day):
                 tn, sid = r.get("trainNo"), r.get("statnId")
                 if tn and sid:
                     ls[(tn, sid)] = r.get("arvlCd")
-                    bset.add((r.get("line"), tn, sid))
     except OSError:
         pass
-    return ls, bset
+    return ls
 
 
 def resolve_keys():
@@ -237,7 +235,10 @@ def main():
     written = 0
     # (열차,역) -> arvlCd / 오늘 bump 한 (노선,열차,역).
     # 재시작이면 오늘 jsonl 에서 복원한다 — dedup 이 메모리뿐이면 n(관측 일수)이 부푼다.
-    last_state, bumped = seed_today(day)
+    # bumped 는 **프로세스 안에서만** 쓰는 캐시다 (같은 셀에 매 사이클 upsert 를
+    # 날리지 않으려는 것). 재시작하면 비어서 다시 시도하지만, DB 의 last_day 가
+    # 중복을 막으므로 안전하고 오히려 놓친 bump 가 복구된다.
+    last_state, bumped = seed_today(day), set()
     ki = [0]   # 키 라운드로빈 커서 (리스트 = 클로저에서 갱신)
 
     def take_key(qday):
@@ -326,7 +327,7 @@ def main():
                     written += 1
                     # 셀 bump — (노선,열차,역)을 오늘 처음 볼 때만 (n = 관측 일수)
                     if not hol and (line, tn, sid) not in bumped:
-                        O.bump_subway(conn, line, tn, sid, dt)
+                        O.bump_subway(conn, line, tn, sid, dt, day)
                         bumped.add((line, tn, sid))
                         did_bump = True
             start += PAGE
