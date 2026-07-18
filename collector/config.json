@@ -25,13 +25,13 @@
   "dayTypes": "mon|tue|wed|thu|fri|sat|sun",
   "_dayTypes": "요일 7종 전부 분리 (2026-07-17 결정 — 기간 비용을 알고 용인). 각 요일은 주 1일씩만 오므로 노선당 완주가 최소 ~1주(7요일 각 1일) — 평일 통합(~1.4일) 대비 ~5배, 전체는 로테이션 ~13라운드 × ~1주 = ~13-15주. ⚠️ 셀의 7샘플은 구간·밴드당 ~7.4관측/일이라 대개 그 요일 '하루' 안에 찬다 — 즉 요일 셀은 사실상 단일 날짜 표본이고 날짜 간 변동(비·사고)은 못 본다. 날짜 간 변동까지 보려면 target 을 지하철처럼 '관측 일수'로 세야 하는데 그러면 요일당 7주 = 총 수십 주라 기각. 요일별 주행시간 차이를 직접 보기 위한 분리이며, 되돌리려면 orchestrator.day_type 을 고치고 rebuild — 요일은 jsonl 의 t 에서 재계산되므로 데이터 손실 없음.",
 
-  "exportDir": null,
+  "exportDir": "/home/ubuntu/bus-store/collector/findpath-export",
   "_exportDir": "지정하면 운행일 전환(04시)마다 bus-*.jsonl · subway-*.jsonl 을 2단 로테이션한다 (버스·지하철 공유, 옛 shinbundang-*/suinbundang-* 도 정리). ① 어제: gzip 백업본을 이 폴더로(+driveRemote 설정 시 드라이브 업로드), 원본 jsonl 은 로컬 유지(ETA 용). ② 그저께 이전: 백업이 드라이브에 확인되면 원본 삭제, 아니면 재업로드 시도→그래도 실패면 보류. → 삭제 전 하루 유예로 수동 백업 확인 가능. 로컬은 대략 오늘+어제 원본 + 전체 .gz. rebuild 는 bus-*.gz 를 읽으므로 exportDir 에 .gz 는 계속 남긴다. null 이면 끔. 윈도우 예: \"C:\\\\Users\\\\me\\\\OneDrive\\\\busdata\"",
 
   "rotateHour": 6,
   "_rotateHour": "백업·삭제 로테이션을 도는 시각(0~23, 하루 1회). 운행일 경계(04시)가 아니라 여유를 둔 이유: ① 경계를 걸친 사이클이 아직 전날 파일에 쓰고 있을 수 있다 (day 변수는 사이클 시작에 정해져 04:00:20 에 끝나는 사이클도 전날 파일로 간다) ② 04시는 첫차·운행일 전환이 겹쳐 gzip·업로드를 얹으면 그 사이클만 길어진다. 이 시각 이후 첫 사이클에서 1회 실행하고, 그 전에 수집기가 시작되면 이 시각까지 기다린다 (파일은 쌓일 뿐 손실 없음).",
 
-  "driveRemote": null,
+  "driveRemote": "gdrive:busdata",
   "_driveRemote": "rclone 리모트 경로 (예 \"gdrive:busdata\"). 설정하면 ① 백업 직후 즉시 드라이브 업로드 ② 원본 삭제 전 드라이브에 실제로 있는지 rclone lsf 로 확인(없으면 재업로드, 그래도 없으면 삭제 보류). 이걸 쓰면 별도 rclone 크론이 불필요하다 (수집기가 직접 올린다). null 이면 로컬 .gz 존재로만 판단 — 윈도우 OneDrive 동기화폴더처럼 동기화앱이 알아서 올리는 경우.",
 
   "intervalSec": 30,
