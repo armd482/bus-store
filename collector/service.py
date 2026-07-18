@@ -9,11 +9,14 @@
   python3 service.py uninstall   등록 자체를 제거
   python3 service.py status      상태 확인
 
-install/start 는 시작 후 그 자리에서 로그를 스트리밍한다 — 직접 실행하던 때와
-같은 화면. 단 Ctrl-C 는 **보기만** 끝낸다. 수집은 백그라운드에서 계속 돈다.
+install/start 는 등록·시작만 하고 **바로 프롬프트를 돌려준다**. 수집은 systemd·
+launchd 가 백그라운드로 돌린다. 로그를 이어서 보려면 `--logs` 를 붙이거나
+따로 `service.py logs` (Ctrl-C 는 보기만 끝낸다 — 수집은 계속 돈다).
 
-수동 실행(python3 server.py + Ctrl-C)과 병행하지 말 것 — 세션 30 을 나눠 쓰면 서로 실패한다.
-stop 은 수동으로 띄운 server.py 도 함께 내린다 (어느 모드든 '완전 종료' 한 명령).
+install 은 시작 전에 이미 돌고 있는 수집기를 전부 내린다 (등록분 + 수동 실행분).
+그래서 코드 배포 후엔 stop 없이 install 만 다시 돌리면 된다.
+
+수동 실행(python3 server.py)과 병행하지 말 것 — 세션 30 을 나눠 쓰면 서로 실패한다.
 """
 import os
 import shutil
@@ -80,6 +83,21 @@ def ensure_pool(workdir):
     r = subprocess.run([PY, "fetch_routes.py"], cwd=workdir)  # 출력 그대로 보여준다
     if r.returncode != 0:
         sys.exit("fetch_routes 실패 — .env 의 GBIS_BUS_KEY 를 확인하고 install 을 다시 돌릴 것")
+
+
+# install/start 는 **기본으로 콘솔을 잡지 않는다**. 수집은 systemd/launchd 가
+# 백그라운드로 돌리므로 스트리밍은 '보기'일 뿐인데, 그게 마지막 줄이라 셸을
+# 되찾으려면 Ctrl-C 를 쳐야 했다 — 배포 스크립트에 넣을 수도 없다.
+# 옛 동작이 필요하면 `install --logs`.
+FOLLOW = False
+
+
+def maybe_follow(streamer):
+    if FOLLOW:
+        streamer()
+        return
+    print("백그라운드에서 돈다 — 셸은 그대로 쓸 수 있다.")
+    print("로그: python3 service.py logs   (install --logs 로 바로 이어 볼 수도 있다)")
 
 
 PROC_PAT = r"python[^ ]* (server|subway_collector)\.py"
@@ -197,7 +215,7 @@ def mac_install():
         run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path(label)], ok_fail=True)
     print("설치·시작됨 (버스+지하철). 대시보드: http://localhost:877")
     print("⚠️ 지하철은 .env 의 SEOUL_SUBWAY_KEY(·KEY2·KEY3)가 있어야 돈다")
-    follow(os.path.join(d, "logs", "server.log"))
+    maybe_follow(lambda: follow(os.path.join(d, "logs", "server.log")))
 
 
 def mac_stop():
@@ -218,7 +236,7 @@ def mac_start():
         run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path(label)], ok_fail=True)
         run(["launchctl", "kickstart", mac_target(label)], ok_fail=True)
     print("시작됨 (버스+지하철).")
-    follow(os.path.join(mac_workdir(), "logs", "server.log"))
+    maybe_follow(lambda: follow(os.path.join(mac_workdir(), "logs", "server.log")))
 
 
 def mac_logs():
@@ -287,7 +305,7 @@ WantedBy=default.target
         run(["systemctl", "--user", "enable", "--now", name])
     print("설치·시작됨 (버스+지하철). 대시보드: http://localhost:8080 (리눅스는 877이 특권 포트라 8080)")
     print("⚠️ 지하철은 .env 의 SEOUL_SUBWAY_KEY(·KEY2·KEY3)가 있어야 돈다 — 없으면 로그에 '키 없음'")
-    lx_logs()
+    maybe_follow(lx_logs)
 
 
 def lx_stop():
@@ -301,7 +319,7 @@ def lx_start():
     for name, _, _ in LX_UNITS:
         run(["systemctl", "--user", "enable", "--now", name], ok_fail=True)
     print("시작됨 (버스+지하철).")
-    lx_logs()
+    maybe_follow(lx_logs)
 
 
 def lx_logs():
@@ -407,7 +425,10 @@ def win_status():
 
 # ── 진입점 ───────────────────────────────────────────────────────────
 def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    global FOLLOW
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    FOLLOW = any(a in ("--logs", "-f", "--follow") for a in sys.argv[1:])
+    cmd = args[0] if args else "status"
     osname = ("win" if os.name == "nt"
               else "mac" if sys.platform == "darwin" else "lx")
     table = {
