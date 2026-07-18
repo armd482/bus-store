@@ -240,13 +240,13 @@ def main():
                 return kid, k
         return None, None
 
+    rotated_day = None   # 로테이션을 마친 운행일 — 하루 한 번만 돌게
+
     def export():
         """jsonl 2단 로테이션 — 별도 스레드 (rclone 네트워크 호출).
         노선별 파일이던 옛 이름도 같이 정리한다."""
         for p in (PREFIX, "shinbundang", "suinbundang"):
             __import__("threading").Thread(target=O.rotate_jsonl, args=(p,), daemon=True).start()
-
-    export()   # 시작 시 1회
 
     print(f"[{now():%H:%M:%S}] 지하철 수집 시작 · 전 노선 일괄(ALL) · 키 {len(keys)}개"
           f"({', '.join(k for k, _ in keys)}) · {interval}s 간격"
@@ -259,9 +259,14 @@ def main():
         if d != day:
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d} (전일 기록 {written:,}건)", flush=True)
             day, written, last_state, bumped = d, 0, {}, set()
-            export()
             time.sleep(random.uniform(0, interval))
             continue
+        # 로테이션은 운행일 경계가 아니라 rotateHour(기본 6시) — 전날 파일이 확실히
+        # 닫힌 뒤 백업한다 (경계를 걸친 사이클이 아직 쓰고 있을 수 있다).
+        due = O.rotate_due(rotated_day, t)
+        if due:
+            rotated_day = due
+            export()
         if not in_service(t):
             time.sleep(300)
             continue

@@ -181,13 +181,13 @@ def main():
     last = {}       # vehicleno -> (nodeord, 그 정류장에서 처음 본 시각)
     picked, cyc, written = [], 0, 0
 
+    rotated_day = None   # 로테이션을 마친 운행일 — 하루 한 번만 돌게
+
     def kickoff_export():
         """bus-*.jsonl 2단 로테이션(백업 어제 / 삭제 그저께) — 별도 스레드.
         rclone 네트워크 호출이 있으니 사이클을 막지 않게 스레드로 돌린다."""
         __import__("threading").Thread(
             target=O.rotate_jsonl, args=("bus",), daemon=True).start()
-
-    kickoff_export()   # 시작 시 1회 — 꺼져 있는 동안 쌓인 옛 파일 정리
 
     print(f"[{now():%H:%M:%S}] 수집 시작 · 목표 {target}샘플 · 밴드 {nb}개 · "
           f"최대 {maxr}노선 · 상한 {quota:,} (오늘 {read_calls(quota_day(now())):,} 사용)", flush=True)
@@ -207,8 +207,13 @@ def main():
             # 재기회를 주면 고착이 최대 하루로 묶인다.
             conn.execute("UPDATE route SET emptyStreak = 0")
             conn.commit()
-            kickoff_export()   # 어제 백업 + 그저께 삭제(백업 확인 후)
             continue
+        # 로테이션은 운행일 경계(04시)가 아니라 rotateHour(기본 6시)에 — 경계를 걸친
+        # 사이클이 아직 전날 파일에 쓰고 있을 수 있고, 04시는 첫차·전환이 겹친다.
+        due = O.rotate_due(rotated_day, t)
+        if due:
+            rotated_day = due
+            kickoff_export()   # 어제 백업 + 그저께 삭제(백업 확인 후)
         if not O.in_window(t, window):
             # serviceWindow 밖 — 현재 설정은 [0,24](24시간)라 이 분기는 안 탄다.
             # ⚠️ 전수 실측상 "버스가 0인 시간대는 없다"(config _serviceWindow —

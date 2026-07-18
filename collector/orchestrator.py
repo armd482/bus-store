@@ -200,6 +200,25 @@ def _backup_verified(name, local_gz, remote):
     return ok and name in out
 
 
+def rotate_due(rotated_day, t=None):
+    """지금 로테이션을 돌릴 때인가 — 돌려야 하면 그 운행일 문자열, 아니면 None.
+
+    ⚠️ 운행일 경계(04시)가 아니라 config.rotateHour(기본 6시)에 돌린다:
+      - 경계를 걸친 사이클이 아직 전날 파일에 쓰고 있을 수 있다 (day 변수는 사이클
+        시작에 정해지므로 04:00:20 에 끝나는 사이클도 전날 파일로 간다)
+      - 04시는 버스 첫차·운행일 전환·심야 정리가 겹치는 시각이라 gzip·업로드를
+        얹으면 그 사이클만 길어진다
+      두 시간 여유를 두면 전날 파일이 확실히 닫힌 뒤 백업된다.
+
+    하루 한 번만 참이 되도록 호출부가 rotated_day 를 갱신한다.
+    """
+    t = t or datetime.now(KST)
+    today = service_day_of(t).strftime("%Y-%m-%d")
+    if rotated_day == today or t.hour < cfg().get("rotateHour", 6):
+        return None
+    return today
+
+
 def rotate_jsonl(prefix):
     """2단 로테이션 — 백업(어제)과 삭제(그저께 이전)를 분리한다. 버스·지하철 공유.
 
