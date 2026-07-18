@@ -106,11 +106,16 @@ def service_day(t):
 
 
 def daytype(t):
-    """지하철은 3종(weekday/sat/sun) — 시각표가 요일별이라 이 단위로 수렴한다.
-    ⚠️ 버스(7종)와 다르다: 지하철은 trainNo 가 매일 같은 시각표라 요일별 며칠이면
-    수렴하고, §8 #3(토요일=평일 시각표인가 공휴일인가)을 이 3분리가 답한다."""
-    wd = (t - timedelta(hours=4)).weekday()
-    return "sun" if wd == 6 else "sat" if wd == 5 else "weekday"
+    """버스와 같은 7종(mon~sun) — O.day_type 을 그대로 쓴다.
+
+    ⚠️ 이전 판은 3종(weekday/sat/sun)이었다. 시각표가 평일/토/휴일 단위라 3종이면
+    수렴이 5배 빠르지만(평일 7일 vs 요일당 7주), **뭉치면 다시 못 쪼갠다.**
+    월요일과 금요일 정시성이 다른지(금요일 저녁 지연 등)를 보려면 7종이어야 하고,
+    필요하면 나중에 7→3 으로 합치는 건 재집계(rebuild-subway)로 공짜다.
+    ⚠️ 규칙을 바꿨으면 `orchestrator.py rebuild-subway --yes` 로 옛 셀을 재분류할 것 —
+    안 하면 weekday/sat/sun 셀과 mon~sun 셀이 장부에 공존한다.
+    """
+    return O.day_type(t)
 
 
 def fetch_page(key, start, end):

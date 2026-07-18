@@ -547,6 +547,58 @@ def rebuild(force, shrink_ok=False):
     print("수집기가 돌고 있었다면 재시작할 것.")
 
 
+def rebuild_subway(force):
+    """지하철 셀(subway_cell)을 subway-*.jsonl 에서 재계산 — 요일 규칙이 바뀌었을 때.
+
+    셀 n = **관측한 서로 다른 날 수**이므로, 파일에서도 (노선,열차,역,요일)별로
+    **날짜를 집합으로 모아 그 크기**를 센다 (행 수가 아니다 — 같은 날 진입·도착·출발
+    3행이 나와도 1일).
+    요일은 저장값이 아니라 t 에서 다시 계산한다 → day_type 을 3종↔7종으로 바꿔도
+    이 명령 한 번이면 재분류된다. 공휴일(config.holidays)은 수집기와 같게 제외한다.
+    ⚠️ 수집기를 멈추고 돌릴 것.
+    """
+    import glob
+    import gzip
+    files = sorted(glob.glob(os.path.join(DATA, "subway-*.jsonl")))
+    exp = cfg().get("exportDir")
+    if exp:
+        files += sorted(glob.glob(os.path.join(exp, "subway-*.jsonl.gz")))
+    if not force:
+        sys.exit(f"subway jsonl {len(files)}개에서 subway_cell 을 재계산해 교체한다.\n"
+                 f"수집기를 먼저 멈출 것. 정말이면: python3 orchestrator.py rebuild-subway --yes")
+    days = {}   # (line, trainNo, statnId, daytype) -> {운행일...}
+    bad = 0
+    for p in files:
+        opener = gzip.open if p.endswith(".gz") else open
+        for line in opener(p, mode="rt", encoding="utf-8"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                bad += 1
+                continue
+            ln, tn, sid = r.get("line"), r.get("trainNo"), r.get("statnId")
+            if not (ln and tn and sid):
+                continue
+            try:
+                t = datetime.fromisoformat(r["t"])
+            except (KeyError, ValueError):
+                continue
+            if is_holiday(t):
+                continue                      # 수집기와 같은 기준 — 평일 다이어가 아니다
+            key = (ln, tn, sid, day_type(t))
+            days.setdefault(key, set()).add(service_day_of(t).strftime("%Y-%m-%d"))
+    c = connect()
+    old = c.execute("SELECT COALESCE(SUM(n),0) FROM subway_cell").fetchone()[0]
+    c.execute("DELETE FROM subway_cell")
+    c.executemany("INSERT INTO subway_cell(line,trainNo,statnId,daytype,n) VALUES(?,?,?,?,?)",
+                  [k + (len(v),) for k, v in days.items()])
+    c.commit()
+    print(f"지하철 셀 재계산: 파일 {len(files)}개 → 셀 {len(days):,}개 "
+          f"(관측일 합 {sum(len(v) for v in days.values()):,} · 이전 {old:,})"
+          + (f" · 깨진 줄 {bad}" if bad else ""))
+    print("수집기가 돌고 있었다면 재시작할 것.")
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     if cmd == "status":
@@ -560,8 +612,10 @@ def main():
         reset("--yes" in sys.argv[2:])
     elif cmd == "rebuild":
         rebuild("--yes" in sys.argv[2:], "--shrink-ok" in sys.argv[2:])
+    elif cmd == "rebuild-subway":
+        rebuild_subway("--yes" in sys.argv[2:])
     else:
-        sys.exit(f"모르는 명령: {cmd}  (status | routes | reset | rebuild)")
+        sys.exit(f"모르는 명령: {cmd}  (status | routes | reset | rebuild | rebuild-subway)")
 
 
 if __name__ == "__main__":

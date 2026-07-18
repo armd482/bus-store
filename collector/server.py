@@ -45,6 +45,7 @@ LOCK = threading.Lock()
 
 
 AVG_ROW_BYTES = 222  # 슬림 형식 행 평균 (✅ 실측) — 행 수 추정용
+DAYS7 = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")  # 버스·지하철 공통 요일 7종
 
 # 지하철 jsonl 증분 리더 상태 — /api 마다 풀스캔하지 않기 위한 캐시 (subway_snapshot)
 _SUB_TAIL = {}
@@ -149,7 +150,7 @@ def subway_snapshot():
     lines = sorted(
         ({"name": n, "trains": a["trains"], "stations": a["stations"],
           "seen": a["seen"], "filled": a["filled"], "target": tgt,
-          "byDay": {d: a["by"].get(d, {"seen": 0, "filled": 0}) for d in ("weekday", "sat", "sun")},
+          "byDay": {d: a["by"].get(d, {"seen": 0, "filled": 0}) for d in DAYS7},
           "written": per_line_written.get(n, 0)}
          for n, a in agg.items()),
         key=lambda x: -x["seen"])
@@ -302,8 +303,9 @@ const pct = x => (x*100).toFixed(1)+'%';
 const num = x => (x||0).toLocaleString();
 function bar(p, cls){ return `<div class=bar><div class="fill ${cls||''}" style="width:${Math.min(100,p*100)}%"></div></div>`; }
 
-let S = null, tab = 'bus';  // S: 최근 /api 응답 · tab: 활성 탭
+let S = null, tab = 'bus', lineTab = '__all__';  // S: 최근 /api · tab: 상단 탭 · lineTab: 지하철 노선 탭
 window.setTab = (t) => { tab = t; render(); };
+window.setLineTab = (t) => { lineTab = t; render(); };
 
 async function tick(){
   S = await (await fetch('/api')).json();
@@ -408,7 +410,8 @@ function renderSubway(d){
   if(!sub.started)
     return '<div class=sub>지하철 수집기가 아직 안 돎 — <code>.env</code> 에 SEOUL_SUBWAY_KEY(·KEY2) 를 넣고 '
       + 'systemd 유닛(findpath-subway)을 걸 것. §8 #1(지하철 정시성)이 프로젝트 존폐 항목이라 우선순위가 높다.</div>';
-  const KOD = {weekday:'평일',sat:'토',sun:'일'};
+  const KOD = {mon:'월',tue:'화',wed:'수',thu:'목',fri:'금',sat:'토',sun:'일'};
+  const D7 = ['mon','tue','wed','thu','fri','sat','sun'];
   const alive = sub.lastObs && (Date.now()/1000 - sub.lastObs) < 300;
   const tot = sub.lines.reduce((a,L)=>({seen:a.seen+L.seen, filled:a.filled+L.filled}), {seen:0,filled:0});
   const rate = tot.seen ? tot.filled/tot.seen : 0;
@@ -439,25 +442,52 @@ function renderSubway(d){
   }
   h += '</table>';
 
-  // 노선별 셀 수집률
-  h += `<h2>노선별 수집률 — 셀 충족 (목표 ${sub.lines.length?sub.lines[0].target:7}일)</h2><table>`;
-  h += '<tr style="opacity:.5"><td>노선</td><td class=n>충족</td><td></td><td class=n>셀</td>'
-     + '<td class=n>열차/역</td><td class=n>평·토·일</td></tr>';
-  for(const L of sub.lines){
-    const p = L.seen ? L.filled/L.seen : 0;
-    const dd = ['weekday','sat','sun'].map(k=>{
-      const v = L.byDay[k]||{seen:0,filled:0};
-      return `${KOD[k]} ${v.filled}/${v.seen}`;
-    }).join(' · ');
-    h += `<tr><td width=90>${L.name}</td>
-          <td class=n width=54><b>${pct(p)}</b></td>
-          <td width=180>${bar(p, p>=1?'ok':'')}</td>
-          <td class=n style="white-space:nowrap">${num(L.filled)}/${num(L.seen)}</td>
-          <td class=n style="white-space:nowrap;opacity:.6">${L.trains}·${L.stations}</td>
-          <td class=n style="white-space:nowrap;opacity:.6;font-size:11px">${dd}</td></tr>`;
+  // 노선 탭 — 전체 요약 / 노선 하나 상세 (요일 7종)
+  const tgt = sub.lines.length ? sub.lines[0].target : 7;
+  const lt = (id,label,extra) => `<span onclick="setLineTab('${id.replace(/'/g,"\\'")}')" `
+    + `style="cursor:pointer;padding:3px 9px;margin:0 3px 4px 0;border-radius:5px;display:inline-block;`
+    + `${lineTab===id?'background:#3b82f6;color:#fff;font-weight:600':'background:#8882'}">${label}${extra||''}</span>`;
+  h += `<h2>노선별 수집률 — 셀 충족 (목표 ${tgt}일 · 요일 7종)</h2>`;
+  h += '<div style="margin-bottom:10px">' + lt('__all__','전체')
+     + sub.lines.map(L=>lt(L.name, L.name, `<span style="opacity:.6;font-size:11px"> ${pct(L.seen?L.filled/L.seen:0)}</span>`)).join('') + '</div>';
+
+  if(!sub.lines.length){
+    h += '<div class=sub>아직 셀 없음 — 수집이 돌면 노선이 자동으로 나타난다. '
+       + '(오늘 기록이 늘고 있는데 셀이 0이면 공휴일이거나 첫 사이클 전이다.)</div>';
+  } else if(lineTab === '__all__'){
+    h += '<table><tr style="opacity:.5"><td>노선</td><td class=n>충족</td><td></td>'
+       + '<td class=n>셀</td><td class=n>열차·역</td><td class=n>오늘</td></tr>';
+    for(const L of sub.lines){
+      const p = L.seen ? L.filled/L.seen : 0;
+      h += `<tr><td width=90>${L.name}</td>
+            <td class=n width=54><b>${pct(p)}</b></td>
+            <td width=220>${bar(p, p>=1?'ok':'')}</td>
+            <td class=n style="white-space:nowrap">${num(L.filled)}/${num(L.seen)}</td>
+            <td class=n style="white-space:nowrap;opacity:.6">${L.trains}·${L.stations}</td>
+            <td class=n style="white-space:nowrap;opacity:.6">${num(L.written)}</td></tr>`;
+    }
+    h += '</table>';
+  } else {
+    const L = sub.lines.find(x=>x.name===lineTab);
+    if(!L){ h += '<div class=sub>그 노선은 아직 관측되지 않았다.</div>'; }
+    else {
+      const p = L.seen ? L.filled/L.seen : 0;
+      h += `<div class=sub><b>${L.name}</b> — 열차 ${num(L.trains)}대 · 역 ${num(L.stations)}개 · `
+         + `오늘 기록 ${num(L.written)}건 · 전체 셀 충족 <b>${pct(p)}</b> (${num(L.filled)}/${num(L.seen)})</div>`;
+      h += '<table>';
+      for(const dk of D7){
+        const v = L.byDay[dk] || {seen:0,filled:0};
+        const dp = v.seen ? v.filled/v.seen : 0;
+        h += `<tr><td width=40>${KOD[dk]}</td>
+              <td class=n width=54><b>${pct(dp)}</b></td>
+              <td width=260>${bar(dp, dp>=1&&v.seen?'ok':(dk==='sat'||dk==='sun')?'warn':'')}</td>
+              <td class=n style="white-space:nowrap">${num(v.filled)} / ${num(v.seen)} 셀</td></tr>`;
+      }
+      h += '</table>';
+      h += `<div class=sub style="margin-top:6px">셀 = (열차, 역) 조합 · n = 그 요일에 관측한 일수. `
+         + `목표 ${tgt}일이면 그 요일이 ${tgt}번 지나야 채워진다 — 요일마다 주 1회씩이라 ${tgt}주.</div>`;
+    }
   }
-  h += '</table>';
-  if(!sub.lines.length) h += '<div class=sub>아직 셀 없음 — 수집이 돌면 노선이 자동으로 나타난다.</div>';
 
   h += '<h2>판정 (§8 #1)</h2>';
   h += '<div class=sub>각 열차의 실제 통과 시각(arvlCd 진입/도착/출발)을 계획 시각표와 대조 → 편차 분포. '
