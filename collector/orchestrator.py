@@ -417,6 +417,8 @@ def audit_subway(paths=None):
     if not paths:
         sys.exit("subway jsonl 이 없다.")
     off, n_stale, n = {}, {}, 0
+    trains = {}      # line -> trainNo -> {역 집합, 최초/최종 관측}
+    stations = {}    # line -> 역 집합
     for p in paths:
         opener = gzip.open if p.endswith(".gz") else open
         for line in opener(p, mode="rt", encoding="utf-8"):
@@ -437,6 +439,18 @@ def audit_subway(paths=None):
                 n_stale[ln] = n_stale.get(ln, 0) + 1
                 continue                      # 죽은 레코드는 성격 판정에서도 뺀다
             off.setdefault(ln, []).append((b - t).total_seconds())
+            tn, sid = r.get("trainNo"), r.get("statnId")
+            if tn and sid:
+                stations.setdefault(ln, set()).add(sid)
+                v = trains.setdefault(ln, {}).get(tn)
+                if v is None:
+                    trains[ln][tn] = {"st": {sid}, "min": t, "max": t}
+                else:
+                    v["st"].add(sid)
+                    if t < v["min"]:
+                        v["min"] = t
+                    if t > v["max"]:
+                        v["max"] = t
     print(f"파일 {len(paths)}개 · {n:,}행\n")
     print(f"{'노선':<10}{'중앙값':>8}{'미래%':>7}{'죽은%':>7}{'행':>9}  판정")
     flagged = []
@@ -448,6 +462,29 @@ def audit_subway(paths=None):
             flagged.append(ln)
         print(f"{ln:<10}{statistics.median(d):>8.0f}{fut:>6.0%}{dead:>6.1%}{len(d):>9,}  {verdict}")
     print("\n중앙값 = recptnDt − 폴링시각(초). 음수 = 과거(실측), 양수 = 미래(예측).")
+
+    # ── trainNo 의 의미가 노선마다 다르다 (✅ 2026-07-19 실측) ──────────
+    # B안 셀은 trainNo 가 "1회 운행" 단위라고 가정한다. 그 가정이 깨지는 노선이
+    # 있고, 깨지면 셀이 하루 만에 포화돼 관측 일수가 정시성과 무관해진다.
+    print(f"\n{'노선':<10}{'열차수':>7}{'역/열차':>8}{'커버율':>7}{'시간폭':>8}   trainNo 의미")
+    rep = []
+    for ln, tr in trains.items():
+        ns = len(stations.get(ln, ())) or 1
+        med = statistics.median(len(v["st"]) for v in tr.values())
+        spans = sorted((v["max"] - v["min"]).total_seconds() / 3600 for v in tr.values())
+        sp = spans[len(spans) // 2]
+        rep.append((med / ns, ln, len(tr), med, sp))
+    for cov, ln, ntr, med, sp in sorted(rep, reverse=True):
+        if sp > 6:
+            k = "❌ 종일 재사용 — 셀이 하루에 포화"
+        elif cov < 0.25:
+            k = "⚠️ 운행 일부만 — 셀 파편화"
+        else:
+            k = "✅ 1회 운행"
+        print(f"{ln:<10}{ntr:>7}{med:>8.0f}{cov:>6.0%}{sp:>7.1f}h   {k}")
+    print("커버율 = 한 열차가 지나는 역 ÷ 그 노선 역 수. 급행·지선이 있으면 낮게 나온다.")
+    print("시간폭 = 한 trainNo 가 관측된 시간 길이. 6시간 초과면 1회 운행이 아니라")
+    print("번호가 종일 재사용되는 것이고, 그 노선은 (열차,역,요일) 셀이 성립하지 않는다.")
     if flagged:
         print(f"⚠️ {', '.join(flagged)}: recptnDt 가 미래다. §8.1 — 이 노선은 "
               f"시각표(§9 #1)와 대조해 예측 근거를 확인하기 전까지 정시성 판정에 쓰지 말 것.")
