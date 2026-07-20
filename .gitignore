@@ -13,6 +13,13 @@ collector/logs/
 *.sqlite-shm
 *.sqlite-wal
 
+# ⚠️ 압축본도. *.jsonl 은 bus-2026-07-17.jsonl'.gz' 를 **안 잡는다** —
+#    확장자가 .gz 라서다. 로테이션 산출물(exportDir, 구글 드라이브 스테이징)이
+#    저장소 안에 있어서 git status 에 그대로 떴다 (✅ 실제로 스테이지됨).
+#    하루 40~50MB 짜리라 한 번 커밋되면 히스토리에서 지우기 어렵다.
+*.gz
+collector/findpath-export/
+
 # ── C 스파이크 산출물 (445MB, 전부 재다운로드 가능) ──────
 # OTP jar    : github.com/opentripplanner/OpenTripPlanner/releases (v2.9.0, Java 25)
 # 한국 pbf    : download.geofabrik.de/asia/south-korea-latest.osm.pbf
