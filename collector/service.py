@@ -292,6 +292,13 @@ WorkingDirectory={HERE}
 ExecStart={PY} {script}
 Restart=always
 RestartSec=10
+# ⚠️ t4g.micro 는 RAM 903MB 뿐이다. 2026-07-18 에 수집기가 541MB 까지 부풀어
+#    커널 OOM 킬러가 두 번 돌았다 (23:15, 23:51). 커널이 고르면 누가 죽을지
+#    모르고 — 지하철 수집기나 sshd 가 희생될 수 있다 — 로그도 안 남는다.
+#    유닛에 상한을 걸면 그 유닛만 죽고 Restart=always 가 즉시 되살린다.
+#    MemoryHigh 에서 먼저 회수 압력을 받으므로 대개 Max 까지 안 간다.
+MemoryHigh=320M
+MemoryMax=420M
 [Install]
 WantedBy=default.target
 """)

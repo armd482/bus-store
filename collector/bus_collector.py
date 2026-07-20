@@ -386,8 +386,10 @@ def main():
         nerr = sum(errs.values())
         ok = len(picked) - nerr
         rec = len(failed) - nerr  # 재시도로 회복된 수
+        mem = O.rss_mb()
         print(f"[{obs:%H:%M:%S}] 응답 {ok}/{len(picked)}노선 · 운행 {moving}대 · "
               f"통과 +{len(rows)} (누적 {written:,}) · {took:.0f}s"
+              + (f" · {mem:.0f}MB" if mem else "")
               + (f" · 재시도 {len(failed)}→회복 {rec}" if failed else ""), flush=True)
         if errs:
             # 재시도로 회복 못 한 것만 여기 온다 — 이 줄은 server.log 에도 남으므로

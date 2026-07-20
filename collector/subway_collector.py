@@ -339,8 +339,9 @@ def main():
             continue
         if int(t.timestamp()) // interval % 20 == 0:
             cal = " ".join(f"{kid}:{read_calls(kid, qday)}" for kid, _ in keys)
+            mem = O.rss_mb()
             print(f"[{t:%H:%M:%S}] 콜[{cal}] · 응답 {got}건 · 오늘 기록 {written:,}건 "
-                  f"· 셀 {len(bumped):,}", flush=True)
+                  f"· 셀 {len(bumped):,}" + (f" · {mem:.0f}MB" if mem else ""), flush=True)
 
         time.sleep(interval + random.uniform(-3, 3))
 

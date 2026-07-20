@@ -490,6 +490,20 @@ def audit_subway(paths=None):
               f"시각표(§9 #1)와 대조해 예측 근거를 확인하기 전까지 정시성 판정에 쓰지 말 것.")
 
 
+def rss_mb():
+    """이 프로세스의 RSS(MB). /proc 이 없으면 None (macOS 등).
+
+    2026-07-18 에 수집기가 541MB 로 OOM 킬 당했는데 **증거가 커널 로그뿐이었다** —
+    언제부터 얼마나 자랐는지 알 길이 없어 원인을 못 좁혔다 (t4g.micro 는 903MB).
+    사이클 로그에 찍어두면 다음엔 추이가 남는다. /proc 한 줄이라 비용은 없다.
+    """
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
 def bump_subway(conn, line, trainNo, statnId, daytype, day):
     """지하철 셀 +1 — n = 관측 일수. **같은 운행일에 두 번 불러도 한 번만 오른다.**
 

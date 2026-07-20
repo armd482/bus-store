@@ -46,6 +46,7 @@ LOCK = threading.Lock()
 
 
 AVG_ROW_BYTES = 222  # 슬림 형식 행 평균 (✅ 실측) — 행 수 추정용
+
 DAYS7 = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")  # 버스·지하철 공통 요일 7종
 
 # 지하철 jsonl 증분 리더 상태 — /api 마다 풀스캔하지 않기 위한 캐시 (subway_snapshot).
