@@ -520,17 +520,19 @@ def route_progress(conn, target, nbands):
     rows = conn.execute("""
       SELECT r.routeid, r.routeno, r.routetp, r.cityCode, r.nstops,
              COALESCE(SUM(CASE WHEN c.n >= ? THEN 1 ELSE 0 END), 0),
-             COUNT(c.n)
+             COUNT(c.n),
+             COALESCE(SUM(MIN(c.n, ?)), 0)
       FROM route r LEFT JOIN cell c ON c.routeid = r.routeid
       GROUP BY r.routeid
-    """, (target,)).fetchall()
+    """, (target, target)).fetchall()
     out = []
-    for rid, no, tp, city, nstops, done, seen in rows:
+    for rid, no, tp, city, nstops, done, seen, filln in rows:
         goal = max(1, (nstops - 1)) * nbands * 7  # 구간수 × 밴드수 × 7요일
         out.append({
             "routeid": rid, "routeno": no, "routetp": tp, "cityCode": city,
             "goal": goal, "done": done, "seen": seen,
-            "pct": done / goal if goal else 0.0,
+            "pct": done / goal if goal else 0.0,          # 완성률 — 표시용
+            "fill": filln / (goal * target) if goal else 0.0,  # 충전율 — 선정용
         })
     return out
 
@@ -626,7 +628,20 @@ def pick_routes(conn, n, target, nbands, t=None, max_empty=6):
                 p["cold"] = True               # 계속 비어 있음 — 후순위
             out.append(p)
         live = out
-    live.sort(key=lambda p: (p.get("cold", False), p["pct"], -p["goal"]))
+    # ★ 정렬은 pct(완성률)가 아니라 fill(충전율)로 한다.
+    #
+    # pct 는 "n>=target 을 채운 셀 / 목표 셀"이라 **부분 진행이 안 보인다**.
+    # 셀이 요일별이라 저빈도 노선은 같은 요일에만 +1 이 쌓여 완성까지 ~6주가
+    # 걸리는데, 그동안 pct 가 0 에 붙어 있어 정렬이 -goal(긴 노선)로 떨어진다.
+    # 결과: 이미 며칠 찍은 긴 노선이 **한 번도 안 본 짧은 노선을 계속 이긴다**
+    # (✅ 실측 2026-07-18~19: pct=0 잔류 420→560, 다음 170석 중 신규는 43석뿐.
+    #  잔류조 214개는 최고 셀이 n=1 이라 6주간 pct=0 을 유지한다).
+    #
+    # 병목이 쿼터가 아니라 **달력**이라 이게 비싸다 — 요일별 셀은 그 요일이
+    # 와야만 쌓이므로, 노선의 시계는 첫 관측일에 출발한다. 늦게 시작한 노선이
+    # 전체 일정(§4.4)을 그만큼 뒤로 민다. fill 로 정렬하면 한 번이라도 찍힌
+    # 노선이 즉시 뒤로 물러나 전 노선의 시계가 며칠 안에 출발한다.
+    live.sort(key=lambda p: (p.get("cold", False), p["fill"], -p["goal"]))
     return live[:n]
 
 
@@ -676,11 +691,13 @@ def status():
     print(f"\n=== 진행 중 상위/하위 ===")
     live = sorted([p for p in prog if p["pct"] < 1.0], key=lambda p: -p["pct"])
     for p in live[:3]:
-        print(f"  {p['routeno']:<6} {p['routetp'][:4]:<4} {p['pct']*100:5.1f}%  ({p['done']:,}/{p['goal']:,})")
+        print(f"  {p['routeno']:<6} {p['routetp'][:4]:<4} {p['pct']*100:5.1f}%  "
+              f"({p['done']:,}/{p['goal']:,})  충전 {p['fill']*100:4.1f}%")
     if len(live) > 6:
         print("  …")
     for p in live[-3:]:
-        print(f"  {p['routeno']:<6} {p['routetp'][:4]:<4} {p['pct']*100:5.1f}%  ({p['done']:,}/{p['goal']:,})")
+        print(f"  {p['routeno']:<6} {p['routetp'][:4]:<4} {p['pct']*100:5.1f}%  "
+              f"({p['done']:,}/{p['goal']:,})  충전 {p['fill']*100:4.1f}%")
 
 
 def reset(force):

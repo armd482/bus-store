@@ -255,7 +255,7 @@ def main():
                     time.sleep(600)
                 continue
             print(f"[{t:%H:%M:%S}] 노선 재선정: {len(picked)}개 "
-                  f"(진행률 {picked[0]['pct']*100:.1f}% ~ {picked[-1]['pct']*100:.1f}%)", flush=True)
+                  f"(충전율 {picked[0]['fill']*100:.1f}% ~ {picked[-1]['fill']*100:.1f}%)", flush=True)
 
         if read_calls(qday) + len(picked) > quota:
             print(f"[{t:%H:%M:%S}] 일 상한 근접 — 대기", flush=True)
