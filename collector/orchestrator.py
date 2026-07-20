@@ -642,21 +642,31 @@ def pick_routes(conn, n, target, nbands, t=None, max_empty=6):
                 p["cold"] = True               # 계속 비어 있음 — 후순위
             out.append(p)
         live = out
-    # ★ 정렬은 pct(완성률)가 아니라 fill(충전율)로 한다.
+    # ★ 슬롯을 둘로 나눈다 — 수확(harvest) 과 탐사(explore).
     #
-    # pct 는 "n>=target 을 채운 셀 / 목표 셀"이라 **부분 진행이 안 보인다**.
-    # 셀이 요일별이라 저빈도 노선은 같은 요일에만 +1 이 쌓여 완성까지 ~6주가
-    # 걸리는데, 그동안 pct 가 0 에 붙어 있어 정렬이 -goal(긴 노선)로 떨어진다.
-    # 결과: 이미 며칠 찍은 긴 노선이 **한 번도 안 본 짧은 노선을 계속 이긴다**
-    # (✅ 실측 2026-07-18~19: pct=0 잔류 420→560, 다음 170석 중 신규는 43석뿐.
-    #  잔류조 214개는 최고 셀이 n=1 이라 6주간 pct=0 을 유지한다).
+    # 순수 전략은 **양쪽 다 실패가 실측**됐다:
+    #  ① (cold, pct, -goal) 탐욕 — pct 는 n>=target 셀만 세서 7주간 0 이라
+    #     정렬이 사실상 -goal(긴 노선)만 남는다. 콜당 구간 커버는 최대지만
+    #     짧은 노선 1,427개가 관측 0 으로 굶었다 (✅ 7/17~19). 요일별 셀은
+    #     그 요일이 와야 쌓이므로 시계가 안 출발하면 §4.4 일정이 통째로 밀린다.
+    #  ② (cold, fill, -goal) 균형 — 한 번이라도 찍힌 노선은 fill>0 이 되어
+    #     미관측(fill=0) 뒤로 통째로 밀린다. 미관측은 대부분 배차가 성긴
+    #     노선이라 슬롯을 빈 응답에 태운다 (✅ 7/20: 평균 운행 487→84대,
+    #     밴드 커버 102%→22% 로 **단조 악화**. 통과/운행은 0.37→0.30 로
+    #     거의 그대로 — 처리 효율이 아니라 '버스가 없는 노선'을 찍은 것).
     #
-    # 병목이 쿼터가 아니라 **달력**이라 이게 비싸다 — 요일별 셀은 그 요일이
-    # 와야만 쌓이므로, 노선의 시계는 첫 관측일에 출발한다. 늦게 시작한 노선이
-    # 전체 일정(§4.4)을 그만큼 뒤로 민다. fill 로 정렬하면 한 번이라도 찍힌
-    # 노선이 즉시 뒤로 물러나 전 노선의 시계가 며칠 안에 출발한다.
-    live.sort(key=lambda p: (p.get("cold", False), p["fill"], -p["goal"]))
-    return live[:n]
+    # 그래서 배분한다. 어느 쪽 모델이 틀려도 피해가 상한으로 묶인다:
+    #  · 수확 140석 — ① 그대로. 검증된 수율(금요일 183,378셀)이 보장된다.
+    #  · 탐사  30석 — 미관측 우선. 빈 노선은 6사이클(~4분)에 cold 로 빠지므로
+    #    시간당 수백 개를 훑는다. 굶주림은 여기서 전담해 푼다.
+    n_ex = max(0, min(cfg().get("exploreSlots", 30), n))
+    explore = sorted(
+        live, key=lambda p: (p.get("cold", False), p["seen"] > 0, p["fill"], -p["goal"])
+    )[:n_ex]
+    taken = {p["routeid"] for p in explore}
+    harvest = [p for p in live if p["routeid"] not in taken]
+    harvest.sort(key=lambda p: (p.get("cold", False), p["pct"], -p["goal"]))
+    return explore + harvest[:n - len(explore)]
 
 
 def mark_empty(conn, routeid, empty):
