@@ -59,7 +59,7 @@ LINES = {
 # (main 참조): 사이클 = 3콜이라 키 N개 = 316N회/일. 3키라야 76초가 나오고, 키가
 # 적은데 76초로 돌면 캡이 하루를 못 채워(1키 = 316회×76s ≈ 6.7h) 저녁 첨두부터
 # 매일 비는 구조적 구멍이 된다 — §1.2(꺼진 밴드는 영원히 0)와 같은 문제.
-INTERVAL_SEC = 76
+INTERVAL_SEC = 76   # 간격 **하한**. 실제 간격은 pace() 가 남은 쿼터로 매 사이클 정한다
 DAILY_CAP = 950   # 키당 1,000회/일에 마진
 
 # 운행시간 밖은 열차가 없다 — 콜만 태우므로 건너뛴다.
@@ -286,8 +286,7 @@ def main():
             __import__("threading").Thread(target=O.rotate_jsonl, args=(p,), daemon=True).start()
 
     print(f"[{now():%H:%M:%S}] 지하철 수집 시작 · 전 노선 일괄(ALL) · 키 {len(keys)}개"
-          f"({', '.join(k for k, _ in keys)}) · {interval}s 간격"
-          f"{' (키 부족 — 76s 를 내려면 3키)' if interval > INTERVAL_SEC else ''}"
+          f"({', '.join(k for k, _ in keys)}) · {interval}s 간격(동적)"
           f" · 키당 상한 {DAILY_CAP}회", flush=True)
 
     while True:
