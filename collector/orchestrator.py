@@ -399,6 +399,92 @@ def stale(r):
     return abs((b - t).total_seconds()) > STALE_MAX
 
 
+def judge_timetable(days=None):
+    """§8 #4 — 고정 패널 노선이 시각표를 지키는가. **pinnedRoutes 에만 유효하다.**
+
+    ⚠️ 방법을 세 번 틀린 끝에 남긴다 (✅ 2026-07-21):
+     ① 도착이 아니라 **기점 출발**로 잰다 (도착 분산 = 출발 분산 + 주행 분산).
+     ② 지표는 절대 오차가 아니라 **위상 대비** — 무작위로 평행이동했을 때의
+        오차 ÷ 실제 오차. 절대 오차만 보면 출발이 촘촘한 노선이 무조건 좋아
+        보인다 (밀도 편향: 토↔일이 금↔월보다 정렬돼 나왔다).
+     ③ **양일 모두 관측 중이던 시간창**만 비교한다. 로테이션으로 한쪽만 보던
+        구간을 넣으면 없는 출발을 놓친 것으로 세어 오차가 부풀려진다.
+    대비 1x 근처 = 시각표 없음(또는 캡처 부족), 클수록 시각표 준수.
+    """
+    import glob
+    import gzip
+    import random
+    import statistics
+    random.seed(0)
+    pin = set(cfg().get("pinnedRoutes") or [])
+    if not pin:
+        sys.exit("config.pinnedRoutes 가 비어 있다 — 고정 패널 없이는 판정이 안 된다.")
+    files = sorted(glob.glob(os.path.join(DATA, "bus-*.jsonl")))
+    exp = cfg().get("exportDir")
+    if exp:
+        have = {os.path.basename(p) for p in files}
+        files += [p for p in sorted(glob.glob(os.path.join(exp, "bus-*.jsonl.gz")))
+                  if os.path.basename(p)[:-3] not in have]
+    c = connect()
+    meta = {r[0]: r[1:] for r in c.execute("SELECT routeid,routeno,routetp FROM route")}
+
+    def load(p):
+        deps, win, last = {}, {}, {}
+        opener = gzip.open if p.endswith(".gz") else open
+        for line in opener(p, mode="rt", encoding="utf-8"):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            rid = r.get("routeid")
+            if rid not in pin:
+                continue
+            try:
+                d = datetime.fromisoformat(r["t"])
+            except (KeyError, ValueError):
+                continue
+            m = d.hour * 60 + d.minute + d.second / 60 + (1440 if d.hour < 4 else 0)
+            win.setdefault(rid, set()).add(int(m // 10))
+            if r.get("from_ord") == 1:
+                pv = datetime.fromisoformat(r["t_prev"])
+                mp = pv.hour * 60 + pv.minute + pv.second / 60 + (1440 if pv.hour < 4 else 0)
+                k = (rid, r.get("vehicleno"))
+                if k not in last or mp - last[k] > 20:   # 같은 차의 재출발은 따로 센다
+                    last[k] = mp
+                    deps.setdefault(rid, []).append(mp)
+        return deps, win
+
+    data = {os.path.basename(p)[4:14]: load(p) for p in files}   # bus-YYYY-MM-DD…
+    ds = sorted(data)
+    if days:
+        ds = [x for x in ds if x in days]
+    if len(ds) < 2:
+        sys.exit(f"운행일이 {len(ds)}개뿐이다 — 최소 2일 필요.")
+    print(f"고정 패널 {len(pin)}개 · 운행일 {', '.join(ds)}\n")
+    print(f"{'노선':<10}{'유형':<12}{'비교':<24}{'출발':>5}{'오차':>7}{'대비':>7}")
+    for rid in sorted(pin, key=lambda x: meta.get(x, ("",))[0]):
+        no, tp = meta.get(rid, ("?", "?"))
+        for i in range(len(ds) - 1):
+            for j in range(i + 1, len(ds)):
+                (da, wa), (db, wb) = data[ds[i]], data[ds[j]]
+                ov = wa.get(rid, set()) & wb.get(rid, set())
+                a = sorted(x for x in da.get(rid, []) if int(x // 10) in ov)
+                b = sorted(x for x in db.get(rid, []) if int(x // 10) in ov)
+                if len(a) < 3 or len(b) < 3:
+                    continue
+
+                def err(sh):
+                    return statistics.median(min(abs(x + sh - y) for y in a) for x in b)
+                e0 = max(err(0), 0.05)
+                en = statistics.median(err(random.uniform(12, 40) * random.choice([-1, 1]))
+                                       for _ in range(9))
+                mark = " ★시각표" if en / e0 >= 3 else (" 배차간격" if en / e0 < 1.5 else "")
+                print(f"{no:<10}{tp:<12}{ds[i][5:]}↔{ds[j][5:]:<18}{len(b):>5}"
+                      f"{e0:>6.1f}분{en/e0:>6.1f}x{mark}")
+    print("\n대비 = 무작위 위상 오차 ÷ 실제 오차. 3x 이상이면 시각표, 1.5x 미만이면 배차간격.")
+    print("⚠️ 표본이 3 미만인 조합은 건너뛴다. 고정 패널은 연속 관측되므로 며칠이면 찬다.")
+
+
 def audit_subway(paths=None):
     """지하철 원본 감사 — 노선별 recptnDt 성격과 죽은 레코드 비율 (§8.1).
 
@@ -659,14 +745,27 @@ def pick_routes(conn, n, target, nbands, t=None, max_empty=6):
     #  · 수확 140석 — ① 그대로. 검증된 수율(금요일 183,378셀)이 보장된다.
     #  · 탐사  30석 — 미관측 우선. 빈 노선은 6사이클(~4분)에 cold 로 빠지므로
     #    시간당 수백 개를 훑는다. 굶주림은 여기서 전담해 푼다.
-    n_ex = max(0, min(cfg().get("exploreSlots", 30), n))
+    # ── 고정 패널 (pinned) — 로테이션 밖에서 항상 폴링 ────────────────
+    # §8 #4(광역버스 시각표 준수)는 **로테이션 표본으로 판정이 안 된다** (✅ 실증):
+    # 기점 출발을 잡으려면 그 순간 폴링 중이어야 하는데 로테이션은 보장하지 않는다.
+    # 부분표본끼리 비교하면 시각표가 있어도 정렬이 안 나오고(평일 대비 1.1x),
+    # 없어도 밀도 때문에 나온 것처럼 보인다(토↔일 23.7x — 이건 진짜였지만
+    # 처음 쓴 지표로는 둘을 구분 못 했다).
+    # 몇 개 노선만 상시 관측하면 기점 1→2 전이를 30초 해상도로 전부 잡아
+    # 하루 출발표가 통째로 나온다. 판정에 필요한 건 넓이가 아니라 **연속성**이다.
+    pin = set(cfg().get("pinnedRoutes") or [])
+    pinned = [p for p in live if p["routeid"] in pin][:n]
+    rest = [p for p in live if p["routeid"] not in pin]
+    left = n - len(pinned)
+
+    n_ex = max(0, min(cfg().get("exploreSlots", 30), left))
     explore = sorted(
-        live, key=lambda p: (p.get("cold", False), p["seen"] > 0, p["fill"], -p["goal"])
+        rest, key=lambda p: (p.get("cold", False), p["seen"] > 0, p["fill"], -p["goal"])
     )[:n_ex]
     taken = {p["routeid"] for p in explore}
-    harvest = [p for p in live if p["routeid"] not in taken]
+    harvest = [p for p in rest if p["routeid"] not in taken]
     harvest.sort(key=lambda p: (p.get("cold", False), p["pct"], -p["goal"]))
-    return explore + harvest[:n - len(explore)]
+    return pinned + explore + harvest[:left - len(explore)]
 
 
 def mark_empty(conn, routeid, empty):
@@ -923,6 +1022,8 @@ def main():
         rebuild("--yes" in sys.argv[2:], "--shrink-ok" in sys.argv[2:])
     elif cmd == "rebuild-subway":
         rebuild_subway("--yes" in sys.argv[2:])
+    elif cmd == "judge-timetable":
+        judge_timetable([p for p in sys.argv[2:] if not p.startswith("-")] or None)
     elif cmd == "audit-subway":
         audit_subway([p for p in sys.argv[2:] if not p.startswith("-")])
     elif cmd == "holidays":
