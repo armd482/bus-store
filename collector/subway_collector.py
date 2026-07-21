@@ -223,10 +223,36 @@ def main():
         sys.exit("지하철 인증키가 없다 — config.subwayKeys 와 .env 를 확인.")
     conn = O.connect()
 
-    # 간격은 키 수가 정한다 — 같은 콜 예산으로 하루(운행창 20h = 72,000s)를 고르게
-    # 덮는 게 목표다. 짧게 돌다 캡으로 멈추면 저녁 첨두가 매일 비는 구조적 구멍.
-    cycles_per_day = max(1, DAILY_CAP * len(keys) // 3)   # 사이클 = 3콜(1,000건 × 3페이지)
-    interval = max(INTERVAL_SEC, 72000 // cycles_per_day + 1)
+    # 간격은 **매 사이클 다시 계산한다** — 남은 쿼터를 남은 운행시간에 고르게 편다.
+    #
+    # ⚠️ 고정 계산은 두 군데서 틀렸다 (✅ 2026-07-20: 22:08~00:00 111분 blackout):
+    #  ① 지평을 72,000s(20h)로 박아 뒀는데 운행창을 [5,26]=21h 로 넓힌 뒤 안 고쳤다.
+    #  ② 사이클당 3콜로 가정했다. 평일은 응답이 3,000행을 넘어 4페이지가 되므로
+    #     실측 3.28콜/사이클이다 (일요일은 3.0 — 그래서 일요일만 안 터졌다).
+    #  둘이 겹쳐 995 사이클이 필요한데 870 만 돌고 2.6시간 일찍 소진했다.
+    #  하필 잃는 구간이 22~24시 — §6.3 이 절벽 후보로 지목한 심야 막차다.
+    #
+    # 정적 상수를 다시 맞추는 대신 실측으로 자기보정한다. 열차 수가 계절·요일마다
+    # 달라져 페이지 수가 변해도, 캡에 부딪히는 대신 간격이 늘어날 뿐이다.
+    # **데이터를 버리는 것보다 성기게 찍는 게 낫다** (paced() 의 세마포어와 같은 원칙).
+    cps = 3.0                      # 사이클당 콜 수 — 실측으로 갱신 (EWMA)
+
+    def pace(t, qday):
+        """남은 쿼터 ÷ 남은 운행시간. 자정에 쿼터가 리셋되므로 지평도 자정까지다."""
+        left = sum(max(0, DAILY_CAP - read_calls(kid, qday)) for kid, _ in keys)
+        if left <= 0:
+            return INTERVAL_SEC
+        # 지금부터 자정까지 '운행 중'인 초 — 분 단위로 센다 (하루 1440회, 사이클당 1번)
+        sec, cur = 0, t
+        end = t.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        while cur < end:
+            if in_service(cur):
+                sec += 60
+            cur += timedelta(minutes=1)
+        cycles = left / max(cps, 1.0)
+        return max(INTERVAL_SEC, min(600, int(sec / cycles) if cycles else 600))
+
+    interval = pace(now(), quota_day(now()))
 
     # 매일 위상을 흔든다 (§3.3.3). 고정 간격이면 매일 같은 시각만 샘플링된다.
     time.sleep(random.Random(service_day(now())).uniform(0, interval))
@@ -289,6 +315,7 @@ def main():
         hol = O.is_holiday(t)
         path = os.path.join(OUT_DIR, f"{PREFIX}-{day}.jsonl")
         start, total, got, did_bump, capped = 0, None, 0, False, False
+        used0 = sum(read_calls(kid, qday) for kid, _ in keys)   # 이 사이클의 콜 수 측정용
 
         while total is None or start < total:
             kid, key = take_key(qday)
@@ -337,11 +364,18 @@ def main():
             print(f"[{t:%H:%M:%S}] 전 키 일 상한 도달 — 자정 리셋까지 대기", flush=True)
             time.sleep(300)
             continue
+        # 이번 사이클이 실제로 쓴 콜로 cps 를 갱신하고 간격을 다시 잡는다
+        spent = sum(read_calls(kid, qday) for kid, _ in keys) - used0
+        if spent > 0:
+            cps = 0.8 * cps + 0.2 * spent      # EWMA — 페이지 수가 바뀌면 따라간다
+        interval = pace(t, qday)
+
         if int(t.timestamp()) // interval % 20 == 0:
             cal = " ".join(f"{kid}:{read_calls(kid, qday)}" for kid, _ in keys)
             mem = O.rss_mb()
             print(f"[{t:%H:%M:%S}] 콜[{cal}] · 응답 {got}건 · 오늘 기록 {written:,}건 "
-                  f"· 셀 {len(bumped):,}" + (f" · {mem:.0f}MB" if mem else ""), flush=True)
+                  f"· 셀 {len(bumped):,} · {interval}s({cps:.1f}콜)"
+                  + (f" · {mem:.0f}MB" if mem else ""), flush=True)
 
         time.sleep(interval + random.uniform(-3, 3))
 
