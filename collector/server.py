@@ -685,35 +685,44 @@ function renderSubway(d){
   const lt = (id,label,extra) => `<span onclick="setLineTab('${id.replace(/'/g,"\\'")}')" `
     + `style="cursor:pointer;padding:3px 9px;margin:0 3px 4px 0;border-radius:5px;display:inline-block;`
     + `${lineTab===id?'background:#3b82f6;color:#fff;font-weight:600':'background:#8882'}">${label}${extra||''}</span>`;
-  h += `<h2>노선별 수집률 — 셀 충전율 (목표 ${tgt}일 · 요일 7종)</h2>`;
+  // ★ 노선별 지표는 **판정 준비도**다 — 충전율이 아니다.
+  //   전 노선이 1콜(ALL)에 함께 수집되므로 '수집률'은 노선마다 같을 수밖에 없다.
+  //   ✅ 실측: 19개 노선 전부 정확히 14.3%(=1/7). 아직 각 요일이 한 번씩만 왔고
+  //   전 셀이 n=1 이라 fillN/(seen×7) = 1/7 로 고정된다 — 정보량이 0 이다.
+  //   (다음 월요일에 mon 셀이 n=2 가 되면 오르지만, 그때도 19개가 나란히 오른다.)
+  //   반면 준비도는 1.6~4.5일로 갈린다: 쌍당 관측 수라 trainNo 파편화가 드러난다.
+  const jprog = L => Math.min(1, (L.judgeDays||0)/jt);
+  h += `<h2>노선별 판정 준비도 (§8 #1 · 목표 ${jt}일)</h2>`;
   h += '<div style="margin-bottom:10px">' + lt('__all__','전체')
-     + sub.lines.map(L=>lt(L.name, L.name, `<span style="opacity:.6;font-size:11px"> ${pct(prog(L))}</span>`)).join('') + '</div>';
+     + sub.lines.map(L=>lt(L.name, L.name, `<span style="opacity:.6;font-size:11px"> ${
+         L.judgeSkip ? '—' : (L.judgeDays||0).toFixed(1)+'일'}</span>`)).join('') + '</div>';
 
   if(!sub.lines.length){
     h += '<div class=sub>아직 셀 없음 — 수집이 돌면 노선이 자동으로 나타난다. '
        + '(오늘 기록이 늘고 있는데 셀이 0이면 공휴일이거나 첫 사이클 전이다.)</div>';
   } else if(lineTab === '__all__'){
-    h += '<table><tr style="opacity:.5"><td>노선</td><td class=n>충전율</td><td></td>'
-       + '<td class=n>셀(완료)</td><td class=n>판정 준비</td><td class=n>열차·역</td><td class=n>오늘</td></tr>';
+    h += '<table><tr style="opacity:.5"><td>노선</td><td class=n>쌍당 관측</td><td></td>'
+       + '<td class=n>셀</td><td class=n>열차·역</td><td class=n>오늘</td></tr>';
     for(const L of sub.lines){
-      const p = prog(L), j = L.judgeDays||0;
+      const j = L.judgeDays||0, jp = jprog(L);
       h += `<tr><td width=90>${L.name}</td>
-            <td class=n width=54><b>${pct(p)}</b></td>
-            <td width=150>${bar(p, p>=1?'ok':'')}</td>
-            <td class=n style="white-space:nowrap">${num(L.seen)} <span style="opacity:.55">(${num(L.filled)})</span></td>
-            <td class="n ${L.judgeSkip?'':(j>=jt?'ok':'')}" style="white-space:nowrap">${
-              L.judgeSkip ? '<span style="opacity:.5" title="trainNo 가 종일 재사용돼 셀이 성립하지 않는다 — 시각표 대조 필요(§8.1 ⑤)">판정 제외</span>'
-                          : j.toFixed(1)+'/'+jt+'일'}</td>
+            <td class="n ${L.judgeSkip?'':(j>=jt?'ok':'')}" width=64 style="white-space:nowrap">${
+              L.judgeSkip ? '<span style="opacity:.5">제외</span>' : '<b>'+j.toFixed(1)+'</b>/'+jt+'일'}</td>
+            <td width=170>${L.judgeSkip
+              ? '<span class=sub style="font-size:11px" title="trainNo 가 종일 재사용돼 셀이 성립하지 않는다">시각표 대조 필요 (§8.1 ⑤)</span>'
+              : bar(jp, jp>=1?'ok':'')}</td>
+            <td class=n style="white-space:nowrap;opacity:.6">${num(L.seen)}</td>
             <td class=n style="white-space:nowrap;opacity:.6">${L.trains}·${L.stations}</td>
             <td class=n style="white-space:nowrap;opacity:.6">${num(L.written)}</td></tr>`;
     }
     h += '</table>';
-    h += `<div class=sub style="margin-top:6px"><b>충전율</b> = Σmin(관측일, ${tgt}) ÷ (셀 수 × ${tgt}) — `
-       + `셀 기준이되 부분 진행을 반영한다. 매주 약 ${(100/tgt).toFixed(0)}%p 씩 오른다. `
-       + `괄호 안은 목표를 다 채운 셀 수 — 이건 ${tgt}주차에야 늘기 시작한다. `
-       + `<b>판정 준비</b>는 다른 신호다 — (열차,역) 쌍당 평균 관측 일수(<b>요일 무관</b>)이고 `
-       + `${jt}일이면 정시성 σ 를 잴 수 있다(§8.1 ④). 즉 <b>${jt}일째부터 §8 #1 판정이 가능</b>하고, `
-       + `셀 충족 ${tgt}주를 기다릴 필요가 없다.</div>`;
+    h += `<div class=sub style="margin-top:6px"><b>쌍당 관측</b> = Σ관측일 ÷ 서로 다른 (열차,역) 쌍 수 `
+       + `(<b>요일 무관</b>). ${jt}일이면 정시성 σ 를 잴 수 있어 <b>${jt}일째부터 §8 #1 판정이 가능</b>하다 `
+       + `— 셀 충족 ${tgt}주를 기다릴 필요가 없다(§8.1 ④).<br>`
+       + `⚠️ <b>노선별 '수집률'은 여기 없다.</b> 전 노선이 1콜(ALL)에 함께 수집되므로 수집 노력이 노선마다 `
+       + `같고, 실제로 충전율은 19개 노선 전부 정확히 ${pct(1/tgt)} 로 나온다(각 요일이 아직 한 번씩만 와서 `
+       + `전 셀이 n=1). 노선을 가르는 것은 <b>쌍당 관측</b>이고, 낮은 노선은 trainNo 가 파편화돼 쌍이 부풀려진 `
+       + `것이다 — 2호선은 한 번호가 노선의 8% 구간에서만 잡힌다(§8.1 ⑤ 다).</div>`;
   } else {
     const L = sub.lines.find(x=>x.name===lineTab);
     if(!L){ h += '<div class=sub>그 노선은 아직 관측되지 않았다.</div>'; }
