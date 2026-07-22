@@ -459,7 +459,7 @@ PAGE = """<!doctype html><meta charset="utf-8"><title>수집 현황</title>
  .card .k{font-size:11px;opacity:.6} .card .v{font-size:20px;font-weight:600;margin-top:2px}
  code{background:#8882;padding:1px 4px;border-radius:3px;font-size:12px}
 </style>
-<h1>버스 위치 수집 현황</h1>
+<h1>수집 현황</h1>
 <div class=sub id=sub>…</div>
 <div id=app>불러오는 중…</div>
 <script>
@@ -478,11 +478,16 @@ async function tick(){
 
 function render(){
   const d = S; if(!d) return;
-  const s = d.state;
-  const alive = s.lastObs && (Date.now()/1000 - s.lastObs) < 180;
-  document.getElementById('sub').innerHTML =
-    `경기 ${num(d.routes)}노선 · ${num(d.segments)}구간 · 목표 ${num(d.goal)}셀 × ${d.target}샘플`
-    + (alive ? ' · <span class=ok>●</span> 버스 수집 중' : ' · <span class=bad>●</span> 버스 멈춤');
+  // 헤더는 **세 수집기 공통** — 어느 하나가 멈추면 탭을 안 열어도 보이게.
+  // 경기 전용 규모(노선·구간·목표셀)는 그 탭 안으로 옮겼다. 탭이 셋이 된 뒤로
+  // 전역 헤더가 경기 것만 이고 있으면 다른 탭에서 틀린 맥락을 준다.
+  const now = Date.now()/1000;
+  const dot = (ok, label) => `<span class=${ok?'ok':'bad'}>●</span> ${label}`;
+  const sub = d.subway || {}, seo = d.seoul || {};
+  const parts = [dot(d.state.lastObs && now - d.state.lastObs < 180, '경기')];
+  if(sub.present) parts.push(dot(sub.lastObs && now - sub.lastObs < 300, '지하철'));
+  if(seo.present) parts.push(dot(seo.lastObs && now - seo.lastObs < 600, '서울'));
+  document.getElementById('sub').innerHTML = parts.join(' · ');
 
   const tb = (id,label) => `<span onclick="setTab('${id}')" style="cursor:pointer;padding:6px 16px;`
     + `border-bottom:2px solid ${tab===id?'#3b82f6':'transparent'};${tab===id?'font-weight:700':'opacity:.5'}">${label}</span>`;
@@ -495,6 +500,9 @@ function render(){
 function renderBus(d){
   const s = d.state;
   let h = '';
+  // 규모 — 전역 헤더에 있던 것을 이 탭으로 옮겼다 (경기 전용 정보라서)
+  h += `<div class=sub>TAGO 위치정보 30초 폴링 · 경기 <b>${num(d.routes)}</b>노선 · `
+     + `${num(d.segments)}구간 · 목표 ${num(d.goal)}셀 × ${d.target}샘플 (구간 × 밴드 7 × 요일 7)</div>`;
   // 완성률
   h += `<div class=big>${pct(d.pct)}</div>`;
   const etaTxt = d.etaMeasuring ? ' · 남은 기간 <b>측정 중</b> (관측 하루치 쌓이면 표시)'
