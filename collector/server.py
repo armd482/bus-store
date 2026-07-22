@@ -35,6 +35,11 @@ try:
 except Exception:
     subway_collector = None
 
+try:
+    import seoul_collector           # 서울 버스 스냅샷 — 역시 별도 프로세스
+except Exception:
+    seoul_collector = None
+
 # 수집기가 갱신하는 최근 상태 (대시보드가 읽는다)
 STATE = {
     "started": None, "cycles": 0, "lastObs": None, "lastCycleSec": None,
@@ -54,6 +59,10 @@ DAYS7 = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")  # 버스·지하철 �
 #    offset·카운트가 이중 가산된다. 표시용이라 치명적이진 않지만 락이 한 줄이다.
 _SUB_TAIL = {}
 _SUB_LOCK = threading.Lock()
+
+# 서울 스냅샷도 같은 이유로 증분 리더 (하루 50만 행이라 풀스캔이면 /api 가 늘어진다)
+_SEOUL_TAIL = {}
+_SEOUL_LOCK = threading.Lock()
 
 # 대시보드용 sqlite 연결 하나를 공유한다 — /api(5초)마다 connect() 하면 매번
 # CREATE TABLE·PRAGMA 가 돌고 연결이 닫히지 않은 채 GC 로 넘어간다.
@@ -97,6 +106,81 @@ def _obs_rate_per_day():
     if window < 3600 or size == 0:
         return None, 0.0                     # 표본 부족
     return (size / AVG_ROW_BYTES) / (window / 86400), window / 86400
+
+
+def seoul_snapshot():
+    """서울 버스 도착정보 스냅샷 현황 — 밴드별 진행과 쿼터.
+
+    지하철과 지표가 다르다. 서울은 셀을 쌓는 게 아니라 **밴드마다 노선당 1회**
+    찍어 CV(§6.4)를 재는 것이라, 볼 것은 '오늘 이 밴드에서 702노선 중 몇 개를
+    찍었나' 와 '쿼터가 남았나' 다. 진행은 매일 0 에서 다시 시작한다.
+    """
+    if seoul_collector is None:
+        return {"present": False}
+    now = datetime.now(O.KST)
+    day = seoul_collector.service_day(now)
+    qday = seoul_collector.quota_day(now)
+    cap = seoul_collector.DAILY_CAP
+    try:
+        with open(seoul_collector.ROUTES_FILE, encoding="utf-8") as f:
+            R = json.load(f)
+    except (OSError, ValueError):
+        R = {}
+    done = seoul_collector.load_done(day)
+    bands = O.cfg()["timebands"]
+    per = {}
+    for b, _ in done:
+        per[b] = per.get(b, 0) + 1
+    cur = O.band_of(now, bands)
+
+    # 오늘 jsonl — 행 수와 마지막 관측 (지하철과 같은 증분 리더)
+    path = os.path.join(O.DATA, f"{seoul_collector.PREFIX}-{day}.jsonl")
+    cache = _SEOUL_TAIL
+    with _SEOUL_LOCK:
+        if cache.get("path") != path:
+            cache.update(path=path, offset=0, total=0, last_t=None, last_no=None, last_stn=None)
+        try:
+            size = os.path.getsize(path)
+            if size < cache["offset"]:
+                cache.update(offset=0, total=0)
+            if size > cache["offset"]:
+                with open(path, "rb") as fh:
+                    fh.seek(cache["offset"])
+                    for raw in fh:
+                        if not raw.endswith(b"\n"):
+                            break
+                        cache["offset"] += len(raw)
+                        cache["total"] += 1
+                        try:
+                            r = json.loads(raw.decode("utf-8"))
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        cache["last_t"], cache["last_no"], cache["last_stn"] = \
+                            r.get("t"), r.get("no"), r.get("stNm")
+        except OSError:
+            pass
+        written, last_t = cache["total"], cache["last_t"]
+        last_no, last_stn = cache["last_no"], cache["last_stn"]
+    last_epoch = None
+    if last_t:
+        try:
+            last_epoch = datetime.fromisoformat(last_t).timestamp()
+        except ValueError:
+            pass
+
+    calls = seoul_collector.read_calls(qday)
+    return {
+        "present": True, "started": bool(R),
+        "routes": len(R), "calls": calls, "cap": cap,
+        "need": len(R) * len(bands),          # 하루에 필요한 콜 (밴드마다 노선당 1회)
+        "written": written, "lastObs": last_epoch,
+        "lastNo": last_no, "lastStn": last_stn,
+        "curBand": cur,
+        "bands": [{"i": i, "from": a, "to": b if b <= 24 else b - 24, "wrap": b > 24,
+                   "done": per.get(i, 0), "total": len(R),
+                   "pct": per.get(i, 0) / len(R) if R else 0,
+                   "cur": i == cur} for i, (a, b) in enumerate(bands)],
+    }
 
 
 def subway_snapshot():
@@ -343,6 +427,7 @@ def snapshot():
         "calls": calls, "quota": k["dailyQuota"], "holidays": hol,
         "state": st, "etaDays": eta, "etaDaysHi": eta_hi, "etaMeasuring": eta_measuring,
         "subway": subway_snapshot(),
+        "seoul": seoul_snapshot(),
         "cfg": {kk: k[kk] for kk in
                 ("targetSamples", "maxRoutes", "dispatchRate",
                  "intervalSec", "serviceWindow", "dailyQuota")},
@@ -401,8 +486,8 @@ function render(){
 
   const tb = (id,label) => `<span onclick="setTab('${id}')" style="cursor:pointer;padding:6px 16px;`
     + `border-bottom:2px solid ${tab===id?'#3b82f6':'transparent'};${tab===id?'font-weight:700':'opacity:.5'}">${label}</span>`;
-  let h = `<div style="display:flex;gap:8px;border-bottom:1px solid #8883;margin:0 0 18px">${tb('bus','버스')}${tb('subway','지하철')}</div>`;
-  h += (tab === 'subway') ? renderSubway(d) : renderBus(d);
+  let h = `<div style="display:flex;gap:8px;border-bottom:1px solid #8883;margin:0 0 18px">${tb('bus','경기 버스')}${tb('subway','지하철')}${tb('seoul','서울 버스')}</div>`;
+  h += (tab === 'subway') ? renderSubway(d) : (tab === 'seoul') ? renderSeoul(d) : renderBus(d);
   document.getElementById('app').innerHTML = h;
   paintObs();
 }
@@ -489,6 +574,45 @@ function renderBus(d){
   for(const [k,v] of Object.entries(d.cfg))
     h += `<tr><td width=140><code>${k}</code></td><td>${JSON.stringify(v)}</td></tr>`;
   h += '</table>';
+  return h;
+}
+
+function renderSeoul(d){
+  const s = d.seoul;
+  if(!s || !s.present)
+    return '<div class=sub>이 서버엔 서울 수집기가 없다 (seoul_collector 미탑재).</div>';
+  if(!s.started)
+    return '<div class=sub>노선 목록이 아직 없다 — <code>python3 seoul_collector.py --routes</code> 로 먼저 받을 것.</div>';
+  const q = s.cap ? s.calls/s.cap : 0;
+  const needPct = s.need ? s.calls/s.need : 0;
+  let h = '<div class=sub><b>도착정보 스냅샷</b> — 경기(TAGO)와 방식이 다르다. 서울은 운영사가 '
+    + '구간시간·배차를 <b>이미 계산해서</b> 주므로 30초 폴링이 아니라 <b>밴드마다 노선당 1회</b>만 찍는다 '
+    + `(${num(s.routes)}노선 × 밴드 7 = ${num(s.need)}콜/일, 한도의 ${pct(s.need/s.cap)}). `
+    + 'arrmsg1/arrmsg2 의 간격이 <b>실측 배차</b>이고 그것이 §6.4 의 CV — 모르면 20분 배차에서 10분 오차다.</div>';
+
+  h += '<h2>건강 상태</h2><div class=grid>';
+  h += `<div class=card><div class=k>마지막 관측</div><div class=v id=seoullastobs>—</div>
+        <div class=k>${s.lastNo||''} ${s.lastStn||'—'}</div></div>`;
+  h += `<div class=card><div class=k>오늘 기록</div><div class=v>${num(s.written)}</div>
+        <div class=k>정류장 × 노선 행</div></div>`;
+  h += `<div class=card><div class=k>오늘 콜</div><div class="v ${q>.95?'bad':q>.85?'warn':''}">${num(s.calls)}</div>
+        <div class=k>/ ${num(s.cap)} 상한 · 필요 ${num(s.need)}</div></div>`;
+  h += `<div class=card><div class=k>하루 진행</div><div class="v ${needPct>=1?'ok':''}">${pct(Math.min(needPct,1))}</div>
+        <div class=k>밴드 7종 × ${num(s.routes)}노선</div></div>`;
+  h += '</div>';
+
+  h += '<h2>밴드별 진행 (매일 0에서 시작)</h2><table>';
+  for(const b of s.bands){
+    h += `<tr><td width=90>${b.from}-${b.to}시${b.wrap?'<span style="opacity:.5">익일</span>':''}
+          ${b.cur?'<span style="color:#3b82f6;font-size:11px"> 진행 중</span>':''}</td>
+          <td class=n width=54><b>${pct(b.pct)}</b></td>
+          <td width=240>${bar(b.pct, b.pct>=1?'ok':'')}</td>
+          <td class=n style="white-space:nowrap">${num(b.done)} / ${num(b.total)}</td></tr>`;
+  }
+  h += '</table>';
+  h += '<div class=sub style="margin-top:6px">밴드마다 전 노선을 한 번씩 찍으면 100%. '
+     + '⚠️ 이건 <b>관측이 아니라 운영사 예측</b>이라(신분당선 recptnDt 와 같은 성격, §8.1 ⑤ 가) '
+     + '정시성 판정엔 쓰지 않는다. CV 는 다음 2대의 현재 위치 기반이라 예측 오염이 상대적으로 작다.</div>';
   return h;
 }
 
@@ -640,6 +764,14 @@ function paintObs(){
     const alive = secs != null && secs < 300;
     se.className = 'v ' + (alive ? 'ok' : (sub.inService ? 'bad' : ''));
     se.textContent = secs != null ? secs + '초 전' : '—';
+  }
+  // 서울은 밴드당 노선 1회라 간격이 최대 30초 — 임계값을 넉넉히 잡는다
+  // (버스 180s · 지하철 300s 와 다른 이유. 밴드를 다 찍으면 다음 밴드까지 쉰다).
+  const qe = document.getElementById('seoullastobs');
+  if(qe && S.seoul && S.seoul.present){
+    const secs = S.seoul.lastObs ? Math.round(Date.now()/1000 - S.seoul.lastObs) : null;
+    qe.className = 'v ' + (secs != null && secs < 600 ? 'ok' : '');
+    qe.textContent = secs != null ? secs + '초 전' : '—';
   }
 }
 tick(); setInterval(tick, 5000); setInterval(paintObs, 1000);
