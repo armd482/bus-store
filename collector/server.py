@@ -201,6 +201,8 @@ def subway_snapshot():
           "seen": a["seen"], "filled": a["filled"], "sumN": a["sumN"],
           "fillN": a["fillN"], "target": tgt,
           "judgeDays": judge.get(n, 0),
+          # 셀 모델이 성립하지 않는 노선 — 준비도를 계산해도 의미가 없다 (config 주석 참조)
+          "judgeSkip": n in (O.cfg().get("subwayJudgeExclude") or []),
           "byDay": {d: a["by"].get(d, {"seen": 0, "filled": 0, "sumN": 0, "fillN": 0, "days": 0})
                     for d in DAYS7},
           "written": per_line_written.get(n, 0)}
@@ -527,7 +529,9 @@ function renderSubway(d){
         <div class=k>${num(tot.seen)}셀 · 평균 ${(tot.seen?tot.sumN/tot.seen:0).toFixed(1)}/${tgtAll}일 · 완료 ${num(tot.filled)}</div></div>`;
   // 판정 준비도 (§8.1 ④) — 셀 충족(7주)과 다른 신호. 쌍당 3 관측이면 σ 를 잴 수 있다
   const jt = sub.judgeTarget || 3;
-  const jd = sub.lines.length ? Math.min(...sub.lines.map(L=>L.judgeDays||0)) : 0;
+  // 판정 불가 노선은 최소값 계산에서도 뺀다 — 넣으면 준비도를 과소·과대 양쪽으로 왜곡한다
+  const jlines = sub.lines.filter(L=>!L.judgeSkip);
+  const jd = jlines.length ? Math.min(...jlines.map(L=>L.judgeDays||0)) : 0;
   h += `<div class=card><div class=k>판정 준비도 (§8 #1)</div>
         <div class="v ${jd>=jt?'ok':''}">${jd.toFixed(1)}<span style="font-size:13px">/${jt}일</span></div>
         <div class=k>${jd>=jt?'정시성 판정 가능':'전 노선 최소값 (요일 무관)'}</div></div>`;
@@ -565,7 +569,9 @@ function renderSubway(d){
             <td class=n width=54><b>${pct(p)}</b></td>
             <td width=150>${bar(p, p>=1?'ok':'')}</td>
             <td class=n style="white-space:nowrap">${num(L.seen)} <span style="opacity:.55">(${num(L.filled)})</span></td>
-            <td class="n ${j>=jt?'ok':''}" style="white-space:nowrap">${j.toFixed(1)}/${jt}일</td>
+            <td class="n ${L.judgeSkip?'':(j>=jt?'ok':'')}" style="white-space:nowrap">${
+              L.judgeSkip ? '<span style="opacity:.5" title="trainNo 가 종일 재사용돼 셀이 성립하지 않는다 — 시각표 대조 필요(§8.1 ⑤)">판정 제외</span>'
+                          : j.toFixed(1)+'/'+jt+'일'}</td>
             <td class=n style="white-space:nowrap;opacity:.6">${L.trains}·${L.stations}</td>
             <td class=n style="white-space:nowrap;opacity:.6">${num(L.written)}</td></tr>`;
     }

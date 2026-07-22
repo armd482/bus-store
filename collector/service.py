@@ -100,13 +100,13 @@ def maybe_follow(streamer):
     print("로그: python3 service.py logs   (install --logs 로 바로 이어 볼 수도 있다)")
 
 
-PROC_PAT = r"python[^ ]* (server|subway_collector)\.py"
+PROC_PAT = r"python[^ ]* (server|subway_collector|seoul_collector)\.py"
 
 
 def kill_manual(why="정리"):
     """수동으로 띄운 수집기도 내린다 — 모드와 무관하게 '완전 종료'가 되도록.
 
-    ⚠️ **버스(server.py)와 지하철(subway_collector.py) 둘 다** 잡는다.
+    ⚠️ **버스·지하철·서울 세 수집기 모두** 잡는다.
     server.py 만 죽이던 것이 stop 메시지("완전 종료 (버스+지하철)")와 어긋났다 —
     수동으로 띄운 지하철 수집기가 살아남아 다음 install 때 세션·쿼터를 나눠 쓴다.
 
@@ -124,7 +124,7 @@ def kill_manual(why="정리"):
         # 커맨드라인으로 골라 죽인다 (service.py 자신은 이 패턴에 안 걸린다).
         run(["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process | Where-Object "
-             "{$_.CommandLine -match '(server|subway_collector)\\.py'} "
+             "{$_.CommandLine -match '(server|subway_collector|seoul_collector)\\.py'} "
              "| ForEach-Object {Stop-Process -Id $_.ProcessId -Force}"], ok_fail=True)
         return
 
@@ -174,10 +174,11 @@ def mac_run_dir():
     return dst
 
 
-# 리눅스와 같은 이유로 두 에이전트를 함께 관리한다 (버스 + 지하철)
+# 리눅스와 같은 이유로 세 에이전트를 함께 관리한다 (버스 + 지하철 + 서울)
 MAC_AGENTS = (
     (LABEL, "server.py", "server"),
     (LABEL + ".subway", "subway_collector.py", "subway"),
+    (LABEL + ".seoul", "seoul_collector.py", "seoul"),
 )
 
 
@@ -213,7 +214,7 @@ def mac_install():
 """)
         run(["launchctl", "enable", mac_target(label)], ok_fail=True)
         run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path(label)], ok_fail=True)
-    print("설치·시작됨 (버스+지하철). 대시보드: http://localhost:877")
+    print("설치·시작됨 (버스+지하철+서울). 대시보드: http://localhost:877")
     print("⚠️ 지하철은 .env 의 SEOUL_SUBWAY_KEY(·KEY2·KEY3)가 있어야 돈다")
     maybe_follow(lambda: follow(os.path.join(d, "logs", "server.log")))
 
@@ -223,7 +224,7 @@ def mac_stop():
         run(["launchctl", "bootout", mac_target(label)], ok_fail=True)   # 지금 내리고
         run(["launchctl", "disable", mac_target(label)], ok_fail=True)   # 재부팅에도 안 뜨게
     kill_manual()
-    print("완전 종료 (버스+지하철). 재부팅해도 안 살아난다 — 다시 켜려면: python3 service.py start")
+    print("완전 종료 (버스+지하철+서울). 재부팅해도 안 살아난다 — 다시 켜려면: python3 service.py start")
 
 
 def mac_start():
@@ -235,7 +236,7 @@ def mac_start():
         run(["launchctl", "enable", mac_target(label)], ok_fail=True)
         run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path(label)], ok_fail=True)
         run(["launchctl", "kickstart", mac_target(label)], ok_fail=True)
-    print("시작됨 (버스+지하철).")
+    print("시작됨 (버스+지하철+서울).")
     maybe_follow(lambda: follow(os.path.join(mac_workdir(), "logs", "server.log")))
 
 
@@ -271,6 +272,7 @@ def mac_status():
 LX_UNITS = (
     ("findpath", "server.py --port 8080", "findpath collector (bus + dashboard)"),
     ("findpath-subway", "subway_collector.py", "findpath subway collector"),
+    ("findpath-seoul", "seoul_collector.py", "findpath seoul bus arrival snapshot"),
 )
 
 
@@ -310,7 +312,7 @@ WantedBy=default.target
     run(["systemctl", "--user", "daemon-reload"])
     for name, _, _ in LX_UNITS:
         run(["systemctl", "--user", "enable", "--now", name])
-    print("설치·시작됨 (버스+지하철). 대시보드: http://localhost:8080 (리눅스는 877이 특권 포트라 8080)")
+    print("설치·시작됨 (버스+지하철+서울). 대시보드: http://localhost:8080 (리눅스는 877이 특권 포트라 8080)")
     print("⚠️ 지하철은 .env 의 SEOUL_SUBWAY_KEY(·KEY2·KEY3)가 있어야 돈다 — 없으면 로그에 '키 없음'")
     maybe_follow(lx_logs)
 
@@ -319,18 +321,18 @@ def lx_stop():
     for name, _, _ in LX_UNITS:
         run(["systemctl", "--user", "disable", "--now", name], ok_fail=True)
     kill_manual()
-    print("완전 종료 (버스+지하철). 재부팅해도 안 살아난다 — 다시 켜려면: python3 service.py start")
+    print("완전 종료 (버스+지하철+서울). 재부팅해도 안 살아난다 — 다시 켜려면: python3 service.py start")
 
 
 def lx_start():
     for name, _, _ in LX_UNITS:
         run(["systemctl", "--user", "enable", "--now", name], ok_fail=True)
-    print("시작됨 (버스+지하철).")
+    print("시작됨 (버스+지하철+서울).")
     maybe_follow(lx_logs)
 
 
 def lx_logs():
-    print("로그 스트리밍 — 버스+지하철 (Ctrl-C = 보기만 종료, 수집은 계속)", flush=True)
+    print("로그 스트리밍 — 버스+지하철+서울 (Ctrl-C = 보기만 종료, 수집은 계속)", flush=True)
     try:
         args = ["journalctl", "--user", "-f", "-n", "10"]
         for name, _, _ in LX_UNITS:
