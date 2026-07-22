@@ -162,6 +162,35 @@ def snapshot(key, rid):
     return out
 
 
+def done_path(day):
+    return os.path.join(O.DATA, f"seoul-done-{day}.json")
+
+
+def load_done(day):
+    """(밴드, 노선) 진행 상황을 디스크에서 복원.
+
+    ⚠️ 메모리에만 두면 재시작할 때마다 그 밴드를 처음부터 다시 찍는다. systemd 가
+    Restart=always 라 크래시·배포 때마다 쿼터가 샌다 — 지하철에서 같은 구조(하루 1회
+    제약이 메모리에만 있던 것)로 셀이 통째로 0 이 됐던 것과 같은 부류다.
+    콜 카운터를 디스크에 두는 것과 같은 이유이고, 이건 그 짝이다.
+    """
+    try:
+        with open(done_path(day), encoding="utf-8") as f:
+            return {(int(k.split(":", 1)[0]), k.split(":", 1)[1]): True for k in json.load(f)}
+    except (OSError, ValueError, IndexError):
+        return {}
+
+
+def save_done(day, done):
+    tmp = done_path(day) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump([f"{b}:{r}" for b, r in done], f)
+        os.replace(tmp, done_path(day))   # 원자적 교체 — 쓰다 죽어도 이전 것이 남는다
+    except OSError:
+        pass
+
+
 def main():
     key = load_key()
     if not key:
@@ -183,9 +212,11 @@ def main():
     print("  " + " · ".join(f"{TYPE_NM.get(k, k)}{v}" for k, v in sorted(tp_n.items())), flush=True)
 
     day = service_day(now())
-    done = {}          # (band, routeid) -> 이 운행일에 찍었나
+    done = load_done(day)   # (band, routeid) -> 이 운행일에 찍었나. 재시작해도 이어간다
     rotated_day = None
     written = 0
+    if done:
+        print(f"[{now():%H:%M:%S}] 재시작 복원: 이미 찍은 (밴드,노선) {len(done):,}개", flush=True)
 
     while True:
         t = now()
@@ -193,6 +224,7 @@ def main():
         if d != day:
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d} (전일 {written:,}행)", flush=True)
             day, done, written = d, {}, 0
+            save_done(day, done)
             continue
         due = O.rotate_due(rotated_day, t)
         if due:
@@ -218,9 +250,17 @@ def main():
 
         # 밴드가 끝나기 전에 todo 를 고르게 편다. 남은 쿼터도 함께 본다
         # (지하철 pace() 와 같은 원칙 — 캡에 부딪히는 대신 성겨진다).
-        band_end = t.replace(hour=bands[b][1] % 24, minute=0, second=0, microsecond=0)
-        if bands[b][1] >= 24 or band_end <= t:
-            band_end = band_end + timedelta(days=1)
+        # ⚠️ 밴드 6 은 [20,28] 로 자정을 넘는다. "28>=24 면 무조건 +1일"로 두면
+        #    01시에 잔여를 27시간으로 계산해(실제 3시간) 간격이 30초 상한에 붙고
+        #    새벽에 남은 노선을 못 찍는다 (✅ 재현: 03시 계산 25h vs 실제 1h).
+        #    지금이 자정 **전**인지 **후**인지로 갈라야 한다.
+        lo, hi = bands[b]
+        band_end = t.replace(hour=hi % 24, minute=0, second=0, microsecond=0)
+        if hi >= 24:
+            if t.hour >= lo:              # 20~24시 구간 — 종료는 다음날 04시
+                band_end += timedelta(days=1)
+        elif band_end <= t:
+            band_end += timedelta(days=1)
         secs = max(60, (band_end - t).total_seconds())
         # 하한 2초 — 밴드가 얼마 안 남은 채로 시작하면 산식이 0.8초까지 내려가
         # 702콜을 10분에 몰아친다. 서울 API 의 순간 rate 제한은 확인된 바 없어
@@ -235,9 +275,11 @@ def main():
             add_calls(qday, 1)          # 실패도 쿼터를 먹는다
             print(f"[{t:%H:%M:%S}] 실패 {R[rid]['no']}: {type(e).__name__}", flush=True)
             done[(b, rid)] = True       # 이 밴드에선 재시도 안 한다 (다음 밴드에 다시 온다)
+            save_done(day, done)
             time.sleep(gap)
             continue
         done[(b, rid)] = True
+        save_done(day, done)
 
         if rows:
             path = os.path.join(OUT_DIR, f"{PREFIX}-{day}.jsonl")
