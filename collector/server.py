@@ -192,7 +192,7 @@ def subway_snapshot():
     now = datetime.now(O.KST)
     day = subway_collector.service_day(now)
     qday = subway_collector.quota_day(now)
-    tgt = O.cfg().get("targetSamples", 7)
+    tgt = O.cfg().get("subwayTarget", 3)   # ⚠️ 버스(7)와 다르다 — §8.1 ④: 쌍당 3 관측이면 σ
     cap = subway_collector.DAILY_CAP
     c = db()
 
@@ -299,6 +299,10 @@ def subway_snapshot():
         "keys": keys, "lines": lines, "written": total_written,
         "lastObs": last_epoch, "lastStn": last_stn, "lastLine": last_line,
         "judgeTarget": 3,   # §8.1 ④ — 쌍당 3 관측이면 σ 를 잴 수 있다
+        "target": tgt,      # 요일 분리 재검토 목표 (셀당 3 관측 = 3주)
+        # §8 #1 은 이미 판정됨 (§8.2) — 대시보드가 '진행 중 목표'로 오인하지 않게 결과를 실어 보낸다
+        "judged": {"done": True, "sigmaMed": 0.75, "signal": 1.5, "belowSignal": 0.75,
+                   "date": "2026-07-23", "cells": 99082},
     }
 
 
@@ -636,19 +640,29 @@ function renderSubway(d){
   const alive = sub.lastObs && (Date.now()/1000 - sub.lastObs) < 300;
   const tot = sub.lines.reduce((a,L)=>({seen:a.seen+L.seen, filled:a.filled+L.filled,
     sumN:a.sumN+(L.sumN||0), fillN:a.fillN+(L.fillN||0)}), {seen:0,filled:0,sumN:0,fillN:0});
-  const tgtAll = sub.lines.length ? sub.lines[0].target : 7;
-  // ★ 진행률은 **셀 기준**이되 부분 진행을 반영한다: Σmin(n,목표) / (셀 수 × 목표).
-  //   '목표를 채운 셀 / 관측된 셀'은 지하철에선 못 쓴다 — 셀이 요일별 주 1회씩
-  //   균일하게 차서 6주차에도 0%, 7주차에 100% 로 점프한다 (✅ 실측: 하루 뒤
-  //   3,671셀 전부 n=1 → 0.0%). 이건 셀을 안 쓰는 게 아니라 셀의 '충전 정도'를
-  //   세는 것이고, 매주 균일하게 오른다 (1주=14%, 7주=100%).
-  //   완료된 셀 수(filled)는 별도 숫자로 계속 보여준다.
+  // ★ 목표가 바뀌었다. §8 #1(정시성)은 **이미 판정됨**(§8.2, σ 0.75분<신호).
+  //   그래서 남은 목표는 '7주 셀 충족'이 아니라 **요일 분리 재검토** — 같은 요일이
+  //   3번(=3주) 와서 (노선,열차,역,요일)당 3관측이면 요일별 σ 를 잴 수 있다(§8.1 ④).
+  //   목표를 7→3 으로 내렸다(subwayTarget). 진행률 = Σmin(n,3)/(셀 수 × 3),
+  //   각 요일이 세 번씩 오면 100% (지금은 대개 1관측 → 33%).
+  const tgtAll = sub.lines.length ? sub.lines[0].target : 3;
   const rate = tot.seen ? tot.fillN/(tot.seen*tgtAll) : 0;
   const prog = L => L.seen ? (L.fillN||0)/(L.seen*L.target) : 0;
   const days = L => L.seen ? (L.sumN||0)/L.seen : 0;      // 셀당 평균 관측 일수
   let h = '<div class=sub><b>전 노선 일괄(ALL)</b> 도착정보 — 1콜에 19노선·555역 (✅ 경기·인천 포함). '
     + '<b>B안 셀</b> (노선,열차,역,요일)별 관측 일수 — trainNo 가 매일 반복이라 요일별 며칠이면 '
-    + '각 열차 정시성 분포가 나온다 (docs §8 #1).</div>';
+    + '각 열차 정시성 σ 가 나온다 (docs §8.2).</div>';
+
+  // §8 #1 판정 결과 — 존폐 항목이었고 통과했다. 진행 중 목표가 아니라 완료다.
+  const jg = sub.judged;
+  if(jg && jg.done){
+    h += `<div class=card style="margin:12px 0;border-left:3px solid #22c55e;background:#22c55e11">
+      <div class=k>§8 #1 지하철 정시성 — <b class=ok>✅ 판정됨</b> (${jg.date})</div>
+      <div style="margin-top:4px">σ 중앙 <b>${jg.sigmaMed}분</b> &lt; 신호 ${jg.signal}분 · 신호보다 σ 작은 셀 <b>${pct(jg.belowSignal)}</b>
+      <span class=sub>(${num(jg.cells)}셀 · 5일치)</span></div>
+      <div class=sub style="margin-top:2px">§6.2가 버스를 기각한 논리가 지하철엔 적용 안 됨 → <b>절벽 성립, 차별점 유효.</b>
+      아래는 <b>요일 분리 재검토</b>(3주+)의 진행률이다.</div></div>`;
+  }
 
   h += '<h2>건강 상태</h2><div class=grid>';
   h += `<div class=card><div class=k>마지막 관측</div><div class=v id=sublastobs>—</div>
@@ -657,16 +671,10 @@ function renderSubway(d){
         <div class=k>도착·출발 관측</div></div>`;
   h += `<div class=card><div class=k>노선</div><div class=v>${num(sub.lines.length)}</div>
         <div class=k>관측된 노선 수</div></div>`;
-  h += `<div class=card><div class=k>셀 충전율 (전체)</div><div class="v ${rate>=.9?'ok':''}">${pct(rate)}</div>
-        <div class=k>${num(tot.seen)}셀 · 평균 ${(tot.seen?tot.sumN/tot.seen:0).toFixed(1)}/${tgtAll}일 · 완료 ${num(tot.filled)}</div></div>`;
-  // 판정 준비도 (§8.1 ④) — 셀 충족(7주)과 다른 신호. 쌍당 3 관측이면 σ 를 잴 수 있다
+  const wk = (tot.seen ? tot.sumN/tot.seen : 0);   // 셀당 평균 관측 일수 = 대략 몇 주째
+  h += `<div class=card><div class=k>요일 분리 재검토</div><div class="v ${rate>=1?'ok':''}">${pct(rate)}</div>
+        <div class=k>셀당 ${wk.toFixed(1)}/${tgtAll}관측 · ${Math.ceil(Math.max(0,tgtAll-wk))}주 남음</div></div>`;
   const jt = sub.judgeTarget || 3;
-  // 판정 불가 노선은 최소값 계산에서도 뺀다 — 넣으면 준비도를 과소·과대 양쪽으로 왜곡한다
-  const jlines = sub.lines.filter(L=>!L.judgeSkip);
-  const jd = jlines.length ? Math.min(...jlines.map(L=>L.judgeDays||0)) : 0;
-  h += `<div class=card><div class=k>판정 준비도 (§8 #1)</div>
-        <div class="v ${jd>=jt?'ok':''}">${jd.toFixed(1)}<span style="font-size:13px">/${jt}일</span></div>
-        <div class=k>${jd>=jt?'정시성 판정 가능':'전 노선 최소값 (요일 무관)'}</div></div>`;
   h += '</div>';
 
   // 키별 쿼터 — 라운드로빈이라 고르게 소진돼야 정상
