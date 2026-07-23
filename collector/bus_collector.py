@@ -174,7 +174,13 @@ def main():
     bands, target, nb = k["timebands"], k["targetSamples"], len(k["timebands"])
     interval, quota, maxr = k["intervalSec"], k["dailyQuota"], k["maxRoutes"]
     workers, rate = k["maxWorkers"], k["dispatchRate"]
-    inflight = k["maxInflight"]
+    inflight_max = k["maxInflight"]
+    # ★ in-flight 를 사이클마다 TAGO 상태에 맞춰 조절한다 (AIMD — 혼잡제어와 같은 꼴).
+    #   code99(세션 30 초과)가 보이면 다음 사이클 in-flight 를 줄이고(×0.6), 깨끗한
+    #   사이클이면 조금씩 올린다(+2). TAGO 가 느려지면 자동으로 물러나고 회복되면
+    #   차오른다. 고정 20 은 TAGO 지연이 늘 때(2.48→3.94s) 좀비 세션과 겹쳐 code99
+    #   버스트를 냈다 (✅ 2026-07-23). 하한 8 — 그 밑이면 사이클이 너무 길어진다.
+    inflight = inflight_max
     window = k["serviceWindow"]
 
     day = service_day(now())
@@ -274,11 +280,21 @@ def main():
         # 더 조이면 사이클만 길어지므로, 실패분만 잠깐 뒤에 한 번 더 흘린다.
         failed = [meta[rid] for rid, _, err in results if err]
         if failed and read_calls(qday) + calls + len(failed) <= quota:
-            time.sleep(2)  # 세션이 빠질 틈
+            # ⚠️ 재시도를 곧장 20개 동시로 던지면 code99(세션 30 초과)가 재발한다.
+            #    타임아웃난 요청은 우리가 포기해도 TAGO 쪽 세션이 살아 있어(좀비),
+            #    새 20개 + 좀비 > 30 → code99 연쇄. 실제로 이 연쇄가 75/170 같은
+            #    버스트를 만든다 (✅ 2026-07-23: TAGO 지연 2.48→3.94s 로 꼬리가
+            #    15s 를 넘기 시작하면서 악화). 그래서 실패 성격에 따라 물러선다:
+            #    - code99 가 섞였으면 세션이 빠지도록 오래 쉬고(6s) in-flight 를 반으로
+            #    - 타임아웃뿐이면 짧게(2s), 동시성 그대로
+            has99 = any("code99" in err for _, _, err in results if err)
+            pause = 6 if has99 else 2
+            rinflight = max(6, inflight // 2) if has99 else inflight
+            time.sleep(pause)
             retry = {rid: (rid, items, err)
                      for rid, items, err in paced(
                          lambda p: fetch(key, p["cityCode"], p["routeid"]),
-                         failed, rate, workers, inflight)}
+                         failed, rate, workers, rinflight)}
             calls += len(failed)
             results = [retry.get(r[0], r) if r[2] else r for r in results]
 
@@ -399,6 +415,19 @@ def main():
             print(f"[{obs:%H:%M:%S}] ⚠️ 실패 {nerr}/{len(picked)} (재시도 후) — {detail}", flush=True)
         if cyc % 20 == 0:
             print(f"[{obs:%H:%M:%S}] 콜 {read_calls(qday):,}/{quota:,}", flush=True)
+
+        # ★ 다음 사이클 in-flight 조절 (AIMD). code99 는 세션 30 초과라 곧장 물러나고
+        #   (×0.6), 깨끗하면 천천히 차오른다(+2). errs 에 잔여 code99 가 없어도 이번
+        #   사이클에서 code99 를 겪었을 수 있으므로 원본 results 로 판단한다.
+        saw99 = any("code99" in (err or "") for _, _, err in results)
+        prev_inflight = inflight
+        if saw99:
+            inflight = max(8, int(inflight * 0.6))
+        elif inflight < inflight_max:
+            inflight = min(inflight_max, inflight + 2)
+        if inflight != prev_inflight:
+            print(f"[{obs:%H:%M:%S}] in-flight {prev_inflight}→{inflight} "
+                  f"({'code99 후퇴' if saw99 else '회복'})", flush=True)
 
         # 지터는 max 안에. 밖에 두면 took > interval 일 때 음수가 되어 죽는다.
         time.sleep(max(1.0, interval - took + random.uniform(-2, 2)))
