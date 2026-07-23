@@ -76,7 +76,8 @@
     "SEOUL_SUBWAY_KEY",
     "SEOUL_SUBWAY_KEY2",
     "SEOUL_SUBWAY_KEY3",
-    "SEOUL_SUBWAY_KEY4"
+    "SEOUL_SUBWAY_KEY4",
+    "SEOUL_SUBWAY_KEY5"
   ],
   "_subwayKeys": ".env 의 서울 열린데이터광장 인증키 변수명 목록 — 라운드로빈으로 쓴다. ★ 전 노선 일괄(OA-15799 `realtimeStationArrival/{start}/{end}/ALL`) 방식이라 노선별 키가 필요 없다: ✅ 실측 1콜에 19노선·555역·약 2,916건(경기·인천 포함 — 판교·광교·수원·기흥·오이도·인천·안산·의정부 확인). 1회 수집 = 3콜(1,000건씩 3페이지). 키 N개 = 950N콜/일 ÷ 3 = 316N회/일 → 1키 228초 · 2키 114초 · **3키 76초** 간격. ⚠️ 키를 늘려 한도를 우회하는 건 약관 제6조4항 취지(대량 트래픽은 활용사례 등록)에 어긋난다 — 3개까지가 실용 범위이고 그 이상은 갤러리 등록(무제한)으로 갈 것.",
   "subwayServiceWindow": [
