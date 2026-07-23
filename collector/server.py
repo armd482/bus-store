@@ -700,7 +700,7 @@ function renderSubway(d){
   //   (다음 월요일에 mon 셀이 n=2 가 되면 오르지만, 그때도 19개가 나란히 오른다.)
   //   반면 준비도는 1.6~4.5일로 갈린다: 쌍당 관측 수라 trainNo 파편화가 드러난다.
   const jprog = L => Math.min(1, (L.judgeDays||0)/jt);
-  h += `<h2>노선별 판정 준비도 (§8 #1 · 목표 ${jt}일)</h2>`;
+  h += `<h2>노선별 쌍당 관측 <span class=sub style="font-weight:400">— §8 #1 은 판정 완료(§8.2). 이 표는 노선별 데이터 두께·trainNo 파편화 점검용</span></h2>`;
   h += '<div style="margin-bottom:10px">' + lt('__all__','전체')
      + sub.lines.map(L=>lt(L.name, L.name, `<span style="opacity:.6;font-size:11px"> ${
          L.judgeSkip ? '—' : (L.judgeDays||0).toFixed(1)+'일'}</span>`)).join('') + '</div>';
@@ -726,20 +726,20 @@ function renderSubway(d){
     h += '</table>';
     h += `<div class=sub style="margin-top:6px"><b>쌍당 관측</b> = Σ관측일 ÷ 서로 다른 (열차,역) 쌍 수 `
        + `(<b>요일 무관</b>). ${jt}일이면 정시성 σ 를 잴 수 있어 <b>${jt}일째부터 §8 #1 판정이 가능</b>하다 `
-       + `— 셀 충족 ${tgt}주를 기다릴 필요가 없다(§8.1 ④).<br>`
+       + `— §8 #1 은 이미 이 방식으로 판정됐다(§8.2).<br>`
        + `⚠️ <b>노선별 '수집률'은 여기 없다.</b> 전 노선이 1콜(ALL)에 함께 수집되므로 수집 노력이 노선마다 `
-       + `같고, 실제로 충전율은 19개 노선 전부 정확히 ${pct(1/tgt)} 로 나온다(각 요일이 아직 한 번씩만 와서 `
-       + `전 셀이 n=1). 노선을 가르는 것은 <b>쌍당 관측</b>이고, 낮은 노선은 trainNo 가 파편화돼 쌍이 부풀려진 `
+       + `같고, 요일 분리 재검토 진행률은 19개 노선 전부 같은 값이다(각 요일이 아직 한 번씩만 와서 전 셀 n=1). `
+       + `노선을 가르는 것은 <b>쌍당 관측</b>이고, 낮은 노선은 trainNo 가 파편화돼 쌍이 부풀려진 `
        + `것이다 — 2호선은 한 번호가 노선의 8% 구간에서만 잡힌다(§8.1 ⑤ 다).</div>`;
   } else {
     const L = sub.lines.find(x=>x.name===lineTab);
     if(!L){ h += '<div class=sub>그 노선은 아직 관측되지 않았다.</div>'; }
     else {
       h += `<div class=sub><b>${L.name}</b> — 열차 ${num(L.trains)}대 · 역 ${num(L.stations)}개 · `
-         + `오늘 기록 ${num(L.written)}건 · 충전율 <b>${pct(prog(L))}</b> `
-         + `(${num(L.seen)}셀 · 완료 ${num(L.filled)}) · 관측 ${days(L).toFixed(1)}/${L.target}일</div>`;
-      h += '<table><tr style="opacity:.5"><td>요일</td><td class=n>충전율</td><td></td>'
-         + '<td class=n>셀(완료)</td><td class=n>관측 일수</td></tr>';
+         + `오늘 기록 ${num(L.written)}건 · 요일 분리 재검토 <b>${pct(prog(L))}</b> `
+         + `(${num(L.seen)}셀 · 3관측 완료 ${num(L.filled)}) · 셀당 ${days(L).toFixed(1)}/${L.target}관측</div>`;
+      h += '<table><tr style="opacity:.5"><td>요일</td><td class=n>재검토%</td><td></td>'
+         + '<td class=n>셀(3관측)</td><td class=n>관측 수</td></tr>';
       for(const dk of D7){
         const v = L.byDay[dk] || {seen:0,filled:0,fillN:0,days:0};
         const dp = v.seen ? (v.fillN||0)/(v.seen*L.target) : 0;
@@ -750,8 +750,9 @@ function renderSubway(d){
               <td class=n style="white-space:nowrap;opacity:.75">${(v.days||0).toFixed(1)} / ${L.target}일</td></tr>`;
       }
       h += '</table>';
-      h += `<div class=sub style="margin-top:6px">셀 = (열차, 역) 조합 · <b>관측 일수</b> = 그 요일에 며칠 봤나 `
-         + `(셀당 평균). 요일마다 주 1회씩이라 목표 ${tgt}일 = ${tgt}주. 셀이 0인 요일은 아직 그 요일이 안 온 것.</div>`;
+      h += `<div class=sub style="margin-top:6px">셀 = (열차, 역) 조합 · <b>관측 수</b> = 그 요일에 며칠 봤나 `
+         + `(셀당 평균). 요일마다 주 1회씩이라 목표 ${tgt}관측 = ${tgt}주. 셀이 0인 요일은 아직 그 요일이 안 온 것. `
+         + `이게 100% 면 요일별 σ 를 재검토할 표본이 찼다는 뜻(§8.2).</div>`;
     }
   }
 
