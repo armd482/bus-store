@@ -107,7 +107,7 @@
   "_driveRemote": "rclone 리모트 경로 (예 \"gdrive:busdata\"). 설정하면 ① 백업 직후 즉시 드라이브 업로드 ② 원본 삭제 전 드라이브에 실제로 있는지 rclone lsf 로 확인(없으면 재업로드, 그래도 없으면 삭제 보류). 이걸 쓰면 별도 rclone 크론이 불필요하다 (수집기가 직접 올린다). null 이면 로컬 .gz 존재로만 판단 — 윈도우 OneDrive 동기화폴더처럼 동기화앱이 알아서 올리는 경우.",
   "intervalSec": 30,
   "_intervalSec": "✅ 실측: 30초면 정류장 이동의 94.7%를 1칸으로 잡는다(2칸 이상 건너뜀 5.2%). 갱신주기 10~20초보다 성기게.",
-  "dailyQuota": 940000,
+  "dailyQuota": 960000,
   "_dailyQuota": "운영계정 50만/일에 마진. 초과 근접 시 수집기가 스스로 대기했다가 자정(달력일) 리셋 후 재개한다. ✅ 실측: serviceWindow [0,24] 로 24시간 열어도 사이클 ~31s + 심야 운행 노선 자동 축소로 하루 44~46만 — 마진 안. 카운터는 달력일 키(.buscalls-*, data.go.kr 자정 리셋과 일치)이고 fetch_routes 의 ~4,400콜은 여기 안 잡히니 상한 근접일엔 fetch_routes 를 자정 직후로 미룰 것.",
   "busKeys": [
     "GBIS_BUS_KEY",

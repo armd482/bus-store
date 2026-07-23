@@ -429,6 +429,9 @@ def snapshot():
         "pct": done / goal if goal else 0,
         "bands": band_rows, "days": byday, "today": today, "nowBand": nowband,
         "calls": calls, "quota": k["dailyQuota"], "holidays": hol,
+        "maxRoutes": k.get("maxRoutes", 170),
+        "busKeys": len([n for n in (k.get("busKeys") or ["GBIS_BUS_KEY"])
+                        if bus_collector and bus_collector._load_key(n)]) if bus_collector else 1,
         "state": st, "etaDays": eta, "etaDaysHi": eta_hi, "etaMeasuring": eta_measuring,
         "subway": subway_snapshot(),
         "seoul": seoul_snapshot(),
@@ -505,8 +508,11 @@ function renderBus(d){
   const s = d.state;
   let h = '';
   // 규모 — 전역 헤더에 있던 것을 이 탭으로 옮겼다 (경기 전용 정보라서)
+  const nkey = d.busKeys || 1;
   h += `<div class=sub>TAGO 위치정보 30초 폴링 · 경기 <b>${num(d.routes)}</b>노선 · `
-     + `${num(d.segments)}구간 · 목표 ${num(d.goal)}셀 × ${d.target}샘플 (구간 × 밴드 7 × 요일 7)</div>`;
+     + `${num(d.segments)}구간 · 목표 ${num(d.goal)}셀 × ${d.target}샘플 (구간 × 밴드 7 × 요일 7)`
+     + `<br>키 <b>${nkey}개</b>(계정 독립 세션·쿼터) · 사이클당 최대 <b>${num(d.maxRoutes||170)}</b>노선 폴링`
+     + (nkey>=2 ? ' — 세션·rate 가 키 단위라 커버 속도 ×'+nkey : '') + `</div>`;
   // 완성률
   h += `<div class=big>${pct(d.pct)}</div>`;
   const etaTxt = d.etaMeasuring ? ' · 남은 기간 <b>측정 중</b> (관측 하루치 쌓이면 표시)'
@@ -519,9 +525,16 @@ function renderBus(d){
   const q = d.calls/d.quota;
   const errN = Object.values(s.errors).reduce((a,b)=>a+b,0);
   const errRate = s.picked ? errN/s.picked : 0;
+  // 쿼터는 **계정 단위**(각 50만 하드리밋). 합산 카운터라 균등 분배(fetch_all)를
+  // 전제로 계정당 = 합산/키수 로 환산해 보여준다. 계정 하나라도 50만에 부딪히면
+  // 그 계정 몫이 멈추므로, 계정당 값이 진짜 벽에 가까운지가 중요하다.
+  const perAcct = nkey>=2 ? d.calls/nkey : d.calls;
+  const perQ = nkey>=2 ? d.quota/nkey : d.quota;
+  const qa = perAcct/500000;   // 계정당 하드리밋 50만 대비
   h += '<h2>건강 상태</h2><div class=grid>';
-  h += `<div class=card><div class=k>쿼터</div><div class="v ${q>.95?'bad':q>.85?'warn':''}">${num(d.calls)}</div>
-        <div class=k>/ ${num(d.quota)} (${pct(q)})</div></div>`;
+  h += `<div class=card><div class=k>쿼터 ${nkey>=2?'(계정당)':''}</div>
+        <div class="v ${qa>.97?'bad':qa>.9?'warn':''}">${num(Math.round(perAcct))}</div>
+        <div class=k>/ ${num(Math.round(perQ))} 사용상한 · 하드 500k${nkey>=2?` · 합산 ${num(d.calls)}/${num(d.quota)}`:''}</div></div>`;
   h += `<div class=card><div class=k>실패율</div><div class="v ${errRate>.05?'bad':errRate>.02?'warn':'ok'}">${pct(errRate)}</div>
         <div class=k>${Object.entries(s.errors).map(([k,v])=>k+'×'+v).join(' ')||'없음'}</div></div>`;
   h += `<div class=card><div class=k>마지막 관측</div><div class=v id=lastobs>—</div>
