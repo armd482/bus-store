@@ -36,20 +36,37 @@ STATE = {"errors": {}}
 LOCK = __import__("threading").Lock()
 
 
-def load_key():
+def _load_key(envname):
     """자기 폴더의 .env 를 먼저 본다 — launchd 는 ~/Desktop 을 못 읽는다(macOS TCC)."""
-    key = os.environ.get("GBIS_BUS_KEY")
-    if key:
-        return key
+    v = os.environ.get(envname)
+    if v:
+        return v
     for p in (os.path.join(O.HERE, ".env"),
               os.path.join(O.HERE, "..", "..", "bus-test", ".env.local")):
         try:
             for line in open(p, encoding="utf-8"):
-                if line.strip().startswith("GBIS_BUS_KEY="):
+                if line.strip().startswith(envname + "="):
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
         except OSError:
             continue
     return None
+
+
+def load_key():
+    return _load_key("GBIS_BUS_KEY")
+
+
+def load_keys():
+    """config.busKeys(env 변수명 목록) → 실제 키 리스트. 없는 건 건너뛴다.
+
+    ★ TAGO 세션 30·rate 한도는 **키(=계정) 단위**다 (✅ 2026-07-23 실측: 같은 EC2
+    IP 에서 키1·키2 를 나란히 던져 처리량 2.16배, 키2 는 429 0건). 두 키를 쓰면
+    같은 IP 로도 동시 세션 60·처리량 2배 → 커버 속도 2배, 수집 기간 절반.
+    쿼터도 계정마다 별개라 두 배가 된다.
+    """
+    names = O.cfg().get("busKeys") or ["GBIS_BUS_KEY"]
+    out = [(nm, _load_key(nm)) for nm in names]
+    return [(nm, k) for nm, k in out if k]
 
 
 def now():
@@ -130,6 +147,32 @@ def paced(fn, items, rate, workers, max_inflight):
     return out
 
 
+def fetch_all(keys, picked, rate, workers, inflight):
+    """picked 를 키 수만큼 라운드로빈으로 나눠 **각 키로 병렬 paced**.
+
+    세션·rate 한도가 키 단위라(load_keys 참조) 키마다 독립 세마포어·독립 rate 로
+    돌린다 → 같은 IP 로도 동시성이 키 수만큼 곱해진다. 반환은 (routeid, items, err)
+    리스트 (picked 순서와 무관 — 호출부가 routeid 로 매핑).
+    """
+    if len(keys) == 1:
+        _, key = keys[0]
+        return paced(lambda p: fetch(key, p["cityCode"], p["routeid"]),
+                     picked, rate, workers, inflight)
+    groups = [picked[i::len(keys)] for i in range(len(keys))]   # 균등 라운드로빈
+    parts = [None] * len(keys)
+
+    def worker(idx):
+        _, key = keys[idx]
+        parts[idx] = paced(lambda p: fetch(key, p["cityCode"], p["routeid"]),
+                           groups[idx], rate, workers, inflight)
+    ths = [__import__("threading").Thread(target=worker, args=(i,)) for i in range(len(keys))]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    return [r for part in parts for r in part]
+
+
 def fetch(key, city, routeid):
     """⚠️ 실패가 HTTP 200 으로 온다. resultCode 를 반드시 볼 것.
 
@@ -165,8 +208,8 @@ def fetch(key, city, routeid):
 
 
 def main():
-    key = load_key()
-    if not key:
+    keys = load_keys()
+    if not keys:
         sys.exit("GBIS_BUS_KEY 없음")
 
     k = O.cfg()
@@ -201,7 +244,11 @@ def main():
             target=O.rotate_jsonl, args=("bus",), daemon=True).start()
 
     print(f"[{now():%H:%M:%S}] 수집 시작 · 목표 {target}샘플 · 밴드 {nb}개 · "
-          f"최대 {maxr}노선 · 상한 {quota:,} (오늘 {read_calls(quota_day(now())):,} 사용)", flush=True)
+          f"최대 {maxr}노선 · 키 {len(keys)}개({', '.join(nm for nm, _ in keys)}) · "
+          f"상한 {quota:,} (오늘 {read_calls(quota_day(now())):,} 사용)", flush=True)
+    if len(keys) < 2:
+        print(f"[{now():%H:%M:%S}] ⚠️ 키 1개 — maxRoutes {maxr} 를 단일 세션풀로 돌리면 "
+              f"사이클이 길어진다. GBIS_BUS_KEY2 를 .env 에 넣으면 커버 속도 2배", flush=True)
 
     while True:
         t = now()
@@ -272,7 +319,7 @@ def main():
         with LOCK:
             STATE["fetching"] = True
         meta = {p["routeid"]: p for p in picked}
-        results = paced(lambda p: fetch(key, p["cityCode"], p["routeid"]), picked, rate, workers, inflight)
+        results = fetch_all(keys, picked, rate, workers, inflight)
         calls = len(picked)
 
         # code99(세션 고갈)는 일시적이다 — 꼬리 지연이 세션 30개를 채우는 순간에만
@@ -292,9 +339,7 @@ def main():
             rinflight = max(6, inflight // 2) if has99 else inflight
             time.sleep(pause)
             retry = {rid: (rid, items, err)
-                     for rid, items, err in paced(
-                         lambda p: fetch(key, p["cityCode"], p["routeid"]),
-                         failed, rate, workers, rinflight)}
+                     for rid, items, err in fetch_all(keys, failed, rate, workers, rinflight)}
             calls += len(failed)
             results = [retry.get(r[0], r) if r[2] else r for r in results]
 
