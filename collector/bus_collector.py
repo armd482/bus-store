@@ -106,7 +106,7 @@ def add_calls(day, n):
     return v
 
 
-def paced(fn, items, rate, workers, max_inflight):
+def paced(fn, items, rate, workers, max_inflight, hold=0):
     """제약이 둘이라 방어도 둘이다 — 버스트(rate) 와 동시 세션(in-flight).
 
     ① 버스트 — 제출을 1/rate 간격으로 벌린다.
@@ -126,13 +126,26 @@ def paced(fn, items, rate, workers, max_inflight):
            그래서 실패가 평균이 아니라 꼬리에서 터졌다 (170노선 사이클 3.5%).
        세마포어를 걸면 응답이 얼마나 느려지든 세션은 안 넘는다. 대신 느려지면
        제출이 알아서 막혀 사이클이 길어진다 — 데이터를 버리는 것보다 낫다.
+
+    ③ ★ 좀비 세션 — ②의 가정("release=세션 닫힘")은 **타임아웃에서 깨진다**.
+       우리가 15s 에 포기해도 TAGO 는 그 요청을 모른다 → 세션이 서버 쪽에 살아
+       있다(좀비). 슬롯을 곧장 반납하면 다음 요청이 아직 살아있는 세션 위에 쌓여
+       (우리 18 + 좀비 N) > 30 → code99 (✅ 2026-07-24: TAGO 지연 시 1~2노선 잔여).
+       그래서 **타임아웃난 슬롯은 hold 초만큼 붙잡았다 반납**한다 — 세마포어
+       카운트를 실제 TAGO 세션에 맞춘다. 타임아웃이 몰리면 그만큼 슬롯이 잠겨
+       동시성이 자동으로 준다(정확히 필요한 반응). 회복되면 저절로 풀린다.
     """
     sem = __import__("threading").Semaphore(max_inflight)
 
     def guarded(it):
+        r = None
         try:
-            return fn(it)
+            r = fn(it)
+            return r
         finally:
+            # 타임아웃이면 좀비가 TAGO 에서 빠질 시간(hold)만큼 슬롯을 더 붙잡는다.
+            if hold and r is not None and r[2] and ("Timeout" in r[2] or "timed out" in r[2]):
+                time.sleep(hold)
             sem.release()
 
     out = [None] * len(items)
@@ -147,7 +160,7 @@ def paced(fn, items, rate, workers, max_inflight):
     return out
 
 
-def fetch_all(keys, picked, rate, workers, inflight):
+def fetch_all(keys, picked, rate, workers, inflight, hold=0):
     """picked 를 키 수만큼 라운드로빈으로 나눠 **각 키로 병렬 paced**.
 
     세션·rate 한도가 키 단위라(load_keys 참조) 키마다 독립 세마포어·독립 rate 로
@@ -157,14 +170,14 @@ def fetch_all(keys, picked, rate, workers, inflight):
     if len(keys) == 1:
         _, key = keys[0]
         return paced(lambda p: fetch(key, p["cityCode"], p["routeid"]),
-                     picked, rate, workers, inflight)
+                     picked, rate, workers, inflight, hold)
     groups = [picked[i::len(keys)] for i in range(len(keys))]   # 균등 라운드로빈
     parts = [None] * len(keys)
 
     def worker(idx):
         _, key = keys[idx]
         parts[idx] = paced(lambda p: fetch(key, p["cityCode"], p["routeid"]),
-                           groups[idx], rate, workers, inflight)
+                           groups[idx], rate, workers, inflight, hold)
     ths = [__import__("threading").Thread(target=worker, args=(i,)) for i in range(len(keys))]
     for t in ths:
         t.start()
@@ -218,6 +231,7 @@ def main():
     interval, quota, maxr = k["intervalSec"], k["dailyQuota"], k["maxRoutes"]
     workers, rate = k["maxWorkers"], k["dispatchRate"]
     inflight_max = k["maxInflight"]
+    hold = k.get("busZombieHoldSec", 10)   # 타임아웃 슬롯을 붙잡을 초 (paced ③)
     # ★ in-flight 를 사이클마다 TAGO 상태에 맞춰 조절한다 (AIMD — 혼잡제어와 같은 꼴).
     #   code99(세션 30 초과)가 보이면 다음 사이클 in-flight 를 줄이고(×0.6), 깨끗한
     #   사이클이면 조금씩 올린다(+2). TAGO 가 느려지면 자동으로 물러나고 회복되면
@@ -319,7 +333,7 @@ def main():
         with LOCK:
             STATE["fetching"] = True
         meta = {p["routeid"]: p for p in picked}
-        results = fetch_all(keys, picked, rate, workers, inflight)
+        results = fetch_all(keys, picked, rate, workers, inflight, hold)
         calls = len(picked)
 
         # code99(세션 고갈)는 일시적이다 — 꼬리 지연이 세션 30개를 채우는 순간에만
@@ -339,7 +353,7 @@ def main():
             rinflight = max(6, inflight // 2) if has99 else inflight
             time.sleep(pause)
             retry = {rid: (rid, items, err)
-                     for rid, items, err in fetch_all(keys, failed, rate, workers, rinflight)}
+                     for rid, items, err in fetch_all(keys, failed, rate, workers, rinflight, hold)}
             calls += len(failed)
             results = [retry.get(r[0], r) if r[2] else r for r in results]
 
