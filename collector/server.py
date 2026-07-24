@@ -682,7 +682,8 @@ function renderSubway(d){
   if(!sub || !sub.present)
     return '<div class=sub>이 서버엔 지하철 수집기가 없다 (subway_collector 미탑재).</div>';
   if(!sub.started)
-    return '<div class=sub>지하철 수집기가 아직 안 돎 — <code>.env</code> 에 SEOUL_SUBWAY_KEY(·KEY2) 를 넣고 '
+    return '<div class=sub>지하철 수집기가 아직 안 돎 — <code>.env</code> 에 config.subwayKeys의 '
+      + 'SEOUL_SUBWAY_KEY~KEY5를 넣고 '
       + 'systemd 유닛(findpath-subway)을 걸 것. §8 #1(지하철 정시성)이 프로젝트 존폐 항목이라 우선순위가 높다.</div>';
   const KOD = {mon:'월',tue:'화',wed:'수',thu:'목',fri:'금',sat:'토',sun:'일'};
   const D7 = ['mon','tue','wed','thu','fri','sat','sun'];
