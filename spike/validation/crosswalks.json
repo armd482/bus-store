@@ -1,0 +1,7 @@
+{
+  "_note": "S1~S5 경로에 걸린 횡단보도만. dist_m=횡단거리, cycle=주기(초), green=보행녹색(초). 측정법은 MEASUREMENT.md 참조. 아래 cw_A/B/C 는 S4 데모용 예시값 — 실측으로 교체.",
+
+  "cw_A": {"dist_m": 18, "cycle": 95,  "green": 20},
+  "cw_B": {"dist_m": 22, "cycle": 120, "green": 25},
+  "cw_C": {"dist_m": 18, "cycle": 110, "green": 22}
+}

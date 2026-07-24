@@ -1,0 +1,56 @@
+[
+  {
+    "id": "S4",
+    "_desc": "6211 클린 플립 (데모 — 실측으로 교체). depart 후 횡단보도 3개에서 실제로 신호 대기가 길어 이른 6211(08:14)을 놓치고 08:25 탑승. OTP(S15)는 낙관적 15초로 08:14 탑승을 예측(틀림), 제품(Sm)은 기대대기로 08:25를 예측(맞음).",
+    "depart": "08:05",
+    "fixed_s": 0,
+    "walk": {
+      "segments": [
+        {"dist_m": 220, "crossings": []},
+        {"dist_m": 200, "crossings": ["cw_A"]},
+        {"dist_m": 200, "crossings": ["cw_B", "cw_C"]}
+      ]
+    },
+    "timetable": ["08:14", "08:25", "08:36"],
+    "observed_connection": "08:25",
+    "s15_prediction": "08:14 (11분 걸어 이른 차 예측 — 실측과 어긋남)"
+  },
+
+  {
+    "id": "S1",
+    "_desc": "실측으로 채울 것. 아래는 스키마.",
+    "depart": "",
+    "fixed_s": 0,
+    "walk": {"segments": [{"dist_m": 0, "crossings": []}]},
+    "timetable": [],
+    "observed_connection": "",
+    "s15_prediction": ""
+  },
+  {
+    "id": "S2",
+    "depart": "",
+    "fixed_s": 0,
+    "walk": {"segments": [{"dist_m": 0, "crossings": []}]},
+    "timetable": [],
+    "observed_connection": "",
+    "s15_prediction": ""
+  },
+  {
+    "id": "S3",
+    "depart": "",
+    "fixed_s": 0,
+    "walk": {"segments": [{"dist_m": 0, "crossings": []}]},
+    "timetable": [],
+    "observed_connection": "",
+    "s15_prediction": ""
+  },
+  {
+    "id": "S5",
+    "depart": "",
+    "fixed_s": 0,
+    "walk": {"segments": [{"dist_m": 0, "crossings": []}]},
+    "timetable": [],
+    "observed_connection": "",
+    "s15_prediction": ""
+  }
+]
