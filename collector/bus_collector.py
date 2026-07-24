@@ -27,7 +27,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import orchestrator as O
-import env_config as E
 
 BASE = "https://apis.data.go.kr/1613000/BusLcInfoInqireService/getRouteAcctoBusLcList"
 REPICK_EVERY = 40  # 사이클마다 정기 재선정 (~30분). 밴드가 바뀌면 그 즉시도 재선정한다
@@ -41,9 +40,19 @@ _CALL_LOCK = __import__("threading").Lock()
 
 
 def _load_key(envname):
-    """환경변수 → collector/.env → 루트 .env 순으로 읽는다."""
-    fallback = "DATA_GO_KR_KEY" if envname == "GBIS_BUS_KEY" else None
-    return E.get(envname, fallback)
+    """자기 폴더의 .env 를 먼저 본다 — launchd 는 ~/Desktop 을 못 읽는다(macOS TCC)."""
+    v = os.environ.get(envname)
+    if v:
+        return v
+    for p in (os.path.join(O.HERE, ".env"),
+              os.path.join(O.HERE, "..", "..", "bus-test", ".env.local")):
+        try:
+            for line in open(p, encoding="utf-8"):
+                if line.strip().startswith(envname + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            continue
+    return None
 
 
 def load_key():
