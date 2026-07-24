@@ -1256,8 +1256,13 @@ def rebuild(force, shrink_ok=False):
     c.execute("DROP TABLE route_service_day_stage")
     c.execute("DROP TABLE included_stage")
     c.commit()
+    # 대규모 스테이징/교체가 수백 MB WAL을 남기지 않게 즉시 본 DB로 접고 비운다.
+    # rebuild는 수집기를 멈춘 상태에서 실행하는 명령이라 reader가 없어야 정상이다.
+    ck = c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     print(f"재계산 완료: 파일 {len(files)}개 → 관측 {total:,}건 · 셀 {ncell:,}개 "
           f"(이전 장부 {old:,}건" + (f" · 깨진 줄 {bad}" if bad else "") + ")")
+    if ck and ck[0]:
+        print(f"⚠️ WAL 체크포인트 보류: {ck}", flush=True)
     print("수집기가 돌고 있었다면 재시작할 것.")
 
 
