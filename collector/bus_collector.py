@@ -29,7 +29,9 @@ from datetime import datetime, timedelta
 import orchestrator as O
 
 BASE = "https://apis.data.go.kr/1613000/BusLcInfoInqireService/getRouteAcctoBusLcList"
-REPICK_EVERY = 120  # 사이클마다 노선 재선정 (약 1시간)
+REPICK_EVERY = 40  # 사이클마다 정기 재선정 (~30분). 밴드가 바뀌면 그 즉시도 재선정한다
+                   # — 현재 밴드·요일 부족량으로 고르므로(pick_routes) 패널을 오래 고정하면
+                   # 밴드가 넘어간 뒤 옛 밴드를 계속 노려 목적함수가 무력화된다 [리뷰 R2].
 
 # server.py 가 대시보드용으로 주입한다. 단독 실행 시엔 로컬 더미.
 STATE = {"errors": {}}
@@ -251,6 +253,7 @@ def main():
     #    가드가 대부분 걸러주지만, 순번이 우연히 증가 방향이면 통과한다.
     last = {}
     picked, cyc, written = [], 0, 0
+    picked_band = None   # 마지막 재선정 시각의 밴드 — 밴드가 바뀌면 즉시 재선정
 
     rotated_day = None   # 로테이션을 마친 운행일 — 하루 한 번만 돌게
 
@@ -309,8 +312,12 @@ def main():
         #    상한보다 적은 게 정상이라, 그 조건이면 밤새 사이클마다 무거운 커버리지
         #    쿼리(cell 전체 GROUP BY)를 돌리고 로그도 도배된다. 모자랄 땐
         #    10사이클(~7분)마다만 다시 본다 — 새벽 운행 재개도 그 안에 잡힌다.
-        if not picked or cyc % REPICK_EVERY == 0 or (len(picked) < want and cyc % 10 == 0):
+        cur_band = O.band_of(t, bands)
+        band_changed = picked and cur_band != picked_band   # 밴드 경계 넘음 → 부족량이 통째로 바뀐다
+        if (not picked or band_changed or cyc % REPICK_EVERY == 0
+                or (len(picked) < want and cyc % 10 == 0)):
             picked = O.pick_routes(conn, want, target, nb, t=t)
+            picked_band = cur_band
             if not picked:
                 # ⚠️ 빈 풀과 완주를 구분한다. 안 그러면 새로 배포한 사람이
                 #    "모든 노선 완주"를 보고 정상인 줄 안다.
