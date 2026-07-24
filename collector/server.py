@@ -809,7 +809,7 @@ function renderSubway(d){
   h += '<div class=sub>① <b>시각 근접 매칭</b>으로 대조한다 — ✅ 실측상 실시간 <code>btrainNo</code>(숫자)와 '
     + '시각표 <code>열차코드</code>(S902/K802) 형식이 어긋나고 <b>신분당선 PDF엔 열차번호가 아예 없어</b> ID 조인이 불가능하다. '
     + '미매칭 비율도 같이 본다(그 자체가 "시각표를 안 지킨다"의 증거).<br>'
-    + '② 시각은 <code>t</code>(폴링, ±76초)가 아니라 <b><code>recptnDt</code></b>(BIS 수신, ~20초)를 쓴다 — '
+    + '② 시각은 <code>t</code>(동적 폴링, 보통 30~50초)가 아니라 <b><code>recptnDt</code></b>(BIS 수신, ~20초)를 쓴다 — '
     + '해상도가 신호보다 거칠면 못 잰다.<br>'
     + '③ 임계값은 배차 H 대비다: <b>오판율 ≈ 2σ/H</b> → σ≤0.05H 면 절벽 신뢰, σ≥0.3H 면 무의미. '
     + '"±30초"는 H=10분에서 나온 값이라 <b>노선별 H와 함께</b> 판정한다.<br>'
@@ -831,7 +831,7 @@ function paintObs(){
     el.innerHTML = (secs != null ? secs + '초 전' : '—')
       + (s.fetching ? ' <span class=tag style="background:#3b82f622;color:#3b82f6">데이터 요청 중</span>' : '');
   }
-  // 지하철 — 폴링 76s(키 수에 따라 더 김)라 300s 를 임계로. 운행 시간 밖이면 회색
+  // 지하철 — 동적 폴링(현재 보통 30~50s)이므로 300s를 정지 임계로 둔다. 운행 시간 밖이면 회색
   const se = document.getElementById('sublastobs');
   if(se && S.subway){
     const sub = S.subway;

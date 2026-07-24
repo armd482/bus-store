@@ -215,7 +215,8 @@ def mac_install():
         run(["launchctl", "enable", mac_target(label)], ok_fail=True)
         run(["launchctl", "bootstrap", f"gui/{os.getuid()}", mac_plist_path(label)], ok_fail=True)
     print("설치·시작됨 (버스+지하철+서울). 대시보드: http://localhost:877")
-    print("⚠️ 지하철은 .env 의 SEOUL_SUBWAY_KEY(·KEY2·KEY3)가 있어야 돈다")
+    print("⚠️ 지하철은 config.subwayKeys에 등록된 .env 키를 사용한다 "
+          "(현재 SEOUL_SUBWAY_KEY~KEY5)")
     maybe_follow(lambda: follow(os.path.join(d, "logs", "server.log")))
 
 
@@ -313,7 +314,8 @@ WantedBy=default.target
     for name, _, _ in LX_UNITS:
         run(["systemctl", "--user", "enable", "--now", name])
     print("설치·시작됨 (버스+지하철+서울). 대시보드: http://localhost:8080 (리눅스는 877이 특권 포트라 8080)")
-    print("⚠️ 지하철은 .env 의 SEOUL_SUBWAY_KEY(·KEY2·KEY3)가 있어야 돈다 — 없으면 로그에 '키 없음'")
+    print("⚠️ 지하철은 config.subwayKeys에 등록된 .env 키를 사용한다 "
+          "(현재 SEOUL_SUBWAY_KEY~KEY5) — 없는 키는 로그에 표시하고 건너뛴다")
     maybe_follow(lx_logs)
 
 
