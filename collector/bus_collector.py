@@ -125,15 +125,21 @@ def add_calls(day, n, keyid=None):
 
 
 def ensure_key_counters(keys, day):
-    """구버전 합계 장부만 있는 배포를 키별 장부로 한 번 마이그레이션."""
-    if not keys or any(read_calls(day, kid) for kid, _ in keys):
+    """구버전 합계 장부의 아직 미배분된 호출을 키별 장부로 마이그레이션.
+
+    배포 직후 fetch_routes가 KEY1 장부를 먼저 만들었어도 합계-키별합 잔여를
+    놓치지 않는다.
+    """
+    if not keys:
         return
-    old = read_calls(day)
-    if not old:
+    total = read_calls(day)
+    assigned = sum(read_calls(day, kid) for kid, _ in keys)
+    missing = max(0, total - assigned)
+    if not missing:
         return
-    q, r = divmod(old, len(keys))
+    q, r = divmod(missing, len(keys))
     for i, (kid, _) in enumerate(keys):
-        _write_calls(day, q + (i < r), kid)
+        _write_calls(day, read_calls(day, kid) + q + (i < r), kid)
 
 
 def paced(fn, items, rate, workers, max_inflight, hold=0):
