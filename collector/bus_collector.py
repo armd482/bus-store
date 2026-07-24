@@ -36,6 +36,7 @@ REPICK_EVERY = 40  # 사이클마다 정기 재선정 (~30분). 밴드가 바뀌
 # server.py 가 대시보드용으로 주입한다. 단독 실행 시엔 로컬 더미.
 STATE = {"errors": {}}
 LOCK = __import__("threading").Lock()
+_CALL_LOCK = __import__("threading").Lock()
 
 
 def _load_key(envname):
@@ -79,6 +80,11 @@ def service_day(t):
     return O.service_day_of(t).strftime("%Y-%m-%d")
 
 
+def next_inflight(current, maximum, saw99):
+    """AIMD 한 단계. 최초 실패가 재시도로 회복돼도 saw99=True를 전달한다."""
+    return max(8, int(current * 0.6)) if saw99 else min(maximum, current + 2)
+
+
 # ── 일 호출수는 디스크에 (KeepAlive 재시작해도 상한을 넘지 않게) ────────
 # ⚠️ 키는 운행일(04시 경계)이 아니라 **달력일**이다 — data.go.kr 쿼터가 자정에 리셋된다.
 #    운행일로 세면 04시에 카운터만 0이 되는데 API 는 00-04시 콜(~3.7만)을 이미 새 날로
@@ -88,24 +94,46 @@ def quota_day(t):
     return t.strftime("%Y-%m-%d")
 
 
-def calls_path(day):
-    return os.path.join(O.DATA, f".buscalls-{day}")
+def calls_path(day, keyid=None):
+    suffix = f"-{keyid}" if keyid else ""
+    return os.path.join(O.DATA, f".buscalls{suffix}-{day}")
 
 
-def read_calls(day):
+def read_calls(day, keyid=None):
     try:
-        return int(open(calls_path(day)).read().strip() or 0)
+        with open(calls_path(day, keyid)) as f:
+            return int(f.read().strip() or 0)
     except (OSError, ValueError):
         return 0
 
 
-def add_calls(day, n):
-    v = read_calls(day) + n
-    tmp = calls_path(day) + ".tmp"
+def _write_calls(day, n, keyid=None):
+    tmp = calls_path(day, keyid) + ".tmp"
     with open(tmp, "w") as f:
-        f.write(str(v))
-    os.replace(tmp, calls_path(day))
+        f.write(str(n))
+    os.replace(tmp, calls_path(day, keyid))
+
+
+def add_calls(day, n, keyid=None):
+    """호출 전 예약. keyid가 있으면 키별 장부와 호환용 합계 장부를 함께 올린다."""
+    with _CALL_LOCK:
+        v = read_calls(day, keyid) + n
+        _write_calls(day, v, keyid)
+        if keyid:
+            _write_calls(day, read_calls(day) + n)
     return v
+
+
+def ensure_key_counters(keys, day):
+    """구버전 합계 장부만 있는 배포를 키별 장부로 한 번 마이그레이션."""
+    if not keys or any(read_calls(day, kid) for kid, _ in keys):
+        return
+    old = read_calls(day)
+    if not old:
+        return
+    q, r = divmod(old, len(keys))
+    for i, (kid, _) in enumerate(keys):
+        _write_calls(day, q + (i < r), kid)
 
 
 def paced(fn, items, rate, workers, max_inflight, hold=0):
@@ -162,7 +190,7 @@ def paced(fn, items, rate, workers, max_inflight, hold=0):
     return out
 
 
-def fetch_all(keys, picked, rate, workers, inflight, hold=0):
+def fetch_all(keys, picked, rate, workers, inflight, hold=0, reserve=None):
     """picked 를 키 수만큼 라운드로빈으로 나눠 **각 키로 병렬 paced**.
 
     세션·rate 한도가 키 단위라(load_keys 참조) 키마다 독립 세마포어·독립 rate 로
@@ -170,14 +198,18 @@ def fetch_all(keys, picked, rate, workers, inflight, hold=0):
     리스트 (picked 순서와 무관 — 호출부가 routeid 로 매핑).
     """
     if len(keys) == 1:
-        _, key = keys[0]
+        kid, key = keys[0]
+        if reserve:
+            reserve(kid, len(picked))
         return paced(lambda p: fetch(key, p["cityCode"], p["routeid"]),
                      picked, rate, workers, inflight, hold)
     groups = [picked[i::len(keys)] for i in range(len(keys))]   # 균등 라운드로빈
     parts = [None] * len(keys)
 
     def worker(idx):
-        _, key = keys[idx]
+        kid, key = keys[idx]
+        if reserve:
+            reserve(kid, len(groups[idx]))
         parts[idx] = paced(lambda p: fetch(key, p["cityCode"], p["routeid"]),
                            groups[idx], rate, workers, inflight, hold)
     ths = [__import__("threading").Thread(target=worker, args=(i,)) for i in range(len(keys))]
@@ -231,9 +263,12 @@ def main():
         sys.exit("GBIS_BUS_KEY 없음")
 
     k = O.cfg()
+    key_cap = k.get("busKeyDailyCap", 480000)
     conn = O.connect()
     bands, target, nb = k["timebands"], k["targetSamples"], len(k["timebands"])
     interval, quota, maxr = k["intervalSec"], k["dailyQuota"], k["maxRoutes"]
+    configured_keys = len(k.get("busKeys") or ["GBIS_BUS_KEY"])
+    effective_maxr = max(1, maxr * len(keys) // max(1, configured_keys))
     workers, rate = k["maxWorkers"], k["dispatchRate"]
     inflight_max = k["maxInflight"]
     hold = k.get("busZombieHoldSec", 10)   # 타임아웃 슬롯을 붙잡을 초 (paced ③)
@@ -246,12 +281,14 @@ def main():
     window = k["serviceWindow"]
 
     day = service_day(now())
-    # (routeid, vehicleno) -> (nodeord, 그 정류장에서 처음 본 시각).
+    # (routeid, vehicleno) -> (nodeord, 관측시각, nodeid, route_version).
     # ⚠️ 키에 routeid 가 필요하다 — 같은 차량이 당일 다른 노선으로 재배차되면
     #    (경기 시내버스 운영에서 실제로 있다) 이전 노선의 nodeord 가 새 노선의
     #    전이 계산에 섞여 엉뚱한 구간 통과가 기록된다. ordv<=prev 와 4×interval
     #    가드가 대부분 걸러주지만, 순번이 우연히 증가 방향이면 통과한다.
     last = {}
+    route_versions = dict(conn.execute(
+        "SELECT routeid,currentVersion FROM route WHERE currentVersion IS NOT NULL"))
     picked, cyc, written = [], 0, 0
     picked_band = None   # 마지막 재선정 시각의 밴드 — 밴드가 바뀌면 즉시 재선정
 
@@ -264,8 +301,8 @@ def main():
             target=O.rotate_jsonl, args=("bus",), daemon=True).start()
 
     print(f"[{now():%H:%M:%S}] 수집 시작 · 목표 {target}샘플 · 밴드 {nb}개 · "
-          f"최대 {maxr}노선 · 키 {len(keys)}개({', '.join(nm for nm, _ in keys)}) · "
-          f"상한 {quota:,} (오늘 {read_calls(quota_day(now())):,} 사용)", flush=True)
+          f"최대 {effective_maxr}노선 · 키 {len(keys)}개({', '.join(nm for nm, _ in keys)}) · "
+          f"키당 상한 {key_cap:,} (오늘 합계 {read_calls(quota_day(now())):,} 사용)", flush=True)
     if len(keys) < 2:
         print(f"[{now():%H:%M:%S}] ⚠️ 키 1개 — maxRoutes {maxr} 를 단일 세션풀로 돌리면 "
               f"사이클이 길어진다. GBIS_BUS_KEY2 를 .env 에 넣으면 커버 속도 2배", flush=True)
@@ -274,6 +311,7 @@ def main():
         t = now()
         d = service_day(t)
         qday = quota_day(t)   # 쿼터는 달력일 — 운행일(d)과 자정~04시에 갈린다
+        ensure_key_counters(keys, qday)
         if d != day:
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d}", flush=True)
             day, last, written, picked = d, {}, 0, []
@@ -305,7 +343,7 @@ def main():
         #    실제로 도는 것만 남긴다. ✅ 실측상 01시에 도는 노선은 17~418개 사이인데
         #    (노선 소요시간을 몰라 추정 폭이 크다) 그걸 40 같은 숫자로 못 박으면
         #    05:16 까지 달리는 36번을 버리고 차고에 있는 낮 노선을 찍게 된다.
-        want = maxr
+        want = effective_maxr
 
         # 노선 재선정 — 채운 노선은 빠지고 미커버가 들어온다
         # ⚠️ len(picked) != want 로 매 사이클 재선정하지 않는다 — 심야엔 운행 노선이
@@ -334,8 +372,9 @@ def main():
             print(f"[{t:%H:%M:%S}] 노선 재선정: {len(picked)}개 "
                   f"(충전율 {picked[0]['fill']*100:.1f}% ~ {picked[-1]['fill']*100:.1f}%)", flush=True)
 
-        if read_calls(qday) + len(picked) > quota:
-            print(f"[{t:%H:%M:%S}] 일 상한 근접 — 대기", flush=True)
+        active_keys = [(kid, key) for kid, key in keys if read_calls(qday, kid) < key_cap]
+        if not active_keys or sum(max(0, key_cap-read_calls(qday, kid)) for kid, _ in active_keys) < len(picked):
+            print(f"[{t:%H:%M:%S}] 키별 일 상한 근접 — 대기", flush=True)
             time.sleep(300)
             continue
 
@@ -343,19 +382,22 @@ def main():
         with LOCK:
             STATE["fetching"] = True
         meta = {p["routeid"]: p for p in picked}
-        # ★ 쿼터는 호출 **전**에 예약 기록한다 [리뷰 R1 #4]. 사이클 도중 프로세스가
-        #   죽으면(자동 재시작) 이미 나간 콜이 장부에서 빠져 재시작 후 실제 API 사용량이
-        #   카운터보다 커지고, 반복되면 쿼터를 넘긴다. 조금 과다계상(죽어서 못 보낸 콜까지
-        #   센다)이 쿼터 초과보다 안전하다.
-        add_calls(qday, len(picked))
-        results = fetch_all(keys, picked, rate, workers, inflight, hold)
+        # 그룹별 호출 직전에 해당 키 장부를 예약한다. 한 키가 빠져도 다른 키의
+        # 소프트캡을 빌려 쓰지 않는다.
+        reserve = lambda kid, n: add_calls(qday, n, kid)
+        results = fetch_all(active_keys, picked, rate, workers, inflight, hold, reserve)
+        # 재시도로 성공 결과가 원본 결과를 대체해도 AIMD가 최초 code99를 잊지 않게
+        # 교체 전에 저장한다.
+        initial_saw99 = any("code99" in (err or "") for _, _, err, _ in results)
+        initial_errs = [err or "" for _, _, err, _ in results if err]
 
         # code99(세션 고갈)는 일시적이다 — 꼬리 지연이 세션 30개를 채우는 순간에만
         # 몰리고 몇 초 뒤엔 풀린다 (✅ 실측: 사이클별 실패 7→8→0). rate/inflight 를
         # 더 조이면 사이클만 길어지므로, 실패분만 잠깐 뒤에 한 번 더 흘린다.
         failed = [meta[rid] for rid, _, err, _ in results if err]
-        if failed and read_calls(qday) + len(failed) <= quota:
-            add_calls(qday, len(failed))   # 재시도도 호출 전에 예약 기록
+        retry_keys = [(kid, key) for kid, key in keys if read_calls(qday, kid) < key_cap]
+        retry_room = sum(key_cap-read_calls(qday, kid) for kid, _ in retry_keys)
+        if failed and retry_keys and retry_room >= len(failed):
             # ⚠️ 재시도를 곧장 20개 동시로 던지면 code99(세션 30 초과)가 재발한다.
             #    타임아웃난 요청은 우리가 포기해도 TAGO 쪽 세션이 살아 있어(좀비),
             #    새 20개 + 좀비 > 30 → code99 연쇄. 실제로 이 연쇄가 75/170 같은
@@ -368,7 +410,8 @@ def main():
             rinflight = max(6, inflight // 2) if has99 else inflight
             time.sleep(pause)
             retry = {rid: (rid, items, err, o)
-                     for rid, items, err, o in fetch_all(keys, failed, rate, workers, rinflight, hold)}
+                     for rid, items, err, o in fetch_all(
+                         retry_keys, failed, rate, workers, rinflight, hold, reserve)}
             results = [retry.get(r[0], r) if r[2] else r for r in results]
         cyc += 1
 
@@ -388,6 +431,8 @@ def main():
             hol = O.is_holiday(obs)
             O.mark_empty(conn, routeid, not items)   # 추정이 아니라 관측이 정한다
             moving += len(items)
+            if band is not None and not hol:
+                O.mark_service(conn, routeid, band, dtype, service_day(obs), bool(items))
             for b in items:
                 v, ordv = b.get("vehicleno"), b.get("nodeord")
                 try:
@@ -398,7 +443,9 @@ def main():
                     continue  # 차량번호 없음 — last[None] 으로 서로 다른 버스가 섞인다
                 vk = (routeid, v)          # 노선까지 포함해야 재배차 오염이 없다
                 prev = last.get(vk)
-                last[vk] = (ordv, obs)
+                nodeid = b.get("nodeid")
+                version = route_versions.get(routeid)
+                last[vk] = (ordv, obs, nodeid, version)
                 if prev is None or ordv <= prev[0]:
                     # 처음 보거나, 같은 정류장이거나, **역방향** — 역방향은 회차 아티팩트다:
                     # 종점 도착 후 재출발하면 ord 가 168→1 로 떨어진다 (✅ 실측 0.07%).
@@ -415,26 +462,30 @@ def main():
                 # 최소 필드만 저장한다 (행 381B → ~220B).
                 #   필수: 통과 구간 (t_prev, t] + 차량(소요시간 체인 키) + 노선/구간
                 #   참고: band/daytype — 행 단독 해석용. rebuild 는 t 에서 현 규칙으로 재계산
-                #   안전: nodeid — ord 는 노선 개편 시 흔들릴 수 있다
-                # routeno/routetp/cityCode/nodenm/좌표는 coverage.sqlite 의
-                # route 테이블에서 routeid 로 조인한다 — 행마다 반복 저장하지 않는다.
+                #   안전: 양 끝 nodeid + route_version — 노선 개편 뒤 ord 재해석 방지.
+                # 정류장명·좌표는 route_stop의 같은 version으로 조인한다.
                 rows.append({
                     "t": obs.isoformat(), "t_prev": prev[1].isoformat(),
                     "routeid": routeid, "vehicleno": v,
                     "from_ord": prev[0], "to_ord": ordv,
-                    "nodeid": b.get("nodeid"),
+                    "from_nodeid": prev[2], "to_nodeid": nodeid,
+                    # 하위 호환: 기존 분석기가 nodeid를 도착 정류장으로 읽는다.
+                    "nodeid": nodeid, "route_version": version or prev[3],
                     "band": band, "daytype": dtype,
                 })
                 if band is not None and not hol:
-                    # 장부는 **인접 구간 단위**로 계상한다. 2칸 이상 건너뛴 전이(5.2%)를
-                    # (31,33) 같은 비인접 셀로 넣으면 분모(인접 구간수 = nstops-1)와
-                    # 어긋나고, 정류장 간격이 짧아 늘 건너뛰어지는 구간은 영영 미충족으로
-                    # 남는다. 통과는 (t_prev, t] 안에서 전부 일어났으므로 사이의 각 인접
-                    # 구간에 1관측씩 준다 — 구간 폭이 넓은 관측일 뿐 거짓은 아니다.
-                    # 원본 행(jsonl)은 전이 그대로 둔다. rebuild 도 같은 분해를 쓴다.
                     sday = service_day(obs)   # 이 관측의 운행일 (n_days 계산용)
-                    for o in range(prev[0], ordv):
-                        bumps.append((routeid, o, o + 1, band, dtype, sday))
+                    # 정확한 셀 표본은 인접 정류장이고 시간대·운행일 경계를 넘지 않은
+                    # 전이뿐이다. 건너뜀/경계 관측은 span 장부로 분리한다.
+                    quality = O.transition_quality(prev[1], obs, prev[0], ordv, bands)
+                    if quality == "exact":
+                        bumps.append((routeid, prev[0], ordv, band, dtype, sday))
+                    else:
+                        gap = (obs-prev[1]).total_seconds()
+                        if quality == "skipped":
+                            quality = "censored" if ordv-prev[0] <= 3 else "implausible"
+                        O.bump_span(conn, routeid, prev[0], ordv, band, dtype, sday,
+                                    quality, gap)
 
         if rows:
             # 사이클이 04시 경계를 걸치면 노선별 응답시각에 따라 운행일이 갈린다.
@@ -452,12 +503,24 @@ def main():
         if bumps:
             for a in bumps:
                 O.bump(conn, *a)
+                O.mark_included_direct(conn, *a[:5])
         # bumps 가 없어도 커밋 — mark_empty 의 emptyStreak 갱신이 트랜잭션에 걸려 있다.
         # 조건부로 두면 전이 0건인 심야에 쓰기 트랜잭션이 몇 분씩 열린 채 유지되고
         # (WAL 비대 + 다른 쓰기 차단) 크래시 시 그 갱신들이 유실된다.
         conn.commit()
 
         took = time.time() - started
+        final_errs = [err for err, n in errs.items() for _ in range(n)]
+        all_health_errs = initial_errs + final_errs
+        O.record_health(
+            conn, qday, cur_band, len(picked), len(picked)-sum(errs.values()),
+            len(failed), sum(errs.values()),
+            sum("code99" in e for e in all_health_errs),
+            sum("Timeout" in e or "timed out" in e for e in all_health_errs),
+            sum("HTTP429" in e for e in all_health_errs),
+            sum(e.startswith("HTTP5") for e in all_health_errs),
+            took, inflight)
+        conn.commit()
         with LOCK:
             STATE["cycles"] = cyc
             STATE["lastObs"] = time.time()
@@ -467,6 +530,7 @@ def main():
             STATE["written"] = written
             STATE["errors"] = errs
             STATE["retried"] = len(failed)
+            STATE["rssMB"] = mem
             STATE["night"] = False
             STATE["fetching"] = False
             # 잔여 실패(재시도 후)만 이력에 남긴다 — 대시보드가 최근 오류 리스트로 보여준다.
@@ -494,17 +558,15 @@ def main():
             detail = " ".join(f"{k}×{v}" for k, v in sorted(errs.items(), key=lambda x: -x[1]))
             print(f"[{cyc_obs:%H:%M:%S}] ⚠️ 실패 {nerr}/{len(picked)} (재시도 후) — {detail}", flush=True)
         if cyc % 20 == 0:
-            print(f"[{cyc_obs:%H:%M:%S}] 콜 {read_calls(qday):,}/{quota:,}", flush=True)
+            detail = " ".join(f"{kid}={read_calls(qday,kid):,}/{key_cap:,}" for kid, _ in keys)
+            print(f"[{cyc_obs:%H:%M:%S}] 콜 {detail}", flush=True)
 
         # ★ 다음 사이클 in-flight 조절 (AIMD). code99 는 세션 30 초과라 곧장 물러나고
         #   (×0.6), 깨끗하면 천천히 차오른다(+2). errs 에 잔여 code99 가 없어도 이번
         #   사이클에서 code99 를 겪었을 수 있으므로 원본 results 로 판단한다.
-        saw99 = any("code99" in (err or "") for _, _, err, _ in results)
+        saw99 = initial_saw99 or any("code99" in (err or "") for _, _, err, _ in results)
         prev_inflight = inflight
-        if saw99:
-            inflight = max(8, int(inflight * 0.6))
-        elif inflight < inflight_max:
-            inflight = min(inflight_max, inflight + 2)
+        inflight = next_inflight(inflight, inflight_max, saw99)
         if inflight != prev_inflight:
             print(f"[{cyc_obs:%H:%M:%S}] in-flight {prev_inflight}→{inflight} "
                   f"({'code99 후퇴' if saw99 else '회복'})", flush=True)

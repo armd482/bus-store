@@ -281,6 +281,10 @@ def lx_unit_path(name="findpath"):
     return os.path.expanduser(f"~/.config/systemd/user/{name}.service")
 
 
+def lx_timer_path(name="findpath-routes"):
+    return os.path.expanduser(f"~/.config/systemd/user/{name}.timer")
+
+
 def lx_install():
     os.makedirs(os.path.dirname(lx_unit_path()), exist_ok=True)
     # ⚠️ --port 8080 필수 — 기본 877 은 특권 포트(<1024)라 리눅스 일반 유저는 bind 못 한다
@@ -306,6 +310,28 @@ MemoryMax=420M
 WantedBy=default.target
 """)
         run(["systemctl", "--user", "stop", name], ok_fail=True)  # 돌던 게 있으면 먼저 내리고
+    # 매주 노선·정류장 구조를 새 버전으로 스냅샷한다. 같은 TAGO 세션 풀을 쓰는
+    # 경기버스 수집기는 배타적으로 내리고, 성공/실패와 무관하게 다시 올린다.
+    with open(lx_unit_path("findpath-routes"), "w") as f:
+        f.write(f"""[Unit]
+Description=findpath weekly route metadata refresh
+[Service]
+Type=oneshot
+WorkingDirectory={HERE}
+ExecStartPre=systemctl --user stop findpath.service
+ExecStart={PY} fetch_routes.py
+ExecStopPost=systemctl --user start findpath.service
+""")
+    with open(lx_timer_path(), "w") as f:
+        f.write("""[Unit]
+Description=findpath weekly route metadata refresh timer
+[Timer]
+OnCalendar=Sun *-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=900
+[Install]
+WantedBy=timers.target
+""")
     kill_manual("install")   # nohup/screen 으로 띄운 것도 — 안 그러면 유닛과 중복으로 돈다
     ensure_pool(HERE)                                             # 풀이 비었으면 fetch_routes 부터
     user = os.environ.get("USER", "")
@@ -313,6 +339,7 @@ WantedBy=default.target
     run(["systemctl", "--user", "daemon-reload"])
     for name, _, _ in LX_UNITS:
         run(["systemctl", "--user", "enable", "--now", name])
+    run(["systemctl", "--user", "enable", "--now", "findpath-routes.timer"])
     print("설치·시작됨 (버스+지하철+서울). 대시보드: http://localhost:8080 (리눅스는 877이 특권 포트라 8080)")
     print("⚠️ 지하철은 config.subwayKeys에 등록된 .env 키를 사용한다 "
           "(현재 SEOUL_SUBWAY_KEY~KEY5) — 없는 키는 로그에 표시하고 건너뛴다")
@@ -322,6 +349,7 @@ WantedBy=default.target
 def lx_stop():
     for name, _, _ in LX_UNITS:
         run(["systemctl", "--user", "disable", "--now", name], ok_fail=True)
+    run(["systemctl", "--user", "disable", "--now", "findpath-routes.timer"], ok_fail=True)
     kill_manual()
     print("완전 종료 (버스+지하철+서울). 재부팅해도 안 살아난다 — 다시 켜려면: python3 service.py start")
 

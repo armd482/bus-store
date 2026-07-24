@@ -169,6 +169,7 @@ def seoul_snapshot():
             pass
 
     calls = seoul_collector.read_calls(qday)
+    failures = list(seoul_collector.load_failures(day).values())
     return {
         "present": True, "started": bool(R),
         "routes": len(R), "calls": calls, "cap": cap,
@@ -176,6 +177,7 @@ def seoul_snapshot():
         "written": written, "lastObs": last_epoch,
         "lastNo": last_no, "lastStn": last_stn,
         "curBand": cur,
+        "failures": failures,
         "bands": [{"i": i, "from": a, "to": b if b <= 24 else b - 24, "wrap": b > 24,
                    "done": per.get(i, 0), "total": len(R),
                    "pct": per.get(i, 0) / len(R) if R else 0,
@@ -322,8 +324,26 @@ def snapshot():
     # 요일 7종을 전부 분리한 뒤로 토·일은 더 이상 '병목'이 아니다 — 월~일 모두
     # 주 1회씩만 채워지는 동등한 처지다. 그래서 완성률 분모도 7요일 전체로 본다.
     ndays = 7
-    day_goal = nseg * nb           # 요일 하나 기준 — 요일별 진행률의 분모
-    goal = day_goal * ndays        # 전체 목표 셀 (구간 × 밴드 × 7요일)
+    absolute_day_goal = nseg * nb
+    absolute_goal = absolute_day_goal * ndays
+    # 실제 차량이 관측된 노선×요일×밴드만 도달 가능 분모로 쓴다.
+    with _DB_LOCK:
+        eligible_rows = c.execute("""
+          SELECT rs.daytype,rs.band,COALESCE(SUM(MAX(r.nstops-1,0)),0)
+          FROM route_service rs JOIN route r ON r.routeid=rs.routeid
+          WHERE rs.status='eligible'
+          GROUP BY rs.daytype,rs.band""").fetchall()
+        availability = dict(c.execute(
+            "SELECT status,COUNT(*) FROM route_service GROUP BY status").fetchall())
+        span_rows = c.execute("""SELECT reason,COALESCE(SUM(n),0),
+                                COALESCE(SUM((to_ord-from_ord)*n),0),COALESCE(MAX(max_gap),0)
+                                FROM span GROUP BY reason""").fetchall()
+        included_seen, direct_seen = c.execute(
+            "SELECT COUNT(*),COALESCE(SUM(direct_n>0),0) FROM included_cell").fetchone()
+    eligible = {(d, b): n for d, b, n in eligible_rows}
+    eligible_by_day = {d: sum(n for (dd, _), n in eligible.items() if dd == d) for d in DAYS7}
+    goal = sum(eligible.values())
+    day_goal = eligible_by_day.get(O.day_type(datetime.now(O.KST)), 0)
 
     # 한 번의 스캔으로 — 백그라운드 캐시가 계산하므로 셀 수백만이어도 괜찮다.
     # ★ 완료 = n>=target AND n_days>=minDays (같은 날 완주 방지 — 외부 리뷰)
@@ -343,12 +363,13 @@ def snapshot():
             "SELECT band, SUM(n), COUNT(*) FROM cell WHERE daytype=? GROUP BY band",
             (today,)).fetchall()}
     band_rows = []
-    band_need = nseg * tgt  # 이 요일·밴드에서 채워야 할 관측 수 = 구간수 × 목표샘플
     for i, (a, b) in enumerate(bands):
         n, cells = byband.get(i, (0, 0))
+        band_goal = eligible.get((today, i), 0)
+        band_need = band_goal * tgt
         band_rows.append({
             "i": i, "from": a, "to": b if b <= 24 else b - 24, "wrap": b > 24,
-            "obs": n, "cells": cells, "need": band_need,
+            "obs": n, "cells": cells, "goal": band_goal, "need": band_need,
             "pct": n / band_need if band_need else 0,
             "peak": (a, b) in ((7, 9), (17, 20)),
         })
@@ -367,69 +388,81 @@ def snapshot():
                FROM cell GROUP BY daytype""",
             (tgt, md, tgt, md, tgt, md)).fetchall()
     for d, n, cells, full, fill_n, day_fill_n, sample_ready, date_ready in day_rows:
+        dgoal = eligible_by_day.get(d, 0)
         byday[d] = {
             "obs": n, "cells": cells, "done": full,
-            "pct": full / day_goal if day_goal else 0,
+            "goal": dgoal,
+            "absoluteGoal": absolute_day_goal,
+            "pct": full / dgoal if dgoal else 0,
             # 이진 완료율은 2주차 전까지 0에 가까워 고장처럼 보인다. 표본 건수와
             # 날짜 다양성이 각각 얼마나 차는지 연속 진행률도 함께 제공한다.
             "fillN": fill_n,
-            "fillPct": fill_n / (day_goal * tgt) if day_goal else 0,
+            "fillPct": fill_n / (dgoal * tgt) if dgoal else 0,
             "dayFillN": day_fill_n,
-            "dayFillPct": day_fill_n / (day_goal * md) if day_goal else 0,
+            "dayFillPct": day_fill_n / (dgoal * md) if dgoal else 0,
             "sampleReady": sample_ready,
             "dateReady": date_ready,
         }
+    for d in DAYS7:
+        byday.setdefault(d, {
+            "obs": 0, "cells": 0, "done": 0, "goal": eligible_by_day.get(d, 0),
+            "absoluteGoal": absolute_day_goal, "pct": 0, "fillN": 0, "fillPct": 0,
+            "dayFillN": 0, "dayFillPct": 0, "sampleReady": 0, "dateReady": 0,
+        })
 
     # 쿼터는 달력일 키다 (data.go.kr 자정 리셋) — 운행일(service_day)이 아니다
-    calls = bus_collector.read_calls(bus_collector.quota_day(datetime.now(O.KST))) if bus_collector else 0
+    qday = bus_collector.quota_day(datetime.now(O.KST)) if bus_collector else None
+    calls = 0
+    bus_key_calls = []
+    if bus_collector:
+        cap = k.get("busKeyDailyCap", 480000)
+        for kid in (k.get("busKeys") or ["GBIS_BUS_KEY"]):
+            if bus_collector._load_key(kid):
+                bus_key_calls.append({"id": kid, "calls": bus_collector.read_calls(qday, kid),
+                                      "cap": cap})
+        calls = sum(x["calls"] for x in bus_key_calls)
+    with _DB_LOCK:
+        health_rows = c.execute("""SELECT attempted,successful,retried,residual,code99,timeouts,
+                                  http429,http5xx,duration,inflight
+                                  FROM collector_health_cycle WHERE day=? ORDER BY duration""",
+                                (qday or "",)).fetchall()
+    def hpct(pos):
+        return health_rows[min(len(health_rows)-1, int((len(health_rows)-1)*pos))][8] if health_rows else 0
+    health = {
+        "cycles": len(health_rows),
+        "attempted": sum(r[0] for r in health_rows), "successful": sum(r[1] for r in health_rows),
+        "retried": sum(r[2] for r in health_rows), "residual": sum(r[3] for r in health_rows),
+        "code99": sum(r[4] for r in health_rows), "timeouts": sum(r[5] for r in health_rows),
+        "http429": sum(r[6] for r in health_rows), "http5xx": sum(r[7] for r in health_rows),
+        "p50": hpct(.50), "p95": hpct(.95), "p99": hpct(.99),
+        "maxInflight": max((r[9] for r in health_rows), default=0),
+    }
 
     with LOCK:
         st = dict(STATE)
         st["errors"] = dict(STATE["errors"])
         st["errLog"] = list(STATE.get("errLog", []))  # 락 밖 직렬화 중 수집기 append 와 경합 방지
 
-    # 남은 기간 — 밴드별 천장 도달 시점의 [최소, 최대] 범위.
+    # 남은 기간 — 현재까지 실측된 도달 가능 셀을 직접 표본으로 채우는 ETA.
     #
     # 속도: 최근 1~2 운행일 jsonl 크기 기반 (⚠️ 이전 판 버그 — total(역대 전체) ÷
     # elapsed(재시작 후)라서 재시작마다 뻥튀기, 실제 ~100일이 24.9일로 표시됐다).
     #
-    # 구조: (밴드, 요일) 셀은 그 요일(주 1회)에만 채워지고, 운행 구조상 천장이 있다
-    # (새벽·심야 ~82%, 낮 ~90% — 운행 안 하는 시간대의 셀은 영원히 빈다).
-    # 밴드마다 "천장까지 몇 주"를 계산해 범위를 만든다. 단 안정화 두 겹:
-    #  ① 측정 창이 1일 미만이면(방금 시작) '측정 중' — per_day 가 몇 시간치라 요동친다.
-    #  ② 상한은 중앙값의 3배 이내 밴드의 최대치 — 데이터가 거의 없는 밴드 하나가
-    #     max 를 305일처럼 튀게 하던 것을 자른다 (밴드 7개라 퍼센타일은 부정확).
+    # 고정 82%/90% 천장은 제거했다. route_service의 실측 운행 마스크를 분모로 쓰며,
+    # 측정 창이 하루 미만이면 속도 추정이 요동치므로 ETA만 보류한다.
     eta = eta_hi = None
     eta_measuring = False
     per_day, win_days = _obs_rate_per_day()
     if per_day and win_days < 1.0:
         eta_measuring = True                     # 표본은 있으나 창이 얇다
-    elif per_day:
+    elif per_day and goal:
         with _DB_LOCK:
-            band_tot = dict(c.execute(
-                "SELECT band, SUM(n) FROM cell GROUP BY band").fetchall())
-        tot_all = sum(band_tot.values())
-        need_bd = nseg * tgt                     # (밴드, 요일) 하나의 필요 관측 수
-        CEIL = {0: 0.82, nb - 1: 0.82}           # 04-07·20-04시 천장 — 나머지 0.90
-        weeks = []
-        for i in range(nb):
-            share = band_tot.get(i, 0) / tot_all if tot_all else 0  # 하루 관측 중 이 밴드 비중(실측 근사)
-            avg_pct = band_tot.get(i, 0) / (need_bd * 7)            # 7요일 평균 진행률
-            ceil = CEIL.get(i, 0.90)
-            if share > 0.02 and avg_pct < ceil:  # share≤2% 밴드는 표본 부족 — 제외
-                weekly_gain = per_day * share / need_bd             # 요일 하나 기준 주당 증가
-                weeks.append((ceil - avg_pct) / weekly_gain)
-        if weeks:
-            weeks.sort()
-            med = weeks[len(weeks) // 2]
-            cap = med * 3                                          # 이상치 컷 — 중앙값 3배
-            hi = max([w for w in weeks if w <= cap], default=weeks[0])
-            eta, eta_hi = weeks[0] * 7, hi * 7                     # 일 단위
-            # 날짜 다양성 완료조건의 물리적 하한. 같은 daytype은 주 1회만 오므로
-            # minDays개의 서로 다른 날짜를 채우는 데 최소 minDays주가 필요하다.
-            # 관측량 기반 ETA가 이보다 작게 나와도 달력상 달성할 수 없다.
-            date_floor = md * 7
-            eta, eta_hi = max(eta, date_floor), max(eta_hi, date_floor)
+            capped = c.execute("SELECT COALESCE(SUM(MIN(n,?)),0) FROM cell", (tgt,)).fetchone()[0]
+        remaining = max(0, goal * tgt - capped)
+        eta = remaining / per_day
+        eta_hi = eta
+        date_floor = md * 7
+        eta = eta_hi = max(eta, date_floor)
 
     # 공휴일 — 오늘이 공휴일이면 관측은 쌓이되 장부엔 안 들어간다. 그 사실이
     # 화면에 없으면 "수집은 도는데 진행률이 안 오른다"로 보여 고장으로 오인한다.
@@ -446,14 +479,31 @@ def snapshot():
         hol = {"count": 0, "source": None, "updated": None, "today": False, "next": None}
 
     return {
-        "routes": nroute, "segments": nseg, "goal": goal, "dayGoal": day_goal,
-        "dayNeed": nseg * nb * tgt,  # 요일 하나의 필요 관측 건수 = 밴드별 need × 밴드 수
+        "routes": nroute, "segments": nseg, "goal": goal, "absoluteGoal": absolute_goal,
+        "dayGoal": day_goal, "absoluteDayGoal": absolute_day_goal,
+        "dayNeed": day_goal * tgt,
         "target": tgt, "minDays": md,
         "done": done, "seen": seen, "total": total,
+        "availability": availability,
+        "span": {reason: {"events": n, "includedSegments": inc, "maxGap": max_gap}
+                 for reason, n, inc, max_gap in span_rows},
+        "includedCoverage": {
+            "cells": included_seen, "directCells": direct_seen,
+            "pct": included_seen / goal if goal else 0,
+        },
         "pct": done / goal if goal else 0,
         "bands": band_rows, "days": byday, "today": today, "nowBand": nowband,
-        "calls": calls, "quota": k["dailyQuota"], "holidays": hol,
+        "calls": calls, "quota": sum(x["cap"] for x in bus_key_calls), "busKeyCalls": bus_key_calls,
+        "health": health,
+        "storage": {
+            "dbMB": os.path.getsize(O.DB)/1048576 if os.path.exists(O.DB) else 0,
+            "walMB": os.path.getsize(O.DB+"-wal")/1048576 if os.path.exists(O.DB+"-wal") else 0,
+            "rssMB": st.get("rssMB"),
+        },
+        "holidays": hol,
         "maxRoutes": k.get("maxRoutes", 170),
+        "effectiveMaxRoutes": k.get("maxRoutes", 170) * len(bus_key_calls)
+                              // max(1, len(k.get("busKeys") or ["GBIS_BUS_KEY"])),
         "busKeys": len([n for n in (k.get("busKeys") or ["GBIS_BUS_KEY"])
                         if bus_collector and bus_collector._load_key(n)]) if bus_collector else 1,
         "state": st, "etaDays": eta, "etaDaysHi": eta_hi, "etaMeasuring": eta_measuring,
@@ -461,7 +511,7 @@ def snapshot():
         "seoul": seoul_snapshot(),
         "cfg": {kk: k[kk] for kk in
                 ("targetSamples", "maxRoutes", "dispatchRate",
-                 "intervalSec", "serviceWindow", "dailyQuota")},
+                 "intervalSec", "serviceWindow", "dailyQuota", "busKeyDailyCap")},
     }
 
 
@@ -541,31 +591,38 @@ function renderBus(d){
   // 규모 — 전역 헤더에 있던 것을 이 탭으로 옮겼다 (경기 전용 정보라서)
   const nkey = d.busKeys || 1;
   h += `<div class=sub>TAGO 위치정보 30초 폴링 · 경기 <b>${num(d.routes)}</b>노선 · `
-     + `${num(d.segments)}구간 · 목표 ${num(d.goal)}셀 × ${d.target}샘플 (구간 × 밴드 7 × 요일 7)`
-     + `<br>키 <b>${nkey}개</b>(계정 독립 세션·쿼터) · 사이클당 최대 <b>${num(d.maxRoutes||170)}</b>노선 폴링`
+     + `${num(d.segments)}구간 · 도달 가능 ${num(d.goal)}셀 / 이론 ${num(d.absoluteGoal)}셀 × ${d.target}샘플`
+     + `<br>키 <b>${nkey}개</b>(계정 독립 세션·쿼터) · 사이클당 최대 <b>${num(d.effectiveMaxRoutes||d.maxRoutes||170)}</b>노선 폴링`
      + (nkey>=2 ? ' — 세션·rate 가 키 단위라 커버 속도 ×'+nkey : '') + `</div>`;
   // 완성률
   h += `<div class=big>${pctFine(d.pct)}</div>`;
   const etaTxt = d.etaMeasuring ? ' · 남은 기간 <b>측정 중</b> (관측 하루치 쌓이면 표시)'
     : d.etaDays!=null ? ` · 남은 기간 약 <b>${Math.round(d.etaDays)}~${Math.round(d.etaDaysHi)}일</b>`
-       + ` (${(d.etaDays/7).toFixed(0)}~${(d.etaDaysHi/7).toFixed(0)}주 · 밴드별 천장 도달 기준)` : '';
+       + ` (${(d.etaDays/7).toFixed(0)}~${(d.etaDaysHi/7).toFixed(0)}주 · 현재 확인된 도달 가능 셀 기준)` : '';
   h += `<div class=sub>${num(d.done)} / ${num(d.goal)} 셀 충족${etaTxt}</div>`;
   h += bar(d.pct);
+  if((d.effectiveMaxRoutes||0) < (d.maxRoutes||0))
+    h += `<div class=sub style="color:#f59e0b">⚠️ 설정 키 일부가 없어 노선 상한을 ${num(d.maxRoutes)}→${num(d.effectiveMaxRoutes)}로 자동 축소했다.</div>`;
+  const av = d.availability || {}, sp = d.span || {};
+  const ic = d.includedCoverage || {};
+  h += `<div class=sub>운행 마스크: eligible ${num(av.eligible)} · unknown ${num(av.unknown)} · inactive 후보 ${num(av.inactive)}
+        · 절대 커버리지 ${pct(d.absoluteGoal?d.done/d.absoluteGoal:0)}<br>
+        포함 구간 커버리지 ${pct(ic.pct||0)} (${num(ic.cells)}/${num(d.goal)}셀; 직접+검열) ·
+        검열 전이: censored ${num((sp.censored||{}).events)}건 ·
+        implausible ${num((sp.implausible||{}).events)}건 · boundary ${num((sp.boundary||{}).events)}건
+        — 완성률에는 직접 인접 전이만 사용</div>`;
 
   // 건강
   const q = d.calls/d.quota;
   const errN = Object.values(s.errors).reduce((a,b)=>a+b,0);
   const errRate = s.picked ? errN/s.picked : 0;
-  // 쿼터는 **계정 단위**(각 50만 하드리밋). 합산 카운터라 균등 분배(fetch_all)를
-  // 전제로 계정당 = 합산/키수 로 환산해 보여준다. 계정 하나라도 50만에 부딪히면
-  // 그 계정 몫이 멈추므로, 계정당 값이 진짜 벽에 가까운지가 중요하다.
-  const perAcct = nkey>=2 ? d.calls/nkey : d.calls;
-  const perQ = nkey>=2 ? d.quota/nkey : d.quota;
-  const qa = perAcct/500000;   // 계정당 하드리밋 50만 대비
+  const bk = d.busKeyCalls || [];
+  const worst = bk.reduce((a,x)=>!a || x.calls/x.cap>a.calls/a.cap ? x : a, null);
+  const qa = worst ? worst.calls/worst.cap : 0;
   h += '<h2>건강 상태</h2><div class=grid>';
-  h += `<div class=card><div class=k>쿼터 ${nkey>=2?'(계정당)':''}</div>
-        <div class="v ${qa>.97?'bad':qa>.9?'warn':''}">${num(Math.round(perAcct))}</div>
-        <div class=k>/ ${num(Math.round(perQ))} 사용상한 · 하드 500k${nkey>=2?` · 합산 ${num(d.calls)}/${num(d.quota)}`:''}</div></div>`;
+  h += `<div class=card><div class=k>키별 쿼터 (최대 사용 키)</div>
+        <div class="v ${qa>.97?'bad':qa>.9?'warn':''}">${worst?num(worst.calls):'—'}</div>
+        <div class=k>${worst?worst.id+' / '+num(worst.cap):'키 없음'} · 합계 ${num(d.calls)}/${num(d.quota)}</div></div>`;
   h += `<div class=card><div class=k>실패율</div><div class="v ${errRate>.05?'bad':errRate>.02?'warn':'ok'}">${pct(errRate)}</div>
         <div class=k>${Object.entries(s.errors).map(([k,v])=>k+'×'+v).join(' ')||'없음'}</div></div>`;
   h += `<div class=card><div class=k>마지막 관측</div><div class=v id=lastobs>—</div>
@@ -579,6 +636,19 @@ function renderBus(d){
         <div class="v ${HOL.today?'warn':''}">${HOL.today?'오늘 해당':'평상일'}</div>
         <div class=k>${HOL.count||0}일 등록 · 출처 ${HOL.source||'없음'}${HOL.next?' · 다음 '+HOL.next:''}</div></div>`;
   h += '</div>';
+  if(bk.length)
+    h += '<div class=sub>키별 실제 호출: '
+      + bk.map(x=>`<code>${x.id}</code> ${num(x.calls)}/${num(x.cap)}`).join(' · ') + '</div>';
+  const hh = d.health || {};
+  if(hh.cycles)
+    h += `<div class=sub>영속 품질(오늘 ${num(hh.cycles)}사이클): 성공 ${num(hh.successful)}/${num(hh.attempted)}
+      · 재시도 ${num(hh.retried)} · 잔여실패 ${num(hh.residual)}
+      · code99 ${num(hh.code99)} · timeout ${num(hh.timeouts)} · 429 ${num(hh.http429)} · 5xx ${num(hh.http5xx)}
+      · 사이클 p50/p95/p99 ${hh.p50.toFixed(1)}/${hh.p95.toFixed(1)}/${hh.p99.toFixed(1)}초
+      · 최대 in-flight ${num(hh.maxInflight)}</div>`;
+  const ss = d.storage || {};
+  h += `<div class=sub>자원: 수집기 RSS ${ss.rssMB!=null?ss.rssMB.toFixed(0)+'MB':'—'}
+        · SQLite ${Number(ss.dbMB||0).toFixed(1)}MB · WAL ${Number(ss.walMB||0).toFixed(1)}MB</div>`;
   if(HOL.today)
     h += '<div class=sub style="color:#f59e0b">⚠️ 오늘은 공휴일 — 관측은 그대로 jsonl 에 쌓이지만 '
        + '장부(셀)에는 넣지 않는다. 휴일 다이어라 요일 표본을 오염시키기 때문. '
@@ -586,7 +656,7 @@ function renderBus(d){
 
   // 밴드 — 지금 채워지는 요일의 **누적** (모든 주의 해당 요일 합).
   const KO = {mon:'월',tue:'화',wed:'수',thu:'목',fri:'금',sat:'토',sun:'일'};
-  h += `<h2>밴드별 — <b>${KO[d.today]||'?'}요일</b> 누적 (모든 주 합산 · 04시에 다음 요일로 전환)</h2>`;
+  h += `<h2>밴드별 — <b>${KO[d.today]||'?'}요일</b> 직접 관측 누적 (공휴일·건너뜀·경계 제외)</h2>`;
   for(const b of d.bands){
     const label = `${String(b.from).padStart(2,'0')}-${String(b.to).padStart(2,'0')}시`;
     const cur = d.nowBand!=null && b.i===d.nowBand;
@@ -599,13 +669,16 @@ function renderBus(d){
   h += `<h2>요일별 완성률 (전부 분리)</h2>
         <div class=sub>엄격 완료 = 셀당 관측 ${d.target}건 + 서로 다른 같은 요일 ${d.minDays||2}일.
         첫 주에는 표본이 쌓여도 날짜 조건 때문에 충족 셀이 0인 것이 정상이다.
-        아래 표본·날짜 충전률로 실제 진행을 함께 본다.</div><table>`;
+        분모는 실제 차량이 확인된 노선×요일×밴드의 구간이다. 아래 표본·날짜 충전률과
+        표본/날짜 준비 셀을 함께 본다.</div><table>`;
   for(const [k,label] of [['mon','월'],['tue','화'],['wed','수'],['thu','목'],['fri','금'],['sat','토'],['sun','일']]){
     const v = d.days[k] || {obs:0,done:0,cells:0,pct:0,fillPct:0,dayFillPct:0};
     h += `<tr><td width=40>${label}</td>
           <td class=n width=72><b>${pctFine(v.pct)}</b></td>
           <td width=250>${bar(v.pct, v.pct>=1?'ok':'')}</td>
-          <td class=n style="white-space:nowrap">충족 셀 ${num(v.done)} / ${num(d.dayGoal)}</td>
+          <td class=n style="white-space:nowrap">최종 ${num(v.done)} / ${num(v.goal)}</td>
+          <td class=n style="white-space:nowrap;opacity:.75">표본셀 ${num(v.sampleReady)}</td>
+          <td class=n style="white-space:nowrap;opacity:.75">날짜셀 ${num(v.dateReady)}</td>
           <td class=n style="white-space:nowrap;opacity:.75">표본 ${pct(v.fillPct||0)}</td>
           <td class=n style="white-space:nowrap;opacity:.75">날짜 ${pct(v.dayFillPct||0)}</td>
           <td class=n style="white-space:nowrap;opacity:.6">관측 ${num(v.obs)}건</td></tr>`;
@@ -671,6 +744,16 @@ function renderSeoul(d){
           <td class=n style="white-space:nowrap">${num(b.done)} / ${num(b.total)}</td></tr>`;
   }
   h += '</table>';
+  const sf = s.failures || [];
+  h += `<h2>영속 실패 노선 (${num(sf.length)})</h2>`;
+  if(!sf.length) h += '<div class=sub style="color:#22c55e">현재 미해결 실패 없음</div>';
+  else {
+    h += '<table>';
+    for(const f of sf)
+      h += `<tr><td>밴드 ${f.band}</td><td><b>${f.no||f.routeid}</b></td>
+            <td class=n>${num(f.tries)}회</td><td class=bad>${f.reason||'실패'}</td></tr>`;
+    h += '</table>';
+  }
   h += '<div class=sub style="margin-top:6px">밴드마다 전 노선을 한 번씩 찍으면 100%. '
      + '⚠️ 이건 <b>관측이 아니라 운영사 예측</b>이라(신분당선 recptnDt 와 같은 성격, §8.1 ⑤ 가) '
      + '정시성 판정엔 쓰지 않는다. CV 는 다음 2대의 현재 위치 기반이라 예측 오염이 상대적으로 작다.</div>';

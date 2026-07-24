@@ -202,6 +202,25 @@ def save_done(day, done):
         pass
 
 
+def failures_path(day):
+    return os.path.join(O.DATA, f".seoul-failures-{day}.json")
+
+
+def load_failures(day):
+    try:
+        with open(failures_path(day), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_failures(day, failures):
+    tmp = failures_path(day) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(failures, f, ensure_ascii=False)
+    os.replace(tmp, failures_path(day))
+
+
 def main():
     key = load_key()
     if not key:
@@ -225,6 +244,7 @@ def main():
     day = service_day(now())
     done = load_done(day)   # (band, routeid) -> **성공**만. 재시작해도 이어간다
     fails = {}              # (band, routeid) -> 연속 실패 횟수 (메모리 — 재시작 시 새 시도)
+    fail_log = load_failures(day)
     MAX_TRIES = 3           # 밴드 안에서 이만큼 실패하면 포기 (다음 밴드에 다시 온다)
     rotated_day = None
     written = 0
@@ -236,8 +256,9 @@ def main():
         d = service_day(t)
         if d != day:
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d} (전일 {written:,}행)", flush=True)
-            day, done, written = d, {}, 0
+            day, done, written, fail_log = d, {}, 0, {}
             save_done(day, done)
+            save_failures(day, fail_log)
             continue
         due = O.rotate_due(rotated_day, t)
         if due:
@@ -293,11 +314,18 @@ def main():
             #    포기(todo 에서 빠지되 done 도 아니라 대시보드가 미완료로 본다).
             fails[(b, rid)] = fails.get((b, rid), 0) + 1
             nt = fails[(b, rid)]
+            fail_log[f"{b}:{rid}"] = {
+                "band": b, "routeid": rid, "no": R[rid]["no"], "tries": nt,
+                "reason": f"{type(e).__name__}: {str(e)[:120]}", "t": t.isoformat(),
+            }
+            save_failures(day, fail_log)
             print(f"[{t:%H:%M:%S}] 실패({nt}/{MAX_TRIES}) {R[rid]['no']}: {type(e).__name__}", flush=True)
             time.sleep(min(30.0, gap * (2 ** (nt - 1))))   # 지수 백오프
             continue
         done[(b, rid)] = True           # 성공(빈 응답 포함 — 유효)만 done
         fails.pop((b, rid), None)
+        fail_log.pop(f"{b}:{rid}", None)
+        save_failures(day, fail_log)
         save_done(day, done)
 
         if rows:

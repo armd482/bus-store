@@ -57,7 +57,7 @@ for _s in (sys.stdout, sys.stderr):
 
 KST = timezone(timedelta(hours=9))
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(HERE, "data")
+DATA = os.environ.get("FINDPATH_DATA", os.path.join(HERE, "data"))
 DB = os.path.join(DATA, "coverage.sqlite")
 CONFIG = os.path.join(HERE, "config.json")
 
@@ -154,6 +154,19 @@ def band_of(t, bands):
     return None
 
 
+def transition_quality(t_prev, t, from_ord, to_ord, bands):
+    """직접 소요시간 표본 여부와 제외 사유.
+
+    인접 정류장이고 운행일·밴드 경계를 넘지 않아야 exact다.
+    """
+    if to_ord != from_ord + 1:
+        return "skipped"
+    if (service_day_of(t_prev).date() != service_day_of(t).date()
+            or band_of(t_prev, bands) != band_of(t, bands)):
+        return "boundary"
+    return "exact"
+
+
 def in_window(t, window):
     """운행 창 안인가. window 도 24 초과 = 익일. [4, 27] = 04:00~03:00."""
     a, b = window
@@ -207,6 +220,48 @@ def connect(check_same_thread=True):
     # 대시보드가 5초마다 요일·밴드 필터 쿼리를 친다 — 셀이 수백만이 되면
     # daytype 풀스캔이 /api 를 초 단위로 늘린다.
     c.execute("CREATE INDEX IF NOT EXISTS cell_day ON cell(daytype)")
+    # 직접 인접 전이가 아닌 관측은 소요시간 셀에 넣지 않는다. span은 "이 범위 안의
+    # 여러 구간을 통과했다"는 검열(censored) 관측을 손실 없이 따로 보존한다.
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS span (
+        routeid TEXT NOT NULL, from_ord INTEGER NOT NULL, to_ord INTEGER NOT NULL,
+        band INTEGER, daytype TEXT NOT NULL, service_day TEXT NOT NULL,
+        reason TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
+        gap_sum REAL NOT NULL DEFAULT 0, max_gap REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY(routeid,from_ord,to_ord,band,daytype,service_day,reason)
+      )""")
+    c.execute("CREATE INDEX IF NOT EXISTS span_route ON span(routeid)")
+    span_cols = {r[1] for r in c.execute("PRAGMA table_info(span)")}
+    if "gap_sum" not in span_cols:
+        c.execute("ALTER TABLE span ADD COLUMN gap_sum REAL NOT NULL DEFAULT 0")
+    if "max_gap" not in span_cols:
+        c.execute("ALTER TABLE span ADD COLUMN max_gap REAL NOT NULL DEFAULT 0")
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS included_cell (
+        routeid TEXT NOT NULL, from_ord INTEGER NOT NULL, to_ord INTEGER NOT NULL,
+        band INTEGER NOT NULL, daytype TEXT NOT NULL,
+        direct_n INTEGER NOT NULL DEFAULT 0, censored_n INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(routeid,from_ord,to_ord,band,daytype)
+      )""")
+    # 실제 차량이 한 번이라도 관측된 노선×요일×밴드. 이 마스크만 도달 가능 셀의
+    # 분모로 사용한다. 이론상 모든 조합 분모는 별도 지표로 계속 제공한다.
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS route_service (
+        routeid TEXT NOT NULL, band INTEGER NOT NULL, daytype TEXT NOT NULL,
+        n_days INTEGER NOT NULL DEFAULT 0, last_day TEXT,
+        status TEXT NOT NULL DEFAULT 'eligible',
+        polled_days INTEGER NOT NULL DEFAULT 0,
+        empty_days INTEGER NOT NULL DEFAULT 0,
+        last_poll_day TEXT,
+        PRIMARY KEY(routeid,band,daytype)
+      )""")
+    service_cols = {r[1] for r in c.execute("PRAGMA table_info(route_service)")}
+    for col, decl in (("status", "TEXT NOT NULL DEFAULT 'eligible'"),
+                      ("polled_days", "INTEGER NOT NULL DEFAULT 0"),
+                      ("empty_days", "INTEGER NOT NULL DEFAULT 0"),
+                      ("last_poll_day", "TEXT")):
+        if col not in service_cols:
+            c.execute(f"ALTER TABLE route_service ADD COLUMN {col} {decl}")
     # 지하철 셀 (B안) — (노선, 열차, 역, 요일)별 관측 일수. trainNo 가 매일 반복이라
     # 요일별 며칠이면 각 열차의 정시성 분포가 나온다 (§8 #1). n = 관측한 서로 다른 날 수.
     c.execute("""
@@ -236,13 +291,39 @@ def connect(check_same_thread=True):
         endvt       TEXT,               -- 막차 출발 'HHMM'. ⚠️ 도착이 아니다
         emptyStreak INTEGER DEFAULT 0,  -- 연속 0대 반환 횟수 — 관측이 정하는 후순위
         lastSeen    REAL                -- 마지막으로 버스가 보인 시각
+        ,currentVersion TEXT            -- 현재 정류장 구조 해시
       )""")
+    # 노선 개편 뒤 같은 nodeord를 과거 정류장에 잘못 대입하지 않도록 정류장 목록을
+    # 버전 스냅샷으로 보존한다.
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS route_version (
+        routeid TEXT NOT NULL, version TEXT NOT NULL, captured_at TEXT NOT NULL,
+        nstops INTEGER NOT NULL, PRIMARY KEY(routeid,version)
+      )""")
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS route_stop (
+        routeid TEXT NOT NULL, version TEXT NOT NULL, nodeord INTEGER NOT NULL,
+        nodeid TEXT, nodenm TEXT, lat REAL, lon REAL, updowncd TEXT,
+        PRIMARY KEY(routeid,version,nodeord)
+      )""")
+    c.execute("CREATE INDEX IF NOT EXISTS route_stop_node ON route_stop(nodeid)")
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS collector_health_cycle (
+        ts REAL PRIMARY KEY, day TEXT NOT NULL, band INTEGER,
+        attempted INTEGER NOT NULL, successful INTEGER NOT NULL,
+        retried INTEGER NOT NULL, residual INTEGER NOT NULL,
+        code99 INTEGER NOT NULL, timeouts INTEGER NOT NULL,
+        http429 INTEGER NOT NULL, http5xx INTEGER NOT NULL,
+        duration REAL NOT NULL, inflight INTEGER NOT NULL
+      )""")
+    c.execute("CREATE INDEX IF NOT EXISTS health_day ON collector_health_cycle(day)")
 
     # 기존 DB 마이그레이션 — CREATE TABLE IF NOT EXISTS 는 이미 있는 테이블에 컬럼을 안 붙인다.
     # ⚠️ 이걸 빠뜨려 배포본에만 손으로 ALTER 했다가, 새 기계에서 'no such column: startvt' 로 죽었다.
     have = {r[1] for r in c.execute("PRAGMA table_info(route)")}
     for col, decl in (("startvt", "TEXT"), ("endvt", "TEXT"),
-                      ("emptyStreak", "INTEGER DEFAULT 0"), ("lastSeen", "REAL")):
+                      ("emptyStreak", "INTEGER DEFAULT 0"), ("lastSeen", "REAL"),
+                      ("currentVersion", "TEXT")):
         if col not in have:
             c.execute(f"ALTER TABLE route ADD COLUMN {col} {decl}")
     c.commit()
@@ -380,6 +461,70 @@ def bump(conn, routeid, from_ord, to_ord, band, daytype, day, k=1):
         n_days = n_days + (last_day IS NOT excluded.last_day),
         last_day = excluded.last_day
     """, (routeid, from_ord, to_ord, band, daytype, k, day, k))
+
+
+def mark_service(conn, routeid, band, daytype, day, has_vehicle=True):
+    """노선×밴드×요일의 eligible/unknown/inactive 상태를 실측으로 갱신."""
+    if band is None:
+        return
+    status = "eligible" if has_vehicle else "unknown"
+    empty = 0 if has_vehicle else 1
+    conn.execute("""
+      INSERT INTO route_service(routeid,band,daytype,n_days,last_day,status,
+                                polled_days,empty_days,last_poll_day)
+      VALUES(?,?,?,?,?,?,1,?,?)
+      ON CONFLICT(routeid,band,daytype) DO UPDATE SET
+        n_days=n_days+(excluded.status='eligible' AND last_day IS NOT excluded.last_day),
+        last_day=CASE WHEN excluded.status='eligible' THEN excluded.last_day ELSE last_day END,
+        polled_days=polled_days+(last_poll_day IS NOT excluded.last_poll_day),
+        empty_days=empty_days+(excluded.empty_days=1 AND last_poll_day IS NOT excluded.last_poll_day),
+        last_poll_day=excluded.last_poll_day,
+        status=CASE
+          WHEN status='eligible' OR excluded.status='eligible' THEN 'eligible'
+          WHEN empty_days+(excluded.empty_days=1 AND last_poll_day IS NOT excluded.last_poll_day)>=2
+            THEN 'inactive'
+          ELSE 'unknown' END
+    """, (routeid, band, daytype, 1 if has_vehicle else 0,
+          day if has_vehicle else None, status, empty, day))
+
+
+def bump_span(conn, routeid, from_ord, to_ord, band, daytype, day, reason, gap_seconds, k=1):
+    conn.execute("""
+      INSERT INTO span(routeid,from_ord,to_ord,band,daytype,service_day,reason,n,gap_sum,max_gap)
+      VALUES(?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(routeid,from_ord,to_ord,band,daytype,service_day,reason)
+      DO UPDATE SET n=n+excluded.n,gap_sum=gap_sum+excluded.gap_sum,
+                    max_gap=MAX(max_gap,excluded.max_gap)
+    """, (routeid, from_ord, to_ord, band, daytype, day, reason, k,
+          gap_seconds * k, gap_seconds))
+    if reason == "censored" and band is not None:
+        for o in range(from_ord, to_ord):
+            conn.execute("""INSERT INTO included_cell
+              (routeid,from_ord,to_ord,band,daytype,direct_n,censored_n)
+              VALUES(?,?,?,?,?,0,?)
+              ON CONFLICT(routeid,from_ord,to_ord,band,daytype)
+              DO UPDATE SET censored_n=censored_n+excluded.censored_n""",
+              (routeid, o, o+1, band, daytype, k))
+
+
+def mark_included_direct(conn, routeid, from_ord, to_ord, band, daytype, k=1):
+    conn.execute("""INSERT INTO included_cell
+      (routeid,from_ord,to_ord,band,daytype,direct_n,censored_n)
+      VALUES(?,?,?,?,?,?,0)
+      ON CONFLICT(routeid,from_ord,to_ord,band,daytype)
+      DO UPDATE SET direct_n=direct_n+excluded.direct_n""",
+      (routeid, from_ord, to_ord, band, daytype, k))
+
+
+def record_health(conn, day, band, attempted, successful, retried, residual,
+                  code99, timeouts, http429, http5xx, duration, inflight, ts=None):
+    conn.execute("""INSERT INTO collector_health_cycle
+      (ts,day,band,attempted,successful,retried,residual,code99,timeouts,http429,http5xx,duration,inflight)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+      (ts or time.time(), day, band, attempted, successful, retried, residual,
+       code99, timeouts, http429, http5xx, duration, inflight))
+    # 일 단위 상세는 30일만 보존한다.
+    conn.execute("DELETE FROM collector_health_cycle WHERE ts < ?", (time.time()-30*86400,))
 
 
 # ── 지하철 관제 시각 (§8.1) ────────────────────────────────────────
@@ -643,11 +788,10 @@ def bump_subway(conn, line, trainNo, statnId, daytype, day):
 
 
 def route_progress(conn, target, nbands):
-    """노선별 (충족 셀, 목표 셀, 관측된 셀). 목표 셀 = 구간수 × 밴드수 × 7요일.
+    """노선별 도달 가능/이론 커버리지.
 
-    ⚠️ 7요일 전부 센다 — 평일만 세면(이전 판) 평일이 다 찬 노선이 pct=1.0 으로
-    로테이션에서 빠져 토·일 셀이 영영 안 채워지는 구조가 된다. 대시보드(server.py)의
-    분모와도 일치해야 한다.
+    도달 가능 목표는 실제 차량이 관측된 (요일,밴드) 조합 × 노선 구간수다.
+    이론 목표(모든 7요일×모든 밴드)는 absolute_goal로 별도 제공한다.
     """
     # ★ 완료 = n >= target **그리고** n_days >= minDays. 같은 날 target 을 다 채워도
     #   서로 다른 운행일이 minDays 미만이면 미완료다 (요일 비교엔 날짜 다양성 필수).
@@ -656,16 +800,21 @@ def route_progress(conn, target, nbands):
       SELECT r.routeid, r.routeno, r.routetp, r.cityCode, r.nstops,
              COALESCE(SUM(CASE WHEN c.n >= ? AND c.n_days >= ? THEN 1 ELSE 0 END), 0),
              COUNT(c.n),
-             COALESCE(SUM(MIN(c.n, ?)), 0)
+             COALESCE(SUM(MIN(c.n, ?)), 0),
+             (SELECT COUNT(*) FROM route_service rs
+              WHERE rs.routeid=r.routeid AND rs.status='eligible')
       FROM route r LEFT JOIN cell c ON c.routeid = r.routeid
       GROUP BY r.routeid
     """, (target, md, target)).fetchall()
     out = []
-    for rid, no, tp, city, nstops, done, seen, filln in rows:
-        goal = max(1, (nstops - 1)) * nbands * 7  # 구간수 × 밴드수 × 7요일
+    for rid, no, tp, city, nstops, done, seen, filln, service_slots in rows:
+        nseg = max(0, (nstops or 0) - 1)
+        goal = nseg * service_slots
+        absolute_goal = nseg * nbands * 7
         out.append({
             "routeid": rid, "routeno": no, "routetp": tp, "cityCode": city,
-            "goal": goal, "done": done, "seen": seen,
+            "goal": goal, "absolute_goal": absolute_goal, "service_slots": service_slots,
+            "done": done, "seen": seen,
             "pct": done / goal if goal else 0.0,          # 완성률 — 표시용
             "fill": filln / (goal * target) if goal else 0.0,  # 충전율 — 선정용
         })
@@ -743,7 +892,17 @@ def pick_routes(conn, n, target, nbands, t=None, max_empty=6):
       2. emptyStreak — 연속으로 0대면 후순위. **추정이 아니라 관측이 정한다.**
     """
     prog = route_progress(conn, target, nbands)
-    live = [p for p in prog if p["pct"] < 1.0]
+    # 현재 조합을 아직 운행하는지 모르면 완료 노선도 탐사 대상이다. 이미 도달 가능
+    # 조합으로 확인됐고 그 조합의 직접 셀이 찬 노선만 현재 수확 후보에서 빠진다.
+    if t is not None:
+        cb, cd = band_of(t, cfg()["timebands"]), day_type(t)
+        known_now = {r[0] for r in conn.execute(
+            "SELECT routeid FROM route_service WHERE band=? AND daytype=? AND status='eligible'",
+            (cb, cd)
+        )} if cb is not None else set()
+        live = [p for p in prog if p["pct"] < 1.0 or p["routeid"] not in known_now]
+    else:
+        live = [p for p in prog if p["pct"] < 1.0]
     if t is not None:
         # nstops 도 같이 — 막차 꼬리를 정류소 수에 비례시킨다 (maybe_running 참조).
         # 긴 노선일수록 막차 출발 후 오래 달리므로 고정 꼬리는 장거리를 잘라낸다.
@@ -819,9 +978,8 @@ def pick_routes(conn, n, target, nbands, t=None, max_empty=6):
                   FROM cell WHERE band=? AND daytype=? GROUP BY routeid""",
                   (target, target, md, today, cb, cd)):
                 need[rid] = (filled, date_need)
-        per_band_goal = max(1, nbands * 7)
         for p in harvest:
-            nseg = max(1, p["goal"] // per_band_goal)      # goal = nseg × nbands × 7
+            nseg = max(1, p["absolute_goal"] // max(1, nbands * 7))
             filled, date_need = need.get(p["routeid"], (0, 0))
             p["cur_need"] = nseg * target - filled + date_need
         # 현재 부족량 큰 순. 동률(예: 둘 다 현재 밴드 미관측)이면 콜당 구간이 많은
@@ -853,13 +1011,16 @@ def status():
 
     done_routes = [p for p in prog if p["pct"] >= 1.0]
     goal = sum(p["goal"] for p in prog)
+    absolute_goal = sum(p["absolute_goal"] for p in prog)
     done = sum(p["done"] for p in prog)
     seen = sum(p["seen"] for p in prog)
     total_obs = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
 
     print(f"=== 커버리지 (요일 7종 분리 · 목표 {tgt}샘플 · 시간대 {nb}개) ===")
     print(f"  노선      {len(prog):,}개 중 완주 {len(done_routes):,}")
-    print(f"  셀        {done:,} / {goal:,} 충족 ({done/goal*100 if goal else 0:.1f}%)")
+    print(f"  도달 가능 {done:,} / {goal:,} 충족 ({done/goal*100 if goal else 0:.1f}%)")
+    print(f"  이론 셀    {absolute_goal:,} (모든 노선×밴드×요일; 절대 커버리지 "
+          f"{done/absolute_goal*100 if absolute_goal else 0:.1f}%)")
     print(f"  관측된 셀  {seen:,} ({seen/goal*100 if goal else 0:.1f}%)  ← 한 번이라도 본 것")
     print(f"  총 관측    {total_obs:,}건")
 
@@ -900,6 +1061,9 @@ def reset(force):
         sys.exit(f"관측 {n:,}건이 지워진다. jsonl 데이터도 같이 지울 것(rm data/bus-*.jsonl).\n"
                  f"정말이면: python3 orchestrator.py reset --yes")
     c.execute("DELETE FROM cell")
+    c.execute("DELETE FROM span")
+    c.execute("DELETE FROM included_cell")
+    c.execute("DELETE FROM route_service")
     c.execute("UPDATE route SET emptyStreak = 0, lastSeen = NULL")
     c.commit()
     print(f"관측 {n:,}건 초기화. 노선 풀·일 콜 카운터는 유지 (쿼터는 실사용이라 지우면 안 된다).")
@@ -944,6 +1108,9 @@ def rebuild(force, shrink_ok=False):
     # 스테이징에 먼저 쌓고 마지막에 원자적으로 교체한다 — 도중 실패해도 기존 장부가 남는다
     c.execute("DROP TABLE IF EXISTS cell_stage")
     c.execute("DROP TABLE IF EXISTS cell_day_stage")
+    c.execute("DROP TABLE IF EXISTS span_stage")
+    c.execute("DROP TABLE IF EXISTS route_service_day_stage")
+    c.execute("DROP TABLE IF EXISTS included_stage")
     c.execute("""CREATE TABLE cell_stage (
         routeid TEXT NOT NULL, from_ord INTEGER NOT NULL, to_ord INTEGER NOT NULL,
         band INTEGER NOT NULL, daytype TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
@@ -958,6 +1125,21 @@ def rebuild(force, shrink_ok=False):
         band INTEGER NOT NULL, daytype TEXT NOT NULL, service_day TEXT NOT NULL,
         n INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (routeid, from_ord, to_ord, band, daytype, service_day))""")
+    c.execute("""CREATE TABLE span_stage (
+        routeid TEXT NOT NULL, from_ord INTEGER NOT NULL, to_ord INTEGER NOT NULL,
+        band INTEGER, daytype TEXT NOT NULL, service_day TEXT NOT NULL,
+        reason TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
+        gap_sum REAL NOT NULL DEFAULT 0, max_gap REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY(routeid,from_ord,to_ord,band,daytype,service_day,reason))""")
+    c.execute("""CREATE TABLE route_service_day_stage (
+        routeid TEXT NOT NULL, band INTEGER NOT NULL, daytype TEXT NOT NULL,
+        service_day TEXT NOT NULL,
+        PRIMARY KEY(routeid,band,daytype,service_day))""")
+    c.execute("""CREATE TABLE included_stage (
+        routeid TEXT NOT NULL, from_ord INTEGER NOT NULL, to_ord INTEGER NOT NULL,
+        band INTEGER NOT NULL, daytype TEXT NOT NULL,
+        direct_n INTEGER NOT NULL DEFAULT 0, censored_n INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(routeid,from_ord,to_ord,band,daytype))""")
     bad = total = 0
     k = cfg()
     hols = holiday_set()   # 자동 조회 ∪ 수동 — 수집기와 같은 기준. 루프 밖에서 한 번만
@@ -965,6 +1147,8 @@ def rebuild(force, shrink_ok=False):
     for p in sorted(files, key=lambda x: os.path.basename(x).replace(".gz", "")):
         opener = gzip.open if p.endswith(".gz") else open
         day_counts = {}   # 이 파일에서만 — 메모리 상한을 파일 크기로 묶는다
+        span_counts, service_days = {}, set()
+        included_counts = {}
         for line in opener(p, mode="rt", encoding="utf-8"):
             try:
                 r = json.loads(line)
@@ -990,21 +1174,60 @@ def rebuild(force, shrink_ok=False):
             if service_day_of(dtm).strftime("%Y-%m-%d") in hols:
                 continue  # 공휴일 — 수집기와 같은 기준으로 장부에서 제외 (jsonl 은 진실로 유지)
             dt = day_type(dtm)
-            # 수집기와 같은 인접 구간 분해 — 2칸 이상 건너뛴 전이를 (fo,to) 셀로
-            # 넣으면 분모(인접 구간수)와 어긋난다. bus_collector 의 bump 로직 참조.
-            for o in range(fo, to):
-                key = (r["routeid"], o, o + 1, b, dt, sday)
+            service_days.add((r["routeid"], b, dt, sday))
+            try:
+                prev = datetime.fromisoformat(r["t_prev"])
+            except (KeyError, ValueError):
+                prev = None
+            quality = transition_quality(prev, dtm, fo, to, bands) if prev else "boundary"
+            if quality == "exact":
+                key = (r["routeid"], fo, to, b, dt, sday)
                 day_counts[key] = day_counts.get(key, 0) + 1
+                ik = (r["routeid"], fo, to, b, dt)
+                dn, cn = included_counts.get(ik, (0, 0))
+                included_counts[ik] = (dn + 1, cn)
+            else:
+                gap = max(0, (dtm-prev).total_seconds()) if prev else 0
+                if quality == "skipped":
+                    quality = "censored" if to-fo <= 3 else "implausible"
+                key = (r["routeid"], fo, to, b, dt, sday, quality)
+                old_n, old_sum, old_max = span_counts.get(key, (0, 0.0, 0.0))
+                span_counts[key] = (old_n + 1, old_sum + gap, max(old_max, gap))
+                if quality == "censored":
+                    for o in range(fo, to):
+                        ik = (r["routeid"], o, o+1, b, dt)
+                        dn, cn = included_counts.get(ik, (0, 0))
+                        included_counts[ik] = (dn, cn + 1)
         c.executemany("""INSERT INTO cell_day_stage
                            (routeid,from_ord,to_ord,band,daytype,service_day,n)
                          VALUES(?,?,?,?,?,?,?)
                          ON CONFLICT(routeid,from_ord,to_ord,band,daytype,service_day)
                          DO UPDATE SET n = n + excluded.n""",
                       [k + (v,) for k, v in day_counts.items()])
+        c.executemany("""INSERT INTO span_stage
+                           (routeid,from_ord,to_ord,band,daytype,service_day,reason,n,gap_sum,max_gap)
+                         VALUES(?,?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT(routeid,from_ord,to_ord,band,daytype,service_day,reason)
+                         DO UPDATE SET n=n+excluded.n,gap_sum=gap_sum+excluded.gap_sum,
+                                       max_gap=MAX(max_gap,excluded.max_gap)""",
+                      [k + v for k, v in span_counts.items()])
+        c.executemany("""INSERT OR IGNORE INTO route_service_day_stage
+                         (routeid,band,daytype,service_day) VALUES(?,?,?,?)""",
+                      list(service_days))
+        c.executemany("""INSERT INTO included_stage
+                           (routeid,from_ord,to_ord,band,daytype,direct_n,censored_n)
+                         VALUES(?,?,?,?,?,?,?)
+                         ON CONFLICT(routeid,from_ord,to_ord,band,daytype)
+                         DO UPDATE SET direct_n=direct_n+excluded.direct_n,
+                                       censored_n=censored_n+excluded.censored_n""",
+                      [k + v for k, v in included_counts.items()])
         total += sum(day_counts.values())
     if old and total < old * 0.5 and not shrink_ok:
         c.execute("DROP TABLE cell_stage")
         c.execute("DROP TABLE cell_day_stage")
+        c.execute("DROP TABLE span_stage")
+        c.execute("DROP TABLE route_service_day_stage")
+        c.execute("DROP TABLE included_stage")
         c.commit()
         sys.exit(f"⚠️ 중단 — 재계산 결과({total:,}건)가 기존 장부({old:,}건)의 절반 미만이다.\n"
                  "내보낸 .gz 가 전부 로컬(exportDir)에 있는지 확인할 것 — 클라우드로 move 했다면 먼저 내려받기.\n"
@@ -1019,8 +1242,19 @@ def rebuild(force, shrink_ok=False):
     ncell = c.execute("SELECT COUNT(*) FROM cell_stage").fetchone()[0]
     c.execute("DELETE FROM cell")
     c.execute("INSERT INTO cell SELECT * FROM cell_stage")
+    c.execute("DELETE FROM span")
+    c.execute("INSERT INTO span SELECT * FROM span_stage")
+    c.execute("DELETE FROM route_service")
+    c.execute("""INSERT INTO route_service(routeid,band,daytype,n_days,last_day)
+                 SELECT routeid,band,daytype,COUNT(*),MAX(service_day)
+                 FROM route_service_day_stage GROUP BY routeid,band,daytype""")
+    c.execute("DELETE FROM included_cell")
+    c.execute("INSERT INTO included_cell SELECT * FROM included_stage")
     c.execute("DROP TABLE cell_stage")
     c.execute("DROP TABLE cell_day_stage")
+    c.execute("DROP TABLE span_stage")
+    c.execute("DROP TABLE route_service_day_stage")
+    c.execute("DROP TABLE included_stage")
     c.commit()
     print(f"재계산 완료: 파일 {len(files)}개 → 관측 {total:,}건 · 셀 {ncell:,}개 "
           f"(이전 장부 {old:,}건" + (f" · 깨진 줄 {bad}" if bad else "") + ")")

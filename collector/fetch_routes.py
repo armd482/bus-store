@@ -11,6 +11,7 @@
 """
 
 import json
+import hashlib
 import os
 import sys
 import time
@@ -19,6 +20,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import orchestrator as O
+import bus_collector as B
 
 BASE = "https://apis.data.go.kr/1613000/BusRouteInfoInqireService"
 
@@ -55,6 +57,8 @@ def get(key, op, retries=3, **kw):
         if i:
             time.sleep(2 * 2 ** (i - 1))
         try:
+            # 메타데이터 조회도 같은 data.go.kr 키의 일 한도를 소비한다.
+            B.add_calls(B.quota_day(B.now()), 1, "GBIS_BUS_KEY")
             with urllib.request.urlopen(f"{BASE}/{op}?{q}", timeout=25) as r:
                 d = json.loads(r.read().decode())
         except Exception as e:
@@ -109,7 +113,7 @@ def main():
 
         def detail(r):
             rid = r["routeid"]
-            n = s = e = None
+            n = s = e = stops = version = None
             try:
                 info = get(key, "getRouteInfoIem", cityCode=city, routeId=rid)
                 if info:
@@ -118,17 +122,26 @@ def main():
             except Exception as ex:
                 fails.append((rid, "info", str(ex)[:30]))
             try:
-                n = len(get_all(key, "getRouteAcctoThrghSttnList",
-                                cityCode=city, routeId=rid))
+                stops = get_all(key, "getRouteAcctoThrghSttnList",
+                                cityCode=city, routeId=rid)
+                n = len(stops)
+                canonical = [{
+                    "nodeord": x.get("nodeord"), "nodeid": x.get("nodeid"),
+                    "nodenm": x.get("nodenm"), "gpslati": x.get("gpslati"),
+                    "gpslong": x.get("gpslong"), "updowncd": x.get("updowncd"),
+                } for x in stops]
+                version = hashlib.sha256(json.dumps(
+                    canonical, sort_keys=True, ensure_ascii=False,
+                    separators=(",", ":")).encode()).hexdigest()[:16]
             except Exception as ex:
                 fails.append((rid, "stops", str(ex)[:30]))
-            return rid, (n, s, e)
+            return rid, (n, s, e, stops, version)
 
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
             details = dict(ex.map(detail, routes))
 
         for r in routes:
-            n, s, e = details.get(r["routeid"], (None, None, None))
+            n, s, e, stops, version = details.get(r["routeid"], (None, None, None, None, None))
             # ⚠️ 실패(None)면 기존 값을 보존한다 — 0 으로 덮으면 커버리지 분모가
             #    조용히 무너지고, 재실행해도 실패하는 노선은 영영 0 으로 남는다.
             conn.execute("""
@@ -141,6 +154,19 @@ def main():
                 endvt=COALESCE(?, endvt)
             """, (r["routeid"], city, str(r["routeno"]), r.get("routetp", ""), n, s, e,
                   city, str(r["routeno"]), r.get("routetp", ""), n, s, e))
+            if stops is not None and version:
+                conn.execute("UPDATE route SET currentVersion=? WHERE routeid=?",
+                             (version, r["routeid"]))
+                conn.execute("""INSERT OR IGNORE INTO route_version(routeid,version,captured_at,nstops)
+                                VALUES(?,?,datetime('now'),?)""",
+                             (r["routeid"], version, n))
+                conn.executemany("""INSERT OR REPLACE INTO route_stop
+                    (routeid,version,nodeord,nodeid,nodenm,lat,lon,updowncd)
+                    VALUES(?,?,?,?,?,?,?,?)""", [
+                    (r["routeid"], version, int(x["nodeord"]), x.get("nodeid"), x.get("nodenm"),
+                     x.get("gpslati"), x.get("gpslong"), x.get("updowncd"))
+                    for x in stops if str(x.get("nodeord", "")).isdigit()
+                ])
         conn.commit()
 
         got = [v for v in details.values() if v[0] is not None]
