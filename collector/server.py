@@ -479,8 +479,13 @@ window.setTab = (t) => { tab = t; render(); };
 window.setLineTab = (t) => { lineTab = t; render(); };
 
 async function tick(){
-  S = await (await fetch('/api')).json();
-  render();
+  // ⚠️ 요청 완료 후 다음을 예약한다 (setInterval 금지) — /api 가 느릴 때
+  //    앞 요청이 끝나기 전에 다음이 겹쳐 서버 스레드가 쌓이는 걸 막는다.
+  try {
+    S = await (await fetch('/api')).json();
+    if(!S.warming) render();
+  } catch(e) { /* 일시적 실패는 다음 tick 에 회복 */ }
+  setTimeout(tick, 5000);
 }
 
 function render(){
@@ -813,7 +818,7 @@ function paintObs(){
     qe.textContent = secs != null ? secs + '초 전' : '—';
   }
 }
-tick(); setInterval(tick, 5000); setInterval(paintObs, 1000);
+tick(); setInterval(paintObs, 1000);   // tick 은 스스로 setTimeout 으로 재예약
 </script>
 """
 
@@ -821,7 +826,8 @@ tick(); setInterval(tick, 5000); setInterval(paintObs, 1000);
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api"):
-            body = json.dumps(snapshot(), ensure_ascii=False).encode()
+            with _SNAP_LOCK:                 # 캐시만 즉시 반환 — 계산은 백그라운드
+                body = _SNAP["data"]
             ct = "application/json; charset=utf-8"
         elif self.path == "/":
             body = PAGE.encode()
@@ -865,6 +871,30 @@ class Tee:
         self.f.flush()
 
 
+# ── 스냅샷 캐시 ────────────────────────────────────────────────────
+# ⚠️ snapshot() 은 셀 수백만 규모 sqlite 집계 + jsonl 이어읽기라 **~28초** 걸린다
+#    (✅ 실측). 이걸 /api 마다 동기로 돌리면: 프런트가 5초마다 요청 → 앞 요청이
+#    끝나기 전에 다음이 겹침 → ThreadingHTTPServer 가 스레드를 계속 만들고 _DB_LOCK
+#    에 줄서서 대기 스레드·메모리가 쌓인다. 그래서 **백그라운드에서 주기 계산해
+#    메모리에 캐시**하고 /api 는 캐시만 즉시 반환한다.
+_SNAP = {"data": b'{"warming":true}', "at": 0.0}
+_SNAP_LOCK = threading.Lock()
+
+
+def _snapshot_loop(period=15):
+    """주기적으로 snapshot() 을 계산해 직렬화된 바이트로 캐시한다 (단일 스레드)."""
+    while True:
+        t0 = time.time()
+        try:
+            body = json.dumps(snapshot(), ensure_ascii=False).encode()
+            with _SNAP_LOCK:
+                _SNAP["data"], _SNAP["at"] = body, time.time()
+        except Exception as e:
+            print(f"⚠️ 스냅샷 계산 실패: {type(e).__name__}: {e}", flush=True)
+        # 계산이 오래 걸려도 다음 주기까지는 쉰다 (최소 3초는 양보)
+        time.sleep(max(3.0, period - (time.time() - t0)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=877)
@@ -897,6 +927,9 @@ def main():
             print("수집 스레드 종료 감지 — 프로세스를 내린다 (자동 재시작 장치가 되살린다)", flush=True)
             os._exit(1)
         threading.Thread(target=watchdog, daemon=True).start()
+
+    # 스냅샷 캐시 워커 — /api 가 즉시 응답하도록 백그라운드에서 미리 계산
+    threading.Thread(target=_snapshot_loop, daemon=True).start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"대시보드 http://localhost:{args.port}  (수집 {'끔' if args.no_collect else '켬'})", flush=True)
