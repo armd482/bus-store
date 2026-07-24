@@ -166,7 +166,16 @@ def connect(check_same_thread=True):
     호출부가 락으로 직렬화할 책임을 진다 (server.py 의 읽기 전용 연결)."""
     os.makedirs(DATA, exist_ok=True)
     c = sqlite3.connect(DB, timeout=30, check_same_thread=check_same_thread)
+    # sqlite3.connect(timeout) 외에도 PRAGMA 단계에서 잠금을 기다리게 명시한다.
+    # 여러 systemd 유닛이 동시에 처음 뜰 때 journal_mode 변경부터 경합할 수 있다.
+    c.execute("PRAGMA busy_timeout=30000")
     c.execute("PRAGMA journal_mode=WAL")  # 수집기가 쓰는 중에도 status 가 읽히도록
+    # 버스·지하철·서울 서비스가 부팅 때 거의 동시에 connect() 한다. 신규 컬럼을
+    # 추가하는 배포에서 둘이 함께 "컬럼 없음"을 본 뒤 ALTER 하면 duplicate column /
+    # database locked 로 한쪽이 죽을 수 있다. 스키마 확인·마이그레이션 전체를 하나의
+    # 쓰기 트랜잭션으로 직렬화한다. 뒤 프로세스는 timeout(30s) 안에서 기다렸다가
+    # 선행 프로세스가 만든 최신 스키마를 다시 본다.
+    c.execute("BEGIN IMMEDIATE")
     c.execute("""
       CREATE TABLE IF NOT EXISTS cell (
         routeid  TEXT NOT NULL,
@@ -187,7 +196,11 @@ def connect(check_same_thread=True):
     cols = {r[1] for r in c.execute("PRAGMA table_info(cell)")}
     if "n_days" not in cols:
         c.execute("ALTER TABLE cell ADD COLUMN n_days INTEGER NOT NULL DEFAULT 0")
+    if "last_day" not in cols:
         c.execute("ALTER TABLE cell ADD COLUMN last_day TEXT")
+    # 둘 중 하나만 없던 부분 마이그레이션도 복구한다. 기존 관측은 최소 한 운행일은
+    # 있으므로 1로 시작하고, 정확한 날짜 수는 rebuild 가 JSONL 에서 되살린다.
+    if "n_days" not in cols:
         # 기존 셀은 최소 1일치는 있으므로 n_days=1 로 시작 (완주 판정이 안 깨지게).
         # 정확한 값은 rebuild 가 jsonl 에서 재계산한다.
         c.execute("UPDATE cell SET n_days=1 WHERE n>0")
@@ -930,20 +943,28 @@ def rebuild(force, shrink_ok=False):
     old = c.execute("SELECT COALESCE(SUM(n),0) FROM cell").fetchone()[0]
     # 스테이징에 먼저 쌓고 마지막에 원자적으로 교체한다 — 도중 실패해도 기존 장부가 남는다
     c.execute("DROP TABLE IF EXISTS cell_stage")
+    c.execute("DROP TABLE IF EXISTS cell_day_stage")
     c.execute("""CREATE TABLE cell_stage (
         routeid TEXT NOT NULL, from_ord INTEGER NOT NULL, to_ord INTEGER NOT NULL,
         band INTEGER NOT NULL, daytype TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
         n_days INTEGER NOT NULL DEFAULT 0, last_day TEXT,
         PRIMARY KEY (routeid, from_ord, to_ord, band, daytype))""")
+    # 파일명이 아니라 각 행의 t 에서 계산한 운행일로 먼저 모은다. 03:59에 시작한
+    # 사이클이 04:00 이후 끝나면 새 운행일 행이 전날 파일에 들어갈 수 있으므로
+    # "한 파일=한 운행일" 가정은 성립하지 않는다. 동일 운행일이 경계 양쪽 파일에
+    # 나뉘어도 이 PK가 하나로 합쳐 n_days 이중 증가를 막는다.
+    c.execute("""CREATE TABLE cell_day_stage (
+        routeid TEXT NOT NULL, from_ord INTEGER NOT NULL, to_ord INTEGER NOT NULL,
+        band INTEGER NOT NULL, daytype TEXT NOT NULL, service_day TEXT NOT NULL,
+        n INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (routeid, from_ord, to_ord, band, daytype, service_day))""")
     bad = total = 0
     k = cfg()
     hols = holiday_set()   # 자동 조회 ∪ 수동 — 수집기와 같은 기준. 루프 밖에서 한 번만
     bands = k["timebands"]
-    for p in sorted(files):   # 시간순 — last_day 가 최신 파일로 남게
+    for p in sorted(files, key=lambda x: os.path.basename(x).replace(".gz", "")):
         opener = gzip.open if p.endswith(".gz") else open
-        # 한 파일 = 한 운행일(bus-YYYY-MM-DD). 그 셀들엔 n_days 를 1 더한다.
-        file_day = os.path.basename(p)[4:14]
-        day_counts = {}   # 이 파일(하루)에서만 — 메모리 상한이 하루치로 묶인다
+        day_counts = {}   # 이 파일에서만 — 메모리 상한을 파일 크기로 묶는다
         for line in opener(p, mode="rt", encoding="utf-8"):
             try:
                 r = json.loads(line)
@@ -962,6 +983,7 @@ def rebuild(force, shrink_ok=False):
                 dtm = datetime.fromisoformat(r["t"])
             except (KeyError, ValueError):
                 continue
+            sday = service_day_of(dtm).strftime("%Y-%m-%d")
             b = band_of(dtm, bands)
             if b is None:
                 continue  # 현 밴드 밖 — 장부 대상 아님
@@ -971,27 +993,34 @@ def rebuild(force, shrink_ok=False):
             # 수집기와 같은 인접 구간 분해 — 2칸 이상 건너뛴 전이를 (fo,to) 셀로
             # 넣으면 분모(인접 구간수)와 어긋난다. bus_collector 의 bump 로직 참조.
             for o in range(fo, to):
-                key = (r["routeid"], o, o + 1, b, dt)
+                key = (r["routeid"], o, o + 1, b, dt, sday)
                 day_counts[key] = day_counts.get(key, 0) + 1
-        # n 은 관측 건수 누적, n_days 는 파일(=운행일)마다 +1, last_day 는 최신 파일.
-        c.executemany("""INSERT INTO cell_stage(routeid,from_ord,to_ord,band,daytype,n,n_days,last_day)
-                         VALUES(?,?,?,?,?,?,1,?)
-                         ON CONFLICT(routeid,from_ord,to_ord,band,daytype)
-                         DO UPDATE SET n = n + excluded.n,
-                                       n_days = n_days + 1,
-                                       last_day = excluded.last_day""",
-                      [k + (v, file_day) for k, v in day_counts.items()])
+        c.executemany("""INSERT INTO cell_day_stage
+                           (routeid,from_ord,to_ord,band,daytype,service_day,n)
+                         VALUES(?,?,?,?,?,?,?)
+                         ON CONFLICT(routeid,from_ord,to_ord,band,daytype,service_day)
+                         DO UPDATE SET n = n + excluded.n""",
+                      [k + (v,) for k, v in day_counts.items()])
         total += sum(day_counts.values())
     if old and total < old * 0.5 and not shrink_ok:
         c.execute("DROP TABLE cell_stage")
+        c.execute("DROP TABLE cell_day_stage")
         c.commit()
         sys.exit(f"⚠️ 중단 — 재계산 결과({total:,}건)가 기존 장부({old:,}건)의 절반 미만이다.\n"
                  "내보낸 .gz 가 전부 로컬(exportDir)에 있는지 확인할 것 — 클라우드로 move 했다면 먼저 내려받기.\n"
                  "그래도 맞다면: python3 orchestrator.py rebuild --yes --shrink-ok")
+    # 실제 운행일별 중간 장부를 셀 장부로 접는다. COUNT(*)가 서로 다른 운행일 수,
+    # MAX(service_day)가 live bump와 같은 last_day다.
+    c.execute("""INSERT INTO cell_stage(routeid,from_ord,to_ord,band,daytype,n,n_days,last_day)
+                 SELECT routeid,from_ord,to_ord,band,daytype,
+                        SUM(n),COUNT(*),MAX(service_day)
+                 FROM cell_day_stage
+                 GROUP BY routeid,from_ord,to_ord,band,daytype""")
     ncell = c.execute("SELECT COUNT(*) FROM cell_stage").fetchone()[0]
     c.execute("DELETE FROM cell")
     c.execute("INSERT INTO cell SELECT * FROM cell_stage")
     c.execute("DROP TABLE cell_stage")
+    c.execute("DROP TABLE cell_day_stage")
     c.commit()
     print(f"재계산 완료: 파일 {len(files)}개 → 관측 {total:,}건 · 셀 {ncell:,}개 "
           f"(이전 장부 {old:,}건" + (f" · 깨진 줄 {bad}" if bad else "") + ")")

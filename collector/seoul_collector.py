@@ -102,7 +102,14 @@ def load_key():
 def fetch(key, op, **params):
     q = urllib.parse.urlencode({"serviceKey": key, **params})
     with urllib.request.urlopen(f"{BASE}/{op}?{q}", timeout=20) as r:
-        return ET.fromstring(r.read().decode("utf-8", "replace"))
+        root = ET.fromstring(r.read().decode("utf-8", "replace"))
+    # 서울 API도 오류를 HTTP 200 XML로 돌려준다. headerCd를 안 보면 오류 응답의
+    # itemList 없음이 정상 빈 스냅샷으로 바뀌고 해당 (밴드,노선)을 done 처리한다.
+    code = root.findtext(".//headerCd")
+    if code is not None and str(code).strip() not in ("0", "00"):
+        msg = root.findtext(".//headerMsg") or root.findtext(".//headerMsg1") or "unknown"
+        raise RuntimeError(f"headerCd={code}:{msg[:80]}")
+    return root
 
 
 def refresh_routes(key):
@@ -159,6 +166,10 @@ def snapshot(key, rid):
             "sec1": f.get("nstnSec1"), "sec2": f.get("nstnSec2"),   # 다음 구간 예정시간
             "spd1": f.get("traSpd1"), "term": f.get("term"),
         })
+    # 등록된 노선은 운행 여부와 무관하게 정류장 목록을 돌려준다. 0행은 유효한
+    # '버스 없음'이 아니라 오류 형식 변경/부분 응답일 가능성이 크므로 재시도한다.
+    if not out:
+        raise RuntimeError("empty_route_snapshot")
     return out
 
 
@@ -271,11 +282,12 @@ def main():
         gap = max(2.0, min(30.0, secs / min(len(todo), left)))
 
         rid = random.choice(todo)       # 무작위 — 항상 같은 순서면 노선별 위상이 고정된다
+        # 호출 전에 예약한다. 응답 도중 프로세스가 죽어도 실제 쿼터보다 장부가 작아져
+        # 재시작 후 상한을 넘는 경로가 없게 한다.
+        add_calls(qday, 1)
         try:
             rows = snapshot(key, rid)
-            add_calls(qday, 1)
         except Exception as e:
-            add_calls(qday, 1)          # 실패도 쿼터를 먹는다
             # ⚠️ [리뷰 R1 #5] 실패를 done 으로 찍으면 완료율이 '성공률'이 아니라
             #    '시도율'이 된다. done 은 안 찍고 지수 백오프로 재시도, MAX 회 넘으면
             #    포기(todo 에서 빠지되 done 도 아니라 대시보드가 미완료로 본다).

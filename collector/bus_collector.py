@@ -437,9 +437,17 @@ def main():
                         bumps.append((routeid, o, o + 1, band, dtype, sday))
 
         if rows:
-            with open(os.path.join(O.DATA, f"bus-{day}.jsonl"), "a", encoding="utf-8") as f:
-                for r in rows:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            # 사이클이 04시 경계를 걸치면 노선별 응답시각에 따라 운행일이 갈린다.
+            # 사이클 시작 때 잡은 day 하나로 쓰면 새 운행일 행이 전날 파일에 섞이고,
+            # rebuild 의 날짜 다양성 계산과 live 장부가 달라진다. 행의 t 기준으로 분리한다.
+            by_day = {}
+            for r in rows:
+                rt = datetime.fromisoformat(r["t"])
+                by_day.setdefault(service_day(rt), []).append(r)
+            for row_day, day_rows in by_day.items():
+                with open(os.path.join(O.DATA, f"bus-{row_day}.jsonl"), "a", encoding="utf-8") as f:
+                    for r in day_rows:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
             written += len(rows)
         if bumps:
             for a in bumps:

@@ -358,10 +358,27 @@ def snapshot():
     byday = {}
     with _DB_LOCK:
         day_rows = c.execute(
-            "SELECT daytype, SUM(n), COUNT(*), SUM(n >= ? AND n_days >= ?) FROM cell GROUP BY daytype",
-            (tgt, md)).fetchall()
-    for d, n, cells, full in day_rows:
-        byday[d] = {"obs": n, "cells": cells, "done": full, "pct": full / day_goal if day_goal else 0}
+            """SELECT daytype, SUM(n), COUNT(*),
+                      SUM(n >= ? AND n_days >= ?),
+                      COALESCE(SUM(MIN(n,?)),0),
+                      COALESCE(SUM(MIN(n_days,?)),0),
+                      COALESCE(SUM(n >= ?),0),
+                      COALESCE(SUM(n_days >= ?),0)
+               FROM cell GROUP BY daytype""",
+            (tgt, md, tgt, md, tgt, md)).fetchall()
+    for d, n, cells, full, fill_n, day_fill_n, sample_ready, date_ready in day_rows:
+        byday[d] = {
+            "obs": n, "cells": cells, "done": full,
+            "pct": full / day_goal if day_goal else 0,
+            # 이진 완료율은 2주차 전까지 0에 가까워 고장처럼 보인다. 표본 건수와
+            # 날짜 다양성이 각각 얼마나 차는지 연속 진행률도 함께 제공한다.
+            "fillN": fill_n,
+            "fillPct": fill_n / (day_goal * tgt) if day_goal else 0,
+            "dayFillN": day_fill_n,
+            "dayFillPct": day_fill_n / (day_goal * md) if day_goal else 0,
+            "sampleReady": sample_ready,
+            "dateReady": date_ready,
+        }
 
     # 쿼터는 달력일 키다 (data.go.kr 자정 리셋) — 운행일(service_day)이 아니다
     calls = bus_collector.read_calls(bus_collector.quota_day(datetime.now(O.KST))) if bus_collector else 0
@@ -408,6 +425,11 @@ def snapshot():
             cap = med * 3                                          # 이상치 컷 — 중앙값 3배
             hi = max([w for w in weeks if w <= cap], default=weeks[0])
             eta, eta_hi = weeks[0] * 7, hi * 7                     # 일 단위
+            # 날짜 다양성 완료조건의 물리적 하한. 같은 daytype은 주 1회만 오므로
+            # minDays개의 서로 다른 날짜를 채우는 데 최소 minDays주가 필요하다.
+            # 관측량 기반 ETA가 이보다 작게 나와도 달력상 달성할 수 없다.
+            date_floor = md * 7
+            eta, eta_hi = max(eta, date_floor), max(eta_hi, date_floor)
 
     # 공휴일 — 오늘이 공휴일이면 관측은 쌓이되 장부엔 안 들어간다. 그 사실이
     # 화면에 없으면 "수집은 도는데 진행률이 안 오른다"로 보여 고장으로 오인한다.
@@ -426,7 +448,7 @@ def snapshot():
     return {
         "routes": nroute, "segments": nseg, "goal": goal, "dayGoal": day_goal,
         "dayNeed": nseg * nb * tgt,  # 요일 하나의 필요 관측 건수 = 밴드별 need × 밴드 수
-        "target": tgt,
+        "target": tgt, "minDays": md,
         "done": done, "seen": seen, "total": total,
         "pct": done / goal if goal else 0,
         "bands": band_rows, "days": byday, "today": today, "nowBand": nowband,
@@ -473,6 +495,8 @@ PAGE = """<!doctype html><meta charset="utf-8"><title>수집 현황</title>
 <div id=app>불러오는 중…</div>
 <script>
 const pct = x => (x*100).toFixed(1)+'%';
+// 초기 엄격 완료율은 0.01%보다 작을 수 있다. 0이 아닌 값을 0.0%로 숨기지 않는다.
+const pctFine = x => x>0 && x<0.001 ? (x*100).toFixed(3)+'%' : pct(x);
 const num = x => (x||0).toLocaleString();
 function bar(p, cls){ return `<div class=bar><div class="fill ${cls||''}" style="width:${Math.min(100,p*100)}%"></div></div>`; }
 
@@ -521,7 +545,7 @@ function renderBus(d){
      + `<br>키 <b>${nkey}개</b>(계정 독립 세션·쿼터) · 사이클당 최대 <b>${num(d.maxRoutes||170)}</b>노선 폴링`
      + (nkey>=2 ? ' — 세션·rate 가 키 단위라 커버 속도 ×'+nkey : '') + `</div>`;
   // 완성률
-  h += `<div class=big>${pct(d.pct)}</div>`;
+  h += `<div class=big>${pctFine(d.pct)}</div>`;
   const etaTxt = d.etaMeasuring ? ' · 남은 기간 <b>측정 중</b> (관측 하루치 쌓이면 표시)'
     : d.etaDays!=null ? ` · 남은 기간 약 <b>${Math.round(d.etaDays)}~${Math.round(d.etaDaysHi)}일</b>`
        + ` (${(d.etaDays/7).toFixed(0)}~${(d.etaDaysHi/7).toFixed(0)}주 · 밴드별 천장 도달 기준)` : '';
@@ -572,14 +596,19 @@ function renderBus(d){
   }
 
   // 요일 — 7종 전부 분리
-  h += `<h2>요일별 완성률 (전부 분리) — 각 요일은 주 1일씩만 온다 (셀 ${d.target}샘플은 대개 그 요일 하루 안에 참 · 기간은 로테이션 라운드가 지배)</h2><table>`;
+  h += `<h2>요일별 완성률 (전부 분리)</h2>
+        <div class=sub>엄격 완료 = 셀당 관측 ${d.target}건 + 서로 다른 같은 요일 ${d.minDays||2}일.
+        첫 주에는 표본이 쌓여도 날짜 조건 때문에 충족 셀이 0인 것이 정상이다.
+        아래 표본·날짜 충전률로 실제 진행을 함께 본다.</div><table>`;
   for(const [k,label] of [['mon','월'],['tue','화'],['wed','수'],['thu','목'],['fri','금'],['sat','토'],['sun','일']]){
-    const v = d.days[k] || {obs:0,done:0,cells:0,pct:0};
+    const v = d.days[k] || {obs:0,done:0,cells:0,pct:0,fillPct:0,dayFillPct:0};
     h += `<tr><td width=40>${label}</td>
-          <td class=n width=64><b>${pct(v.pct)}</b></td>
+          <td class=n width=72><b>${pctFine(v.pct)}</b></td>
           <td width=250>${bar(v.pct, v.pct>=1?'ok':'')}</td>
           <td class=n style="white-space:nowrap">충족 셀 ${num(v.done)} / ${num(d.dayGoal)}</td>
-          <td class=n style="white-space:nowrap;opacity:.6">관측 ${num(v.obs)} / ${num(d.dayNeed)}건</td></tr>`;
+          <td class=n style="white-space:nowrap;opacity:.75">표본 ${pct(v.fillPct||0)}</td>
+          <td class=n style="white-space:nowrap;opacity:.75">날짜 ${pct(v.dayFillPct||0)}</td>
+          <td class=n style="white-space:nowrap;opacity:.6">관측 ${num(v.obs)}건</td></tr>`;
   }
   h += '</table>';
 
