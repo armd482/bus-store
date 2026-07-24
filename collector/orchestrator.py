@@ -780,13 +780,42 @@ def pick_routes(conn, n, target, nbands, t=None, max_empty=6):
     rest = [p for p in live if p["routeid"] not in pin]
     left = n - len(pinned)
 
-    n_ex = max(0, min(cfg().get("exploreSlots", 30), left))
+    n_ex = max(0, min(cfg().get("exploreSlots", 60), left))
     explore = sorted(
         rest, key=lambda p: (p.get("cold", False), p["seen"] > 0, p["fill"], -p["goal"])
     )[:n_ex]
     taken = {p["routeid"] for p in explore}
     harvest = [p for p in rest if p["routeid"] not in taken]
-    harvest.sort(key=lambda p: (p.get("cold", False), p["pct"], -p["goal"]))
+
+    # ★ 수확 점수 = **지금 채울 수 있는** (현재 밴드·요일) 부족량. 전체 진행률이 아니다.
+    #   [외부 리뷰 R2 목적함수 오류] 전체로 고르면 "월요일 새벽이 부족한 A"를 금요일
+    #   저녁에 뽑아 쿼터를 버린다 — 지금 채울 수 있는 건 금요일 저녁 셀뿐인데. 현재
+    #   시각에 실제로 채워지는 셀이 많은 노선을 우선해야 한다.
+    #   cur_need = (현재밴드·요일의 미충족 관측 수) + (n>=target 이지만 n_days<minDays 라
+    #   새 날짜가 필요한 셀 수 — 오늘이 새 날짜면 오늘 폴링이 그 날짜를 채운다).
+    if t is not None:
+        cb = band_of(t, cfg()["timebands"])
+        cd = day_type(t)
+        today = service_day_of(t).strftime("%Y-%m-%d")
+        md = cfg().get("minDays", 2)
+        need = {}
+        if cb is not None:
+            for rid, filled, date_need in conn.execute("""
+                  SELECT routeid, COALESCE(SUM(MIN(n,?)),0),
+                         COALESCE(SUM(n>=? AND n_days<? AND (last_day IS NULL OR last_day<>?)),0)
+                  FROM cell WHERE band=? AND daytype=? GROUP BY routeid""",
+                  (target, target, md, today, cb, cd)):
+                need[rid] = (filled, date_need)
+        per_band_goal = max(1, nbands * 7)
+        for p in harvest:
+            nseg = max(1, p["goal"] // per_band_goal)      # goal = nseg × nbands × 7
+            filled, date_need = need.get(p["routeid"], (0, 0))
+            p["cur_need"] = nseg * target - filled + date_need
+        # 현재 부족량 큰 순. 동률(예: 둘 다 현재 밴드 미관측)이면 콜당 구간이 많은
+        # 긴 노선. cold 는 맨 뒤. 전체 진행률(pct)은 더는 주점수가 아니다.
+        harvest.sort(key=lambda p: (p.get("cold", False), -p["cur_need"], -p["goal"]))
+    else:
+        harvest.sort(key=lambda p: (p.get("cold", False), p["pct"], -p["goal"]))
     return pinned + explore + harvest[:left - len(explore)]
 
 
