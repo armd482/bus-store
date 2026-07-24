@@ -325,11 +325,13 @@ def snapshot():
     day_goal = nseg * nb           # 요일 하나 기준 — 요일별 진행률의 분모
     goal = day_goal * ndays        # 전체 목표 셀 (구간 × 밴드 × 7요일)
 
-    # 한 번의 스캔으로 — 5초마다 오는 /api 가 셀 수백만 규모에서도 버티도록
+    # 한 번의 스캔으로 — 백그라운드 캐시가 계산하므로 셀 수백만이어도 괜찮다.
+    # ★ 완료 = n>=target AND n_days>=minDays (같은 날 완주 방지 — 외부 리뷰)
+    md = k.get("minDays", 2)
     with _DB_LOCK:
         seen, total, done = c.execute(
-            "SELECT COUNT(*), COALESCE(SUM(n),0), COALESCE(SUM(n >= ?),0) FROM cell",
-            (tgt,)).fetchone()
+            "SELECT COUNT(*), COALESCE(SUM(n),0), COALESCE(SUM(n >= ? AND n_days >= ?),0) FROM cell",
+            (tgt, md)).fetchone()
 
     # 밴드별 — 오늘(운행일 기준) 요일만 본다. 자정~04시엔 전날 요일이 '오늘'이다
     # (01:30 관측은 전날 막차 — day_type 이 운행일 경계로 처리한다).
@@ -356,8 +358,8 @@ def snapshot():
     byday = {}
     with _DB_LOCK:
         day_rows = c.execute(
-            "SELECT daytype, SUM(n), COUNT(*), SUM(n >= ?) FROM cell GROUP BY daytype",
-            (tgt,)).fetchall()
+            "SELECT daytype, SUM(n), COUNT(*), SUM(n >= ? AND n_days >= ?) FROM cell GROUP BY daytype",
+            (tgt, md)).fetchall()
     for d, n, cells, full in day_rows:
         byday[d] = {"obs": n, "cells": cells, "done": full, "pct": full / day_goal if day_goal else 0}
 

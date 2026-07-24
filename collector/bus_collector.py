@@ -423,8 +423,9 @@ def main():
                     # 남는다. 통과는 (t_prev, t] 안에서 전부 일어났으므로 사이의 각 인접
                     # 구간에 1관측씩 준다 — 구간 폭이 넓은 관측일 뿐 거짓은 아니다.
                     # 원본 행(jsonl)은 전이 그대로 둔다. rebuild 도 같은 분해를 쓴다.
+                    sday = service_day(obs)   # 이 관측의 운행일 (n_days 계산용)
                     for o in range(prev[0], ordv):
-                        bumps.append((routeid, o, o + 1, band, dtype))
+                        bumps.append((routeid, o, o + 1, band, dtype, sday))
 
         if rows:
             with open(os.path.join(O.DATA, f"bus-{day}.jsonl"), "a", encoding="utf-8") as f:

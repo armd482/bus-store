@@ -175,9 +175,22 @@ def connect(check_same_thread=True):
         band     INTEGER NOT NULL,
         daytype  TEXT NOT NULL,
         n        INTEGER NOT NULL DEFAULT 0,
+        n_days   INTEGER NOT NULL DEFAULT 0,
+        last_day TEXT,
         PRIMARY KEY (routeid, from_ord, to_ord, band, daytype)
       )""")
     c.execute("CREATE INDEX IF NOT EXISTS cell_route ON cell(routeid)")
+    # n_days = 이 셀을 관측한 **서로 다른 운행일 수** (n 은 관측 건수). 매주 같은 요일은
+    # 반복 표본이라(중복 아님) 요일 비교엔 '같은 요일 2일+'가 필요한데, n(건수)만으론
+    # "한 날 7번"과 "3주 7번"을 못 가린다. 완료조건에 n_days 를 넣어 하루 안 완주를 막는다.
+    # (지하철 subway_cell.last_day 와 같은 장치. 외부 리뷰 R1·R2·R3 공통 지적.)
+    cols = {r[1] for r in c.execute("PRAGMA table_info(cell)")}
+    if "n_days" not in cols:
+        c.execute("ALTER TABLE cell ADD COLUMN n_days INTEGER NOT NULL DEFAULT 0")
+        c.execute("ALTER TABLE cell ADD COLUMN last_day TEXT")
+        # 기존 셀은 최소 1일치는 있으므로 n_days=1 로 시작 (완주 판정이 안 깨지게).
+        # 정확한 값은 rebuild 가 jsonl 에서 재계산한다.
+        c.execute("UPDATE cell SET n_days=1 WHERE n>0")
     # 대시보드가 5초마다 요일·밴드 필터 쿼리를 친다 — 셀이 수백만이 되면
     # daytype 풀스캔이 /api 를 초 단위로 늘린다.
     c.execute("CREATE INDEX IF NOT EXISTS cell_day ON cell(daytype)")
@@ -343,11 +356,17 @@ def rotate_jsonl(prefix):
             print(f"[삭제 보류] {os.path.basename(src)} — 백업 미확인, 원본 유지 (수동 확인 요망)", flush=True)
 
 
-def bump(conn, routeid, from_ord, to_ord, band, daytype, k=1):
+def bump(conn, routeid, from_ord, to_ord, band, daytype, day, k=1):
+    """셀 관측 +k. n(건수)은 항상 오르고, n_days(운행일 수)는 day 가 last_day 와
+    다를 때만 오른다 — 같은 날 여러 번 봐도 n_days 는 하루당 1 (외부 리뷰 R1·R2·R3)."""
     conn.execute("""
-      INSERT INTO cell(routeid,from_ord,to_ord,band,daytype,n) VALUES(?,?,?,?,?,?)
-      ON CONFLICT(routeid,from_ord,to_ord,band,daytype) DO UPDATE SET n=n+?
-    """, (routeid, from_ord, to_ord, band, daytype, k, k))
+      INSERT INTO cell(routeid,from_ord,to_ord,band,daytype,n,n_days,last_day)
+        VALUES(?,?,?,?,?,?,1,?)
+      ON CONFLICT(routeid,from_ord,to_ord,band,daytype) DO UPDATE SET
+        n = n + ?,
+        n_days = n_days + (last_day IS NOT excluded.last_day),
+        last_day = excluded.last_day
+    """, (routeid, from_ord, to_ord, band, daytype, k, day, k))
 
 
 # ── 지하철 관제 시각 (§8.1) ────────────────────────────────────────
@@ -617,14 +636,17 @@ def route_progress(conn, target, nbands):
     로테이션에서 빠져 토·일 셀이 영영 안 채워지는 구조가 된다. 대시보드(server.py)의
     분모와도 일치해야 한다.
     """
+    # ★ 완료 = n >= target **그리고** n_days >= minDays. 같은 날 target 을 다 채워도
+    #   서로 다른 운행일이 minDays 미만이면 미완료다 (요일 비교엔 날짜 다양성 필수).
+    md = cfg().get("minDays", 2)
     rows = conn.execute("""
       SELECT r.routeid, r.routeno, r.routetp, r.cityCode, r.nstops,
-             COALESCE(SUM(CASE WHEN c.n >= ? THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN c.n >= ? AND c.n_days >= ? THEN 1 ELSE 0 END), 0),
              COUNT(c.n),
              COALESCE(SUM(MIN(c.n, ?)), 0)
       FROM route r LEFT JOIN cell c ON c.routeid = r.routeid
       GROUP BY r.routeid
-    """, (target, target)).fetchall()
+    """, (target, md, target)).fetchall()
     out = []
     for rid, no, tp, city, nstops, done, seen, filln in rows:
         goal = max(1, (nstops - 1)) * nbands * 7  # 구간수 × 밴드수 × 7요일
@@ -882,13 +904,16 @@ def rebuild(force, shrink_ok=False):
     c.execute("""CREATE TABLE cell_stage (
         routeid TEXT NOT NULL, from_ord INTEGER NOT NULL, to_ord INTEGER NOT NULL,
         band INTEGER NOT NULL, daytype TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
+        n_days INTEGER NOT NULL DEFAULT 0, last_day TEXT,
         PRIMARY KEY (routeid, from_ord, to_ord, band, daytype))""")
     bad = total = 0
     k = cfg()
     hols = holiday_set()   # 자동 조회 ∪ 수동 — 수집기와 같은 기준. 루프 밖에서 한 번만
     bands = k["timebands"]
-    for p in files:
+    for p in sorted(files):   # 시간순 — last_day 가 최신 파일로 남게
         opener = gzip.open if p.endswith(".gz") else open
+        # 한 파일 = 한 운행일(bus-YYYY-MM-DD). 그 셀들엔 n_days 를 1 더한다.
+        file_day = os.path.basename(p)[4:14]
         day_counts = {}   # 이 파일(하루)에서만 — 메모리 상한이 하루치로 묶인다
         for line in opener(p, mode="rt", encoding="utf-8"):
             try:
@@ -919,11 +944,14 @@ def rebuild(force, shrink_ok=False):
             for o in range(fo, to):
                 key = (r["routeid"], o, o + 1, b, dt)
                 day_counts[key] = day_counts.get(key, 0) + 1
-        c.executemany("""INSERT INTO cell_stage(routeid,from_ord,to_ord,band,daytype,n)
-                         VALUES(?,?,?,?,?,?)
+        # n 은 관측 건수 누적, n_days 는 파일(=운행일)마다 +1, last_day 는 최신 파일.
+        c.executemany("""INSERT INTO cell_stage(routeid,from_ord,to_ord,band,daytype,n,n_days,last_day)
+                         VALUES(?,?,?,?,?,?,1,?)
                          ON CONFLICT(routeid,from_ord,to_ord,band,daytype)
-                         DO UPDATE SET n = n + excluded.n""",
-                      [k + (v,) for k, v in day_counts.items()])
+                         DO UPDATE SET n = n + excluded.n,
+                                       n_days = n_days + 1,
+                                       last_day = excluded.last_day""",
+                      [k + (v, file_day) for k, v in day_counts.items()])
         total += sum(day_counts.values())
     if old and total < old * 0.5 and not shrink_ok:
         c.execute("DROP TABLE cell_stage")
