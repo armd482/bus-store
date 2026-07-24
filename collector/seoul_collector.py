@@ -212,7 +212,9 @@ def main():
     print("  " + " · ".join(f"{TYPE_NM.get(k, k)}{v}" for k, v in sorted(tp_n.items())), flush=True)
 
     day = service_day(now())
-    done = load_done(day)   # (band, routeid) -> 이 운행일에 찍었나. 재시작해도 이어간다
+    done = load_done(day)   # (band, routeid) -> **성공**만. 재시작해도 이어간다
+    fails = {}              # (band, routeid) -> 연속 실패 횟수 (메모리 — 재시작 시 새 시도)
+    MAX_TRIES = 3           # 밴드 안에서 이만큼 실패하면 포기 (다음 밴드에 다시 온다)
     rotated_day = None
     written = 0
     if done:
@@ -237,7 +239,8 @@ def main():
             time.sleep(120)
             continue
         qday = quota_day(t)
-        todo = [rid for rid in R if (b, rid) not in done]
+        # 성공(done)도 아니고 포기(fails>=MAX)도 아닌 것만 — 실패는 재시도 대상
+        todo = [rid for rid in R if (b, rid) not in done and fails.get((b, rid), 0) < MAX_TRIES]
         if not todo:
             time.sleep(60)              # 이 밴드는 다 찍었다 — 다음 밴드까지 쉰다
             continue
@@ -273,12 +276,16 @@ def main():
             add_calls(qday, 1)
         except Exception as e:
             add_calls(qday, 1)          # 실패도 쿼터를 먹는다
-            print(f"[{t:%H:%M:%S}] 실패 {R[rid]['no']}: {type(e).__name__}", flush=True)
-            done[(b, rid)] = True       # 이 밴드에선 재시도 안 한다 (다음 밴드에 다시 온다)
-            save_done(day, done)
-            time.sleep(gap)
+            # ⚠️ [리뷰 R1 #5] 실패를 done 으로 찍으면 완료율이 '성공률'이 아니라
+            #    '시도율'이 된다. done 은 안 찍고 지수 백오프로 재시도, MAX 회 넘으면
+            #    포기(todo 에서 빠지되 done 도 아니라 대시보드가 미완료로 본다).
+            fails[(b, rid)] = fails.get((b, rid), 0) + 1
+            nt = fails[(b, rid)]
+            print(f"[{t:%H:%M:%S}] 실패({nt}/{MAX_TRIES}) {R[rid]['no']}: {type(e).__name__}", flush=True)
+            time.sleep(min(30.0, gap * (2 ** (nt - 1))))   # 지수 백오프
             continue
-        done[(b, rid)] = True
+        done[(b, rid)] = True           # 성공(빈 응답 포함 — 유효)만 done
+        fails.pop((b, rid), None)
         save_done(day, done)
 
         if rows:

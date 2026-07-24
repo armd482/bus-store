@@ -336,14 +336,19 @@ def main():
         with LOCK:
             STATE["fetching"] = True
         meta = {p["routeid"]: p for p in picked}
+        # ★ 쿼터는 호출 **전**에 예약 기록한다 [리뷰 R1 #4]. 사이클 도중 프로세스가
+        #   죽으면(자동 재시작) 이미 나간 콜이 장부에서 빠져 재시작 후 실제 API 사용량이
+        #   카운터보다 커지고, 반복되면 쿼터를 넘긴다. 조금 과다계상(죽어서 못 보낸 콜까지
+        #   센다)이 쿼터 초과보다 안전하다.
+        add_calls(qday, len(picked))
         results = fetch_all(keys, picked, rate, workers, inflight, hold)
-        calls = len(picked)
 
         # code99(세션 고갈)는 일시적이다 — 꼬리 지연이 세션 30개를 채우는 순간에만
         # 몰리고 몇 초 뒤엔 풀린다 (✅ 실측: 사이클별 실패 7→8→0). rate/inflight 를
         # 더 조이면 사이클만 길어지므로, 실패분만 잠깐 뒤에 한 번 더 흘린다.
         failed = [meta[rid] for rid, _, err, _ in results if err]
-        if failed and read_calls(qday) + calls + len(failed) <= quota:
+        if failed and read_calls(qday) + len(failed) <= quota:
+            add_calls(qday, len(failed))   # 재시도도 호출 전에 예약 기록
             # ⚠️ 재시도를 곧장 20개 동시로 던지면 code99(세션 30 초과)가 재발한다.
             #    타임아웃난 요청은 우리가 포기해도 TAGO 쪽 세션이 살아 있어(좀비),
             #    새 20개 + 좀비 > 30 → code99 연쇄. 실제로 이 연쇄가 75/170 같은
@@ -357,10 +362,7 @@ def main():
             time.sleep(pause)
             retry = {rid: (rid, items, err, o)
                      for rid, items, err, o in fetch_all(keys, failed, rate, workers, rinflight, hold)}
-            calls += len(failed)
             results = [retry.get(r[0], r) if r[2] else r for r in results]
-
-        add_calls(qday, calls)
         cyc += 1
 
         cyc_obs = now()   # 사이클 종료 시각 — 로그·STATE 용 (데이터의 t 는 노선별 obs)
