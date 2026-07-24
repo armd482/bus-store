@@ -491,7 +491,7 @@ def main():
         # ★ 다음 사이클 in-flight 조절 (AIMD). code99 는 세션 30 초과라 곧장 물러나고
         #   (×0.6), 깨끗하면 천천히 차오른다(+2). errs 에 잔여 code99 가 없어도 이번
         #   사이클에서 code99 를 겪었을 수 있으므로 원본 results 로 판단한다.
-        saw99 = any("code99" in (err or "") for _, _, err in results)
+        saw99 = any("code99" in (err or "") for _, _, err, _ in results)
         prev_inflight = inflight
         if saw99:
             inflight = max(8, int(inflight * 0.6))
