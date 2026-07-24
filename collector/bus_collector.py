@@ -201,23 +201,26 @@ def fetch(key, city, routeid):
     try:
         with urllib.request.urlopen(f"{BASE}?{q}", timeout=15) as r:
             d = json.loads(r.read().decode())
+        obs = now()   # ★ 응답 수신 **직후** = 이 노선의 실제 관측시각.
+        # ⚠️ 사이클 끝 시각 하나를 340노선에 다 찍으면 첫 노선은 최대 ~40s(사이클 길이)
+        #    늦게 찍힌다 — 통과구간 (t_prev,t]·기점 출발시각·시각표 분석이 그만큼 왜곡된다.
         h = d.get("response", {}).get("header", {})
         code = str(h.get("resultCode", "?"))
         if code not in ("00", "0"):
-            return routeid, [], f"code{code}:{h.get('resultMsg','')[:24]}"
+            return routeid, [], f"code{code}:{h.get('resultMsg','')[:24]}", obs
         body = d["response"].get("body") or {}
         if not isinstance(body, dict):
-            return routeid, [], "body_not_dict"
+            return routeid, [], "body_not_dict", obs
         it = (body.get("items") or {}).get("item") or []
         if isinstance(it, dict):
             it = [it]
-        return routeid, it, None
+        return routeid, it, None, obs
     except urllib.error.HTTPError as e:
         # 상태코드가 곧 원인이다: HTTP429=rate limit(키 공유·버스트), HTTP5xx=서버 장애.
         # 'HTTPError' 로 뭉치면 로그만으로 구분이 안 된다 (✅ 실전에서 아쉬웠던 것).
-        return routeid, [], f"HTTP{e.code}"
+        return routeid, [], f"HTTP{e.code}", now()
     except Exception as e:
-        return routeid, [], type(e).__name__
+        return routeid, [], type(e).__name__, now()
 
 
 def main():
@@ -339,7 +342,7 @@ def main():
         # code99(세션 고갈)는 일시적이다 — 꼬리 지연이 세션 30개를 채우는 순간에만
         # 몰리고 몇 초 뒤엔 풀린다 (✅ 실측: 사이클별 실패 7→8→0). rate/inflight 를
         # 더 조이면 사이클만 길어지므로, 실패분만 잠깐 뒤에 한 번 더 흘린다.
-        failed = [meta[rid] for rid, _, err in results if err]
+        failed = [meta[rid] for rid, _, err, _ in results if err]
         if failed and read_calls(qday) + calls + len(failed) <= quota:
             # ⚠️ 재시도를 곧장 20개 동시로 던지면 code99(세션 30 초과)가 재발한다.
             #    타임아웃난 요청은 우리가 포기해도 TAGO 쪽 세션이 살아 있어(좀비),
@@ -348,32 +351,32 @@ def main():
             #    15s 를 넘기 시작하면서 악화). 그래서 실패 성격에 따라 물러선다:
             #    - code99 가 섞였으면 세션이 빠지도록 오래 쉬고(6s) in-flight 를 반으로
             #    - 타임아웃뿐이면 짧게(2s), 동시성 그대로
-            has99 = any("code99" in err for _, _, err in results if err)
+            has99 = any("code99" in err for _, _, err, _ in results if err)
             pause = 6 if has99 else 2
             rinflight = max(6, inflight // 2) if has99 else inflight
             time.sleep(pause)
-            retry = {rid: (rid, items, err)
-                     for rid, items, err in fetch_all(keys, failed, rate, workers, rinflight, hold)}
+            retry = {rid: (rid, items, err, o)
+                     for rid, items, err, o in fetch_all(keys, failed, rate, workers, rinflight, hold)}
             calls += len(failed)
             results = [retry.get(r[0], r) if r[2] else r for r in results]
 
         add_calls(qday, calls)
         cyc += 1
 
-        obs = now()
-        band = O.band_of(obs, bands)
-        dtype = O.day_type(obs)
-        # 공휴일(운행일 기준) — 평일 다이어가 아니므로 요일 표본에 안 섞는다.
-        # jsonl 엔 그대로 남는다 (config.holidays 를 고치면 rebuild 로 재분류).
-        hol = O.is_holiday(obs)
+        cyc_obs = now()   # 사이클 종료 시각 — 로그·STATE 용 (데이터의 t 는 노선별 obs)
         rows, bumps = [], []
         moving = 0
         errs = {}
 
-        for routeid, items, err in results:
+        for routeid, items, err, obs in results:   # ★ obs = 이 노선의 실제 응답시각
             if err:
                 errs[err] = errs.get(err, 0) + 1
                 continue
+            # 밴드·요일·공휴일을 **노선별 관측시각**으로 계산 — 사이클이 밴드/운행일
+            # 경계를 걸치면(08:59~09:01, 03:59~04:01) 노선마다 다르게 떨어져야 정확하다.
+            band = O.band_of(obs, bands)
+            dtype = O.day_type(obs)
+            hol = O.is_holiday(obs)
             O.mark_empty(conn, routeid, not items)   # 추정이 아니라 관측이 정한다
             moving += len(items)
             for b in items:
@@ -462,7 +465,7 @@ def main():
         ok = len(picked) - nerr
         rec = len(failed) - nerr  # 재시도로 회복된 수
         mem = O.rss_mb()
-        print(f"[{obs:%H:%M:%S}] 응답 {ok}/{len(picked)}노선 · 운행 {moving}대 · "
+        print(f"[{cyc_obs:%H:%M:%S}] 응답 {ok}/{len(picked)}노선 · 운행 {moving}대 · "
               f"통과 +{len(rows)} (누적 {written:,}) · {took:.0f}s"
               + (f" · {mem:.0f}MB" if mem else "")
               + (f" · 재시도 {len(failed)}→회복 {rec}" if failed else ""), flush=True)
@@ -471,9 +474,9 @@ def main():
             # (⚠️ 표식) 원인을 자르지 않고 전부 기록한다. 회복된 재시도는 위
             # 사이클 줄(콘솔 전용)에만 나온다.
             detail = " ".join(f"{k}×{v}" for k, v in sorted(errs.items(), key=lambda x: -x[1]))
-            print(f"[{obs:%H:%M:%S}] ⚠️ 실패 {nerr}/{len(picked)} (재시도 후) — {detail}", flush=True)
+            print(f"[{cyc_obs:%H:%M:%S}] ⚠️ 실패 {nerr}/{len(picked)} (재시도 후) — {detail}", flush=True)
         if cyc % 20 == 0:
-            print(f"[{obs:%H:%M:%S}] 콜 {read_calls(qday):,}/{quota:,}", flush=True)
+            print(f"[{cyc_obs:%H:%M:%S}] 콜 {read_calls(qday):,}/{quota:,}", flush=True)
 
         # ★ 다음 사이클 in-flight 조절 (AIMD). code99 는 세션 30 초과라 곧장 물러나고
         #   (×0.6), 깨끗하면 천천히 차오른다(+2). errs 에 잔여 code99 가 없어도 이번
@@ -485,7 +488,7 @@ def main():
         elif inflight < inflight_max:
             inflight = min(inflight_max, inflight + 2)
         if inflight != prev_inflight:
-            print(f"[{obs:%H:%M:%S}] in-flight {prev_inflight}→{inflight} "
+            print(f"[{cyc_obs:%H:%M:%S}] in-flight {prev_inflight}→{inflight} "
                   f"({'code99 후퇴' if saw99 else '회복'})", flush=True)
 
         # 지터는 max 안에. 밖에 두면 took > interval 일 때 음수가 되어 죽는다.
