@@ -1,0 +1,23 @@
+{
+  "id": "2026-07-24-case1",
+  "start": {
+    "query": "서울 중구 퇴계로90길 74"
+  },
+  "end": {
+    "query": "경기도 성남시 수정구 금토로80번길 40"
+  },
+  "walk_start": "2026-07-24T15:22:00",
+  "search_dttm": "202607241522",
+  "count": 10,
+  "profile": {
+    "speed_mps": 1.66
+  },
+  "prefer_routes": [
+    "6211",
+    "9401",
+    "3"
+  ],
+  "transit_waits_s": {},
+  "actual_total_s": 4505.34,
+  "comparable_route": false
+}
