@@ -7,10 +7,15 @@
 **파이썬 3.7+ 만 있으면 된다.** 표준 라이브러리만 쓰므로 `pip install` 이 없고, SQLite 는 파이썬에 내장이다.
 
 ```bash
-cp .env.example .env      # 키를 채운다. 발급처는 .env.example 안에.
+cp ../.env.example ../.env  # 공통 키가 있을 때
+cp .env.example .env        # 수집기 전용 키
 python3 fetch_routes.py   # 노선 풀 — 경기 2,200노선(정류소 수 + 운행시간), 약 10분. 처음 한 번만.
 python3 server.py         # 수집 + 대시보드 → http://localhost:877
 ```
+
+키 탐색 순서는 `운영체제 환경변수 → collector/.env → find-path/.env`다.
+`GBIS_BUS_KEY`를 별도로 두지 않으면 루트의 `DATA_GO_KR_KEY`를 기본 키로
+사용한다. API별 승인 키가 다르면 `collector/.env`의 전용 키가 우선한다.
 
 `fetch_routes.py` 를 **먼저** 돌려야 한다. 노선 풀이 커버리지의 분모라, 비어 있으면 폴링할 대상이 없다.
 

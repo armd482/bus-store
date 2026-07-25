@@ -35,6 +35,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 import orchestrator as O
+import env_config as E
 
 BASE = "http://ws.bus.go.kr/api/rest"      # ⚠️ https 아님 — 443 이 안 열린다 (§3.2 실측)
 PREFIX = "seoul"
@@ -85,17 +86,10 @@ def load_key():
     """data.go.kr 키는 계정 공통이라 GBIS 키가 서울 데이터셋에도 그대로 통한다
     (✅ 실측: 노선·도착·위치 3종 모두 headerCd=0). 별도 키를 안 만드는 이유."""
     for name in ("SEOUL_BUS_KEY", "GBIS_BUS_KEY"):
-        v = os.environ.get(name)
+        fallback = "DATA_GO_KR_KEY" if name == "GBIS_BUS_KEY" else None
+        v = E.get(name, fallback)
         if v:
             return v
-    try:
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")) as f:
-            env = dict(l.strip().split("=", 1) for l in f if "=" in l and not l.startswith("#"))
-        for name in ("SEOUL_BUS_KEY", "GBIS_BUS_KEY"):
-            if env.get(name):
-                return env[name]
-    except OSError:
-        pass
     return None
 
 

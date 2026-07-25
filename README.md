@@ -42,6 +42,12 @@ collector/
   holidays.py               공휴일 자동 조회 (대체·임시공휴일 포함) → 장부에서 제외
   config.json               목표·밴드·쿼터 — 각 값이 무엇을 지배하는지 주석
   README.md                 수집기 운영 (제어 · TCC · 쿼터)
+
+spike/validation/
+  score.py                  연결 이벤트 단위 개인화 도착·연결 평가
+  journey_score.py          대중교통 + 전 도보 + 개인속도 + 신호 전체 여정 평가
+  tmap_journey_client.py    TMAP 대중교통 leg·보행자 재조회 연결기
+  MEASUREMENT.md            관측·평가 프로토콜
 ```
 
 **의존성 없음** — 파이썬 표준 라이브러리만 쓴다. `pip install` 불필요.
@@ -51,8 +57,9 @@ collector/
 ## 빠른 시작 (수집)
 
 ```bash
+cp .env.example .env && chmod 600 .env   # 공통 키가 있을 때
+cp collector/.env.example collector/.env && chmod 600 collector/.env
 cd collector
-cp .env.example .env && chmod 600 .env   # 키 채우기 — 발급처는 .env.example 참조
 python3 fetch_routes.py                   # 노선 풀 (경기 2,200노선 + 운행시간, ~10분)
 python3 server.py                         # 수집 + 대시보드 → http://localhost:877 (리눅스 서비스는 8080)
 ```

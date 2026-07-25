@@ -38,6 +38,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import orchestrator as O    # 공용 로테이션(rotate_jsonl) · 지하철 셀(bump_subway) · 공휴일(is_holiday)
+import env_config as E
 
 KST = timezone(timedelta(hours=9))
 
@@ -71,27 +72,11 @@ SERVICE_WINDOW = (5, 26)   # [시작시, 끝시) — 24 초과 = 익일
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "data")
-ENV_FILE = os.path.join(HERE, "..", "..", "bus-test", ".env.local")
 
 
 def load_key(envname="SEOUL_SUBWAY_KEY"):
-    """env 변수 또는 .env 에서 인증키를 읽는다 (노선마다 다른 키를 줄 수 있게 envname 파라미터).
-
-    launchd 로 뜬 프로세스는 ~/Desktop 을 못 읽는다(macOS TCC) → 자기 폴더 .env 를 본다.
-    """
-    key = os.environ.get(envname)
-    if key:
-        return key
-    for path in (os.path.join(HERE, ".env"), ENV_FILE):
-        try:
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith(envname + "="):
-                        return line.split("=", 1)[1].strip().strip('"').strip("'")
-        except OSError:
-            continue
-    return None
+    """환경변수 → collector/.env → 루트 .env 순으로 인증키를 읽는다."""
+    return E.get(envname)
 
 
 def now():

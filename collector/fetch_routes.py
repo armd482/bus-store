@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import orchestrator as O
 import bus_collector as B
+import env_config as E
 
 BASE = "https://apis.data.go.kr/1613000/BusRouteInfoInqireService"
 
@@ -30,18 +31,7 @@ WORKERS = 15
 
 
 def load_key():
-    key = os.environ.get("GBIS_BUS_KEY")
-    if key:
-        return key
-    for p in (os.path.join(O.HERE, ".env"),
-              os.path.join(O.HERE, "..", "..", "bus-test", ".env.local")):
-        try:
-            for line in open(p, encoding="utf-8"):
-                if line.strip().startswith("GBIS_BUS_KEY="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-        except OSError:
-            continue
-    return None
+    return E.get("GBIS_BUS_KEY", "DATA_GO_KR_KEY")
 
 
 def get(key, op, retries=3, **kw):

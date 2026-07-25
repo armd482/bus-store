@@ -170,6 +170,12 @@ def mac_run_dir():
     if dst != HERE:
         shutil.copytree(HERE, dst, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("data", "logs", "__pycache__", "*.pyc"))
+        # launchd는 Desktop의 프로젝트 루트 .env도 읽지 못한다. 공통 파일이
+        # 있으면 실행본 안에 별도 이름으로 복사하고, collector/.env는 그대로
+        # 유지해 구성요소 전용 값의 우선순위를 보존한다.
+        root_env = os.path.join(HERE, "..", ".env")
+        if os.path.exists(root_env):
+            shutil.copy2(root_env, os.path.join(dst, ".env.common"))
         print(f"TCC 보호 밖으로 복사: {dst}  (코드 수정 후엔 install 재실행으로 재배포)")
     return dst
 

@@ -45,6 +45,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
+import env_config as E
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 CACHE = os.path.join(DATA, "holidays.json")
@@ -160,19 +162,8 @@ def _years():
 
 def data_go_kr_key():
     """특일정보용 data.go.kr 키. bus_collector 를 import 하지 않는다 —
-    orchestrator ↔ bus_collector 순환이 생긴다. 같은 .env 를 직접 읽는다."""
-    k = os.environ.get("GBIS_BUS_KEY")
-    if k:
-        return k
-    for p in (os.path.join(HERE, ".env"),
-              os.path.join(HERE, "..", "..", "bus-test", ".env.local")):
-        try:
-            for line in open(p, encoding="utf-8"):
-                if line.strip().startswith("GBIS_BUS_KEY="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-        except OSError:
-            continue
-    return None
+    orchestrator ↔ bus_collector 순환이 생기므로 공통 로더만 쓴다."""
+    return E.get("GBIS_BUS_KEY", "DATA_GO_KR_KEY")
 
 
 def load(key=None, force=False):
