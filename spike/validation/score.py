@@ -1,15 +1,34 @@
 #!/usr/bin/env python3
 """개인화 길찾기 해결책 평가기.
 
+★ 판정 대상은 **'어느 모델을 써야 하나'가 아니라, 이런 식으로 도보 속도 + 보행신호
+   대기를 반영한 접근이 기존 지도보다 나은가(적합성)**이다. 여러 추정 방법(상한·유도)이
+   있고, 그 방법들로도 지도보다 개선되는가를 본다. 그래서 '제품'은 단일 모델이 아니라
+   **맥락별 추정기**로 둔다 (verdict: 절벽=상한(안전)·배차=유도(정확)).
+
+검증 대상 가설: **도보 속도와 보행신호 대기를 반영하면, 기존 지도(네이버·카카오)
+보다 더 정확한 연결 안내를 준다.** 여기서 '정확'은 도착시각 정밀도가 아니라
+**안내한 연결이 실제와 맞는가**로 정의한다 — 지도가 명시한 것과 다른 버스를 타거나
+(different_bus), 지도보다 더 대기하거나(more_wait), 그 버스를 놓치는(miss) 경우를
+지도의 부정확으로 보고, 그때 우리 모델이 실제를 맞히는지를 잰다 (classify_map_outcome).
+
 같은 연결 이벤트에서 아래를 실제 관측과 비교한다.
 
-  Naver          네이버 표시 도보시간 + 네이버 선택 연결
-  Speed          네이버 도보시간 × 개인 시간비율
-  Speed+Signal   Speed + 횡단보도별 기대 신호대기
-  Oracle         Speed + 실제 신호대기 (예측이 아닌 개선 상한)
+  Naver          네이버 표시 도보시간 + 네이버 선택 연결  ← 기존 지도(기준선)
+  Speed          네이버 도보시간 × 개인 시간비율          ← 도보 속도만 반영
+  Speed+Signal   Speed + 횡단보도별 예측 신호대기         ← 도보 속도 + 신호 (제품)
   TMAP-Personal  TMAP 시설별 거리 / 개인 물리속도
-  TMAP+Signal    TMAP-Personal + 횡단보도별 기대 신호대기
+  TMAP+Signal    TMAP-Personal + 예측 신호대기
   Kakao-Personal 카카오 도보거리 / 개인 물리속도
+
+  ※ '신호를 완벽히 알면 얼마나 정확해지나'(개선 천장)는 별도 모델로 두지 않는다 —
+     그 값은 관측된 실제 신호대기(`actual.signal_wait_s`)를 Speed 도착에 더해
+     한 줄로 읽는다. 예전엔 이를 `Oracle`/`+RealSignal` 모델로 뒀으나 '실측'이
+     실시간 신호 API 로 오해돼 없앴다 (게이트엔 원래 안 들어갔다).
+
+★ 통과 게이트는 **연결 안내 정확도 + 위험오답 0 + 지도 대비 순증분**이다.
+  도착시각 MAE 는 진단값으로만 남긴다(게이트 아님) — 신호를 보수적으로 과대예측하면
+  MAE 는 나빠지지만 연결 안내는 정확할 수 있고, 그 경우를 MAE 게이트가 잘못 탈락시켰다.
 
 통과 판정은 split=test, source=real 표본만 사용한다. demo/calibration 자료는
 모델 개발과 입력 확인에는 쓸 수 있지만 검증 통과 근거에는 포함하지 않는다.
@@ -29,9 +48,9 @@ DEFAULT_RATIO = 0.68
 DEFAULT_SPEED_MPS = 1.66
 DEFAULT_BUFFER_S = 60
 MIN_TEST_EVENTS = 3
-BASE_MODELS = ["Naver", "Speed", "Speed+Signal", "Oracle"]
-TMAP_MODELS = ["TMAP-Personal", "TMAP+Signal", "TMAP-Oracle"]
-KAKAO_MODELS = ["Kakao-Personal", "Kakao+Signal", "Kakao-Oracle"]
+BASE_MODELS = ["Naver", "Speed", "Speed+Signal"]
+TMAP_MODELS = ["TMAP-Personal", "TMAP+Signal"]
+KAKAO_MODELS = ["Kakao-Personal", "Kakao+Signal"]
 
 
 @dataclass
@@ -54,10 +73,13 @@ def fmt_dt(value: datetime) -> str:
 
 
 def expected_wait(green_s: float, cycle_s: float, dist_m: float, speed_mps: float) -> float:
-    """균일 위상에서 속도 인지 보행신호 기대대기.
+    """균일 위상에서 보행신호 기대대기 (설계 문서 §7.1·§7.4 step 2).
 
-    유효 녹색 = green - dist/speed 이므로
-    E[wait] = (red + dist/speed)^2 / (2*cycle).
+    E[wait] = red^2 / (2*cycle).
+
+    횡단 이동시간 자체는 도보시간에 이미 포함되므로 기대대기 분기에서는
+    대기창에 더하지 않는다. crossing_time ≤ green 은 통과 가능 전제로만
+    검사한다(불가하면 신호가 보행자 속도로 건널 수 없는 데이터 오류).
     """
     if not (0 < green_s < cycle_s):
         raise ValueError(f"green_s must be between 0 and cycle_s: {green_s}/{cycle_s}")
@@ -69,13 +91,7 @@ def expected_wait(green_s: float, cycle_s: float, dist_m: float, speed_mps: floa
             f"crossing cannot finish in green: crossing={crossing_s:.1f}s green={green_s:.1f}s"
         )
     red_s = cycle_s - green_s
-    return (red_s + crossing_s) ** 2 / (2 * cycle_s)
-
-
-def worst_wait(crosswalk: dict, speed_mps: float) -> float:
-    """유효 녹색이 막 닫힌 직후 도착했을 때 다음 녹색까지의 최대 대기."""
-    crossing_s = crosswalk["dist_m"] / speed_mps
-    return crosswalk["cycle_s"] - crosswalk["green_s"] + crossing_s
+    return red_s ** 2 / (2 * cycle_s)
 
 
 def profile(sc: dict, ratio_override: float | None = None) -> tuple[float, float]:
@@ -92,21 +108,14 @@ def profile(sc: dict, ratio_override: float | None = None) -> tuple[float, float
 
 
 def crossing_wait(sc: dict, crosswalks: dict, mode: str, speed_mps: float) -> float:
-    ids = sc.get("crossings", [])
-    if mode == "best":
-        return 0.0
-    if mode == "oracle":
-        return float(sc["actual"].get("signal_wait_s", 0))
-
+    """crosswalks.json 에 cycle/green 이 있는 횡단보도의 기대대기 합 (mode='expected')."""
     total = 0.0
-    for cwid in ids:
+    for cwid in sc.get("crossings", []):
         if cwid not in crosswalks:
             raise KeyError(f"{sc['id']}: unknown crosswalk {cwid}")
         c = crosswalks[cwid]
         if mode == "expected":
             total += expected_wait(c["green_s"], c["cycle_s"], c["dist_m"], speed_mps)
-        elif mode == "worst":
-            total += worst_wait(c, speed_mps)
         else:
             raise ValueError(mode)
     return total
@@ -146,6 +155,44 @@ def actual_connection(sc: dict, buffer_s: int) -> str | None:
     return choose_connection(actual_bus_times(sc), arrival, buffer_s)
 
 
+MAP_FAILURE_LABELS = {
+    "different_bus": "다른 버스",
+    "more_wait": "더 대기",
+    "miss": "놓침",
+}
+
+
+def classify_map_outcome(sc: dict, buffer_s: int) -> list[str]:
+    """지도(네이버) 안내가 실제와 어긋난 방식 — 검증의 축.
+
+    도보 속도·신호를 반영하지 않은 기존 지도의 안내가 실제와 어떻게 벌어지는가를
+    사용자가 정의한 '부정확' 세 유형으로 분류한다. 이 셋 중 하나라도 걸리면 지도
+    안내가 실제와 달랐다는 뜻이고, 그때 우리 모델이 실제를 맞히는지가 검증 대상이다.
+
+      different_bus: 지도가 명시한 버스와 실제로 타는 가장 이른 버스가 다르다
+      miss:          지도가 명시한 버스가 실제 도착 시점엔 이미 떠났다 (놓침)
+      more_wait:     실제 정류장 도착이 지도 예측보다 늦어 대기가 안내보다 늘었다
+
+    빈 리스트면 지도 안내가 실제와 일치(정확)한 것이다.
+    """
+    named = sc["naver"].get("selected_connection")
+    truth = actual_connection(sc, buffer_s)
+    actual_arrival = parse_dt(sc["actual"]["stop_arrival"])
+    departures = dict(actual_bus_times(sc))
+    ready = actual_arrival + timedelta(seconds=buffer_s)
+    naver_arrival = parse_dt(sc["walk_start"]) + timedelta(
+        seconds=float(sc["naver"]["walk_time_s"])
+    )
+    modes = []
+    if named and truth and named != truth:
+        modes.append("different_bus")
+    if named in departures and departures[named] < ready:
+        modes.append("miss")
+    if (actual_arrival - naver_arrival).total_seconds() > buffer_s:
+        modes.append("more_wait")
+    return modes
+
+
 def predict(
     sc: dict,
     crosswalks: dict,
@@ -160,73 +207,57 @@ def predict(
     naver_walk_s = float(sc["naver"]["walk_time_s"])
     ratio, speed_mps = profile(sc, ratio_override)
 
-    if model == "Naver":
-        walk_s = naver_walk_s
-    elif model == "Speed":
-        walk_s = naver_walk_s * ratio
-    elif model == "Speed+Signal":
-        wait_s = (
+    def expected_or_strict() -> float:
+        return (
             signal_wait_s
             if signal_wait_s is not None
             else crossing_wait(sc, crosswalks, "expected", speed_mps)
         )
-        walk_s = naver_walk_s * ratio + wait_s
-    elif model == "Best":
-        walk_s = naver_walk_s * ratio
-    elif model == "Worst":
-        walk_s = naver_walk_s * ratio + crossing_wait(
-            sc, crosswalks, "worst", speed_mps
-        )
-    elif model == "Oracle":
-        walk_s = naver_walk_s * ratio + crossing_wait(
-            sc, crosswalks, "oracle", speed_mps
-        )
-    elif model == "TMAP-Personal":
+
+    # base_walk_s = 순수 이동(도보)시간, signal_component = 신호 추가대기.
+    # 둘을 분리해야 §6.3의 절벽 판정을 신호와 독립적으로 적용할 수 있다.
+    signal_component = 0.0
+    # 신호 추정 소스 접미사 제거 — "Speed+Signal(유도)" → base "Speed+Signal".
+    # 어느 소스(상한/유도)의 값을 넣었는지는 signal_wait_s 로 이미 들어와 있다.
+    base = model.split("(", 1)[0]
+    if base == "Naver":
+        base_walk_s = naver_walk_s
+    elif base == "Speed":
+        base_walk_s = naver_walk_s * ratio
+    elif base == "Speed+Signal":
+        base_walk_s = naver_walk_s * ratio
+        signal_component = expected_or_strict()
+    elif base in ("TMAP-Personal", "TMAP+Signal"):
         if tmap_walk_s is None:
             raise ValueError(f"{sc['id']}: TMAP 보행시간이 없습니다.")
-        walk_s = tmap_walk_s
-    elif model == "TMAP+Signal":
-        if tmap_walk_s is None:
-            raise ValueError(f"{sc['id']}: TMAP 보행시간이 없습니다.")
-        wait_s = (
-            signal_wait_s
-            if signal_wait_s is not None
-            else crossing_wait(sc, crosswalks, "expected", speed_mps)
-        )
-        walk_s = tmap_walk_s + wait_s
-    elif model == "TMAP-Oracle":
-        if tmap_walk_s is None:
-            raise ValueError(f"{sc['id']}: TMAP 보행시간이 없습니다.")
-        walk_s = tmap_walk_s + crossing_wait(
-            sc, crosswalks, "oracle", speed_mps
-        )
-    elif model == "Kakao-Personal":
+        base_walk_s = tmap_walk_s
+        if base == "TMAP+Signal":
+            signal_component = expected_or_strict()
+    elif base in ("Kakao-Personal", "Kakao+Signal"):
         if kakao_walk_s is None:
             raise ValueError(f"{sc['id']}: 카카오 보행시간이 없습니다.")
-        walk_s = kakao_walk_s
-    elif model == "Kakao+Signal":
-        if kakao_walk_s is None:
-            raise ValueError(f"{sc['id']}: 카카오 보행시간이 없습니다.")
-        wait_s = (
-            signal_wait_s
-            if signal_wait_s is not None
-            else crossing_wait(sc, crosswalks, "expected", speed_mps)
-        )
-        walk_s = kakao_walk_s + wait_s
-    elif model == "Kakao-Oracle":
-        if kakao_walk_s is None:
-            raise ValueError(f"{sc['id']}: 카카오 보행시간이 없습니다.")
-        walk_s = kakao_walk_s + crossing_wait(
-            sc, crosswalks, "oracle", speed_mps
-        )
+        base_walk_s = kakao_walk_s
+        if base == "Kakao+Signal":
+            signal_component = expected_or_strict()
     else:
         raise ValueError(model)
 
+    walk_s = base_walk_s + signal_component
     arrival = walk_start + timedelta(seconds=walk_s)
+    # §6.3: 시각표를 지키는 수단(지하철·기점 광역)에만 절벽이 있다. 배차버스
+    # (cliff=false)는 신호 Δ가 총시간엔 +Δ로 더해지지만(arrival/MAE) 어느 차를
+    # 잡는지는 안 바꾼다 — 놓쳐도 배차간격 안에 다음 차가 온다. 따라서 연결
+    # 선택 게이트에서는 신호를 제외하고 순수 이동 도착으로 판정한다.
+    cliff = bool(sc.get("cliff", True))
+    gate_arrival = (
+        arrival if cliff else walk_start + timedelta(seconds=base_walk_s)
+    )
     if model == "Naver" and sc["naver"].get("selected_connection"):
         connection = sc["naver"]["selected_connection"]
     else:
-        connection = choose_connection(predicted_bus_times(sc), arrival, buffer_s)
+        connection = choose_connection(
+            predicted_bus_times(sc), gate_arrival, buffer_s
+        )
 
     actual_arrival = parse_dt(sc["actual"]["stop_arrival"])
     truth = actual_connection(sc, buffer_s)
@@ -265,60 +296,65 @@ def evaluate(
 ) -> tuple[list[dict], dict]:
     tmap_walk_times = tmap_walk_times or {}
     kakao_walk_times = kakao_walk_times or {}
-    models = list(BASE_MODELS)
-    if tmap_walk_times:
-        models += TMAP_MODELS
-    if kakao_walk_times:
-        models += KAKAO_MODELS
     rows = []
     for sc in scenarios:
         if not eligible(sc, selected_split):
             continue
+        # 신호 추정 소스 정규화 → [(label, value)].
+        #   None(비-strict)  → [("", None)]  : crosswalks.json 기대대기로 계산(라벨 없음)
+        #   float            → [("", float)]  : 단일 소스(라벨 없음) — 하위호환
+        #   dict{상한:x,유도:y} → 소스별 모델 변형 (Speed+Signal(상한)·(유도) …)
         strict_signal = signal_estimates is not None
-        signal_wait_s = (
-            signal_estimates.get(sc["id"]) if strict_signal else None
-        )
-        signal_available = not strict_signal or signal_wait_s is not None
-        event_models = ["Naver", "Speed", "Oracle"]
-        if signal_available:
-            event_models.insert(2, "Speed+Signal")
+        raw = signal_estimates.get(sc["id"]) if strict_signal else None
+        if not strict_signal:
+            signal_sources = [("", None)]
+        elif raw is None:
+            signal_sources = []                      # 이 이벤트는 신호 계산 불가
+        elif isinstance(raw, dict):
+            signal_sources = [(lb, float(v)) for lb, v in raw.items()]
+        else:
+            signal_sources = [("", float(raw))]
+
         tmap_walk_s = tmap_walk_times.get(sc["id"])
         kakao_walk_s = kakao_walk_times.get(sc["id"])
+
+        def sig_models(base):   # base + 소스 접미사
+            return [(base + (f"({lb})" if lb else ""), val) for lb, val in signal_sources]
+
+        jobs = [("Naver", None), ("Speed", None)]
+        jobs += sig_models("Speed+Signal")
         if tmap_walk_s is not None:
-            event_models += ["TMAP-Personal", "TMAP-Oracle"]
-            if signal_available:
-                event_models.insert(
-                    event_models.index("TMAP-Oracle"), "TMAP+Signal"
-                )
+            jobs.append(("TMAP-Personal", None))
+            jobs += sig_models("TMAP+Signal")
         if kakao_walk_s is not None:
-            event_models += ["Kakao-Personal", "Kakao-Oracle"]
-            if signal_available:
-                event_models.insert(
-                    event_models.index("Kakao-Oracle"), "Kakao+Signal"
-                )
+            jobs.append(("Kakao-Personal", None))
+            jobs += sig_models("Kakao+Signal")
         preds = {
             name: predict(
-                sc,
-                crosswalks,
-                name,
-                buffer_s,
-                ratio_override,
-                tmap_walk_s,
-                kakao_walk_s,
-                signal_wait_s,
+                sc, crosswalks, name, buffer_s, ratio_override,
+                tmap_walk_s, kakao_walk_s, sig_val,
             )
-            for name in event_models
+            for name, sig_val in jobs
         }
         rows.append(
             {
                 "id": sc["id"],
                 "split": sc.get("split", "test"),
+                "cliff": bool(sc.get("cliff", True)),
                 "truth": actual_connection(sc, buffer_s),
                 "boarded": sc["actual"].get("boarded"),
+                "map_failure": classify_map_outcome(sc, buffer_s),
                 "predictions": preds,
             }
         )
 
+    # 모델 목록은 실제 예측 키에서 동적으로 — 신호 소스 접미사(상한/유도)가 붙어
+    # 이름이 가변이기 때문. 등장 순서를 보존한다.
+    models = []
+    for row in rows:
+        for k in row["predictions"]:
+            if k not in models:
+                models.append(k)
     metrics = {}
     for model in models:
         ps = [
@@ -366,67 +402,78 @@ def verdict(
         signal_estimates,
     )
     n = len(rows)
-    use_tmap = n > 0 and all(
-        "TMAP+Signal" in row["predictions"] for row in rows
+    # ★ 판정 대상은 '어느 모델이 이기나'가 아니라, **이 접근(도보 속도 + 신호,
+    #   맥락별 추정기)이 지도보다 나은가**의 적합성이다. 그래서 제품을 단일 모델이
+    #   아니라 **이벤트 맥락별 추정기**로 둔다:
+    #     · 절벽(cliff=true, 지하철)  → 상한(RoadUpper): 과소예측→놓침 위험을 막는 안전값
+    #     · 배차(cliff=false)         → 유도(derived):   도착시각이 정확한 평균값
+    #   소스 변형(상한/유도)이 없으면(단일 신호) 그 신호 모델을 그대로 쓴다.
+    def base_present(base):
+        return n > 0 and all(
+            any(k == base or k.startswith(base + "(") for k in row["predictions"])
+            for row in rows
+        )
+    product_base = next(
+        (b for b in ("TMAP+Signal", "Kakao+Signal", "Speed+Signal") if base_present(b)),
+        None,
     )
-    use_kakao = n > 0 and all(
-        "Kakao+Signal" in row["predictions"] for row in rows
-    )
-    use_speed = n > 0 and all(
-        "Speed+Signal" in row["predictions"] for row in rows
-    )
-    if signal_estimates is not None and not (use_tmap or use_kakao or use_speed):
+    if signal_estimates is not None and product_base is None:
         return {
-            "status": "insufficient",
-            "n": n,
-            "uplift": 0,
+            "status": "insufficient", "n": n, "uplift": 0,
             "product_model": "Signal unavailable",
             "reason": "일부 표본에서 실시간 위상도 주기 기반 기대대기도 계산할 수 없음",
         }
-    product_model = (
-        "TMAP+Signal"
-        if use_tmap
-        else "Kakao+Signal"
-        if use_kakao
-        else "Speed+Signal"
-        if use_speed
-        else "Speed+Signal"
-    )
+    if product_base is None:
+        product_base = "Speed+Signal"
+
+    def product_pred(row):
+        preds = row["predictions"]
+        src = "상한" if row["cliff"] else "유도"   # 절벽 안전 / 배차 정확
+        return (preds.get(f"{product_base}({src})")
+                or preds.get(product_base)
+                or preds.get(f"{product_base}(상한)")
+                or preds.get(f"{product_base}(유도)"))
+    pp = [product_pred(row) for row in rows]
+    used = {p.model for p in pp}
+    product_model = (next(iter(used)) if len(used) == 1
+                     else f"{product_base}(맥락별: 절벽=상한·배차=유도)")
+
     uplift = sum(
-        (not row["predictions"]["Naver"].connection_ok)
-        and row["predictions"][product_model].connection_ok
-        for row in rows
+        (not row["predictions"]["Naver"].connection_ok) and p.connection_ok
+        for row, p in zip(rows, pp)
     )
     if n < MIN_TEST_EVENTS:
         return {
-            "status": "insufficient",
-            "n": n,
-            "uplift": uplift,
+            "status": "insufficient", "n": n, "uplift": uplift,
             "product_model": product_model,
             "reason": f"새 test 표본 {MIN_TEST_EVENTS}건 필요",
         }
 
     naver = metrics["Naver"]
-    product = metrics[product_model]
+    product_accuracy = sum(p.connection_ok for p in pp) / n
+    product_dangerous = sum(p.dangerous is True for p in pp)
+    product_mae = mean(abs(p.arrival_error_s) for p in pp)
+    # MAE(도착시각 정밀도)는 진단값 — 게이트 아님. 검증 대상은 '어느 버스를 타는가'다.
     mae_improvement = (
-        1 - product["mae_s"] / naver["mae_s"]
-        if naver["mae_s"] > 0
-        else float("-inf")
+        1 - product_mae / naver["mae_s"] if naver["mae_s"] > 0 else float("-inf")
     )
+    map_wrong = sum(1 for row in rows if not row["predictions"]["Naver"].connection_ok)
+    # ★ 통과 = 안내(연결) 정확도 + 안전(위험오답 0) + 지도 대비 순증분.
     passed = (
-        mae_improvement >= 0.30
-        and product["connection_accuracy"] >= 2 / 3
-        and product["dangerous"] == 0
-        and uplift >= 1
+        product_accuracy >= 2 / 3 and product_dangerous == 0 and uplift >= 1
     )
     return {
         "status": "pass" if passed else "fail",
         "n": n,
         "uplift": uplift,
         "product_model": product_model,
-        "mae_improvement": mae_improvement,
-        "connection_accuracy": product["connection_accuracy"],
-        "dangerous": product["dangerous"],
+        "map_accuracy": naver["connection_accuracy"],
+        "product_accuracy": product_accuracy,
+        "map_wrong": map_wrong,
+        "corrected": uplift,
+        "mae_improvement": mae_improvement,   # 진단용 — 게이트 아님
+        "connection_accuracy": product_accuracy,
+        "dangerous": product_dangerous,
     }
 
 
@@ -435,13 +482,17 @@ def print_report(rows: list[dict], metrics: dict, result: dict, buffer_s: int) -
     if not rows:
         print("선택한 split에 유효한 표본이 없습니다.")
     for row in rows:
-        print(f"\n[{row['id']}] split={row['split']}  실제 earliest={row['truth']} "
-              f"실제탑승={row['boarded']}")
-        print(f'{"모델":<16}{"정류장 도착":<20}{"오차":>9}  {"선택 연결":<18}판정')
+        cliff_tag = "절벽O" if row.get("cliff", True) else "절벽X(배차·신호 연결게이트 제외)"
+        modes = row.get("map_failure", [])
+        map_tag = ("지도 부정확: " + "·".join(MAP_FAILURE_LABELS.get(m, m) for m in modes)
+                   if modes else "지도 정확")
+        print(f"\n[{row['id']}] split={row['split']} {cliff_tag}  "
+              f"실제 earliest={row['truth']} 실제탑승={row['boarded']}  [{map_tag}]")
+        print(f'{"모델":<18}{"정류장 도착":<20}{"오차":>9}  {"선택 연결":<18}판정')
         for model, p in row["predictions"].items():
             danger = " 위험" if p.dangerous else ""
             print(
-                f"{model:<16}{fmt_dt(p.arrival):<20}{p.arrival_error_s:>+8.1f}s  "
+                f"{model:<18}{fmt_dt(p.arrival):<20}{p.arrival_error_s:>+8.1f}s  "
                 f"{str(p.connection):<18}{'적중' if p.connection_ok else '오답'}{danger}"
             )
 
@@ -450,7 +501,7 @@ def print_report(rows: list[dict], metrics: dict, result: dict, buffer_s: int) -
         if not m["n"]:
             continue
         print(
-            f"{model:<16} n={m['n']}  MAE={m['mae_s']:.1f}s  "
+            f"{model:<18} n={m['n']}  MAE={m['mae_s']:.1f}s  "
             f"중앙AE={m['median_ae_s']:.1f}s  연결정확도={m['connection_accuracy']:.0%}  "
             f"위험오답={m['dangerous']}"
         )
@@ -464,9 +515,14 @@ def print_report(rows: list[dict], metrics: dict, result: dict, buffer_s: int) -
     else:
         print(
             f"{result['status'].upper()} [{result['product_model']}]: "
-            f"MAE 개선 {result['mae_improvement']:.0%}, "
-            f"연결정확도 {result['connection_accuracy']:.0%}, "
-            f"위험오답 {result['dangerous']}, 순증분 {result['uplift']}건"
+            f"연결 안내 정확도 지도 {result['map_accuracy']:.0%} → 제품 "
+            f"{result['product_accuracy']:.0%}, "
+            f"지도 부정확 {result['map_wrong']}건 중 제품이 {result['corrected']}건 교정, "
+            f"위험오답 {result['dangerous']}"
+        )
+        print(
+            f"  (진단) 도착시각 MAE 개선 {result['mae_improvement']:+.0%} — "
+            f"신호 보수 반영 시 음수일 수 있으나 게이트 아님"
         )
 
 
@@ -486,6 +542,30 @@ def sweep_flip(crosswalks: dict, slow: float = 1.0, fast: float = 1.66) -> None:
         )
     if not found:
         print("실측 횡단보도 데이터가 없습니다.")
+
+
+def resolve_tmap_endpoints(tmap_config: dict, key: str | None = None) -> dict:
+    """tmap start/end 가 정류장 참조(stop{city_code,ars})면 실측 좌표로 바꾼다.
+
+    lon/lat 가 이미 있으면 그대로 둔다 (오프라인 재현 유지). 정류장 좌표를 못
+    찾을 때 사용자가 준 ID(ARS)로 TAGO 에서 가져오는 경로다 — Case 1 E1 처럼
+    TMAP 이 종점을 건물 좌표로 잡아 도보가 부풀려지는 것을 막는다.
+    """
+    if not tmap_config:
+        return tmap_config
+    out = dict(tmap_config)
+    resolver = None
+    for side in ("start", "end"):
+        point = out.get(side)
+        if (
+            isinstance(point, dict)
+            and "stop" in point
+            and not ("lon" in point and "lat" in point)
+        ):
+            if resolver is None:
+                from stop_client import resolve_stop as resolver  # 지연 import
+            out[side] = resolver(point, key)
+    return out
 
 
 def main() -> None:
@@ -512,7 +592,7 @@ def main() -> None:
     ap.add_argument(
         "--signals",
         action="store_true",
-        help="TMAP 횡단보도에 실시간 신호를 매칭하고 불가하면 기대대기 사용",
+        help="TMAP 횡단보도에 신호 API를 매칭하고 불가하면 거리별 상한 사용",
     )
     args = ap.parse_args()
     if args.signals:
@@ -560,6 +640,9 @@ def main() -> None:
                 tmap_sc = dict(sc)
                 if sc["id"] in resolved_tmap_configs:
                     tmap_sc["tmap"] = resolved_tmap_configs[sc["id"]]
+                # 종점이 정류장 참조(stop{city_code,ars})면 TMAP 건물 좌표 대신
+                # 실측 정류장 좌표로 해석한다 (Case 1 E1 종점 버그 방지).
+                tmap_sc["tmap"] = resolve_tmap_endpoints(tmap_sc.get("tmap") or {})
                 seconds, summary = event_walk_seconds(tmap_sc, key)
                 tmap_walk_times[sc["id"]] = seconds
                 tmap_summaries[sc["id"]] = summary
@@ -575,6 +658,8 @@ def main() -> None:
     if args.signals:
         from signal_client import (
             estimate_route_wait,
+            fallback_derived_total,
+            fallback_signal_sensitivity,
             fetch_all,
             load_key as load_signal_key,
         )
@@ -583,9 +668,17 @@ def main() -> None:
         if not tmap_summaries:
             print("신호 평가에는 TMAP 횡단보도 경로가 필요합니다.")
         else:
-            signal_key = load_signal_key()
-            intersections = fetch_all("crsrd_map_info", signal_key)
-            signal_rows = fetch_all("tl_drct_info", signal_key)
+            try:
+                signal_key = load_signal_key()
+                intersections = fetch_all("crsrd_map_info", signal_key)
+                signal_rows = fetch_all("tl_drct_info", signal_key)
+            except RuntimeError as exc:
+                intersections = []
+                signal_rows = []
+                print(
+                    f"신호 API 사용 불가({exc}) → "
+                    "TMAP 횡단보도마다 거리별 보수 상한 fallback"
+                )
             fetched_at = datetime.now()
             for sc in scenarios:
                 summary = tmap_summaries.get(sc["id"])
@@ -603,19 +696,40 @@ def main() -> None:
                     signal_rows,
                     fetched_at,
                 )
-                signal_estimates[sc["id"]] = result["wait_s"]
+                # ★ 상한(RoadUpper)과 유도(derived) 둘 다 계산해서 소스별로 넣는다.
+                #   crosswalks.json 에 실측 주기가 있으면 estimate_route_wait 의
+                #   wait_s(정확)도 함께 넣어 세 소스가 된다.
+                mc = summary["crosswalks"]
+                sources = {}
+                if mc:
+                    sources["상한"] = fallback_signal_sensitivity(mc)["road_upper_s"]
+                    sources["유도"] = fallback_derived_total(mc)
+                if result["wait_s"] is not None and result.get("complete"):
+                    sources["정확"] = result["wait_s"]   # 실측 주기 기반(있을 때만)
+                signal_estimates[sc["id"]] = sources or (result["wait_s"])
                 methods = ",".join(
                     detail["method"] for detail in result["details"]
                 ) or "no-crossing"
-                wait_text = (
-                    f"{result['wait_s']:.1f}초"
-                    if result["wait_s"] is not None
-                    else "계산 불가"
-                )
+                src_text = " · ".join(f"{k} {v:.0f}s" for k, v in sources.items()) or (
+                    f"{result['wait_s']:.1f}초" if result["wait_s"] is not None else "계산 불가")
                 print(
-                    f"Signal {sc['id']}: {result['crossings']}개 "
-                    f"[{methods}] → {wait_text}"
+                    f"Signal {sc['id']}: {result['crossings']}개 [{methods}] → {src_text}"
                 )
+                if result.get("used_fallback"):
+                    fallback = result["fallback"]
+                    raw = ", ".join(
+                        f"{name}={seconds:.0f}s"
+                        for name, seconds in fallback["raw_waits_s"].items()
+                    )
+                    bounds = ", ".join(
+                        f"{row['distance_m']:.0f}m→{row['upper_s']:.0f}s"
+                        for row in fallback["crossing_upper_bounds"]
+                    )
+                    print(
+                        f"  TMAP-only fallback (거리별 상한 공식 평가 반영): "
+                        f"횡단보도 {fallback['raw_count']}개 [{bounds}], "
+                        f"합계={fallback['road_upper_s']:.0f}s [{raw}]"
+                    )
 
     rows, metrics = evaluate(
         scenarios,

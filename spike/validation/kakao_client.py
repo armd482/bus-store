@@ -10,7 +10,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-ENV_FILE = os.path.join(PROJECT_ROOT, "collector", ".env")
+ENV_FILES = (os.path.join(HERE, ".env"), os.path.join(PROJECT_ROOT, ".env"))
 SEARCH_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
 WALK_URL = "https://dapi.kakao.com/v2/routing/walk"
 PUBLIC_TRAFFIC_URL = "https://dapi.kakao.com/v2/routing/publictraffic"
@@ -32,12 +32,13 @@ def _dotenv_value(path: str, name: str) -> str | None:
 
 
 def load_key() -> str:
-    key = os.environ.get("KAKAO_REST_API_KEY") or _dotenv_value(
-        ENV_FILE, "KAKAO_REST_API_KEY"
-    )
+    key = os.environ.get("KAKAO_REST_API_KEY")
+    for path in ENV_FILES:
+        key = key or _dotenv_value(path, "KAKAO_REST_API_KEY")
     if not key:
         raise RuntimeError(
-            "KAKAO_REST_API_KEY가 없습니다. collector/.env에 추가하세요."
+            "KAKAO_REST_API_KEY가 없습니다. spike/validation/.env 또는 "
+            "find-path/.env에 추가하세요."
         )
     return key
 
