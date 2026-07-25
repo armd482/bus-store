@@ -1,0 +1,56 @@
+{
+  "_description": "API 부재 시 TMAP 횡단거리별 신호대기 보수 상한. 2026-07-23 이전 관측만 학습에 사용한다. ⚠️ 밴드는 이제 세그먼트가 아니라 '병합된 신호' 단위의 거리에 적용된다 — 2단계 횡단(중앙분리대)의 세그먼트는 tmap_client.merge_adjacent_crosswalks 가 하나로 합치고, 그 합산 횡단폭(예 신당 15+28=43m)으로 밴드를 조회한다. excluded_unlabeled_crossings(28m·31m·10m)가 바로 그렇게 병합되는 2단계분이다.",
+  "training_cutoff": "2026-07-23",
+  "mapped_observations": [
+    {
+      "route": "래미안신당하이베르아파트→신당누리센터 정류장",
+      "distance_m": 15,
+      "observed_wait_s": 3.54,
+      "upper_s": 60,
+      "mapping_basis": "신호 대기는 순수보행 416.08초 뒤 발생했고 TMAP 첫 횡단 오프셋 446.99초에 가장 가까움"
+    },
+    {
+      "route": "판교역.낙생육교.현대백화점→백현마을1단지",
+      "distance_m": 16,
+      "observed_wait_s": 45.52,
+      "upper_s": 60,
+      "mapping_basis": "첫 신호 전 순수보행 70.17초와 TMAP 첫 횡단 오프셋 84.94초"
+    },
+    {
+      "route": "판교역.낙생육교.현대백화점→백현마을1단지",
+      "distance_m": 24,
+      "observed_wait_s": 120.77,
+      "upper_s": 150,
+      "mapping_basis": "두 신호 사이 순수보행 11.69초와 TMAP 횡단 오프셋 간격 14.46초"
+    }
+  ],
+  "excluded_unlabeled_crossings": [
+    {
+      "route": "래미안신당하이베르아파트→신당누리센터 정류장",
+      "distance_m": 28,
+      "reason": "별도 신호 대기 랩 없음"
+    },
+    {
+      "route": "판교역.낙생육교.현대백화점→백현마을1단지",
+      "distance_m": 31,
+      "reason": "개별 대기 라벨 없음"
+    },
+    {
+      "route": "판교역.낙생육교.현대백화점→백현마을1단지",
+      "distance_m": 10,
+      "reason": "개별 대기 라벨 없음"
+    }
+  ],
+  "bands": [
+    {
+      "max_distance_m": 20,
+      "upper_s": 60,
+      "learned_from": "15m→3.54초, 16m→45.52초의 최대값"
+    },
+    {
+      "max_distance_m": null,
+      "upper_s": 150,
+      "learned_from": "24m→120.77초"
+    }
+  ]
+}

@@ -76,6 +76,8 @@ class TmapClientTests(unittest.TestCase):
                         "index": 2,
                         "distance": 10,
                         "facilityType": "15",
+                        "roadType": 21,
+                        "categoryRoadType": 0,
                     },
                 },
             ]
@@ -84,6 +86,33 @@ class TmapClientTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["offset_s"], 10)
         self.assertEqual(rows[0]["lon"], 127.0002)
+        self.assertEqual(rows[0]["road_type"], 21)
+        self.assertEqual(rows[0]["category_road_type"], 0)
+
+    def test_merges_two_stage_crossing_into_one_signal(self):
+        # 신당 15m + 28m 처럼 앞 끝 = 다음 시작인 2단계 횡단 → 신호 1개로 합친다.
+        crossings = [
+            {"offset_s": 10, "distance_m": 15,
+             "start": [127.0, 37.0], "end": [127.0002, 37.0], "lon": 127.0001, "lat": 37.0},
+            {"offset_s": 20, "distance_m": 28,
+             "start": [127.0002, 37.0], "end": [127.0006, 37.0], "lon": 127.0004, "lat": 37.0},
+        ]
+        merged = tmap_client.merge_adjacent_crosswalks(crossings, gap_m=8)
+        self.assertEqual(len(merged), 1)
+        self.assertAlmostEqual(merged[0]["distance_m"], 43)   # 15 + 28
+        self.assertEqual(merged[0]["segments"], 2)
+        self.assertEqual(merged[0]["offset_s"], 10)           # 첫 세그먼트 시작
+
+    def test_keeps_separate_intersections_apart(self):
+        # 사이에 일반보행로가 있어 ~160m 떨어진 두 교차로 → 합치지 않는다.
+        crossings = [
+            {"offset_s": 10, "distance_m": 15,
+             "start": [127.0, 37.0], "end": [127.0002, 37.0], "lon": 127.0001, "lat": 37.0},
+            {"offset_s": 90, "distance_m": 16,
+             "start": [127.002, 37.0], "end": [127.0022, 37.0], "lon": 127.0021, "lat": 37.0},
+        ]
+        merged = tmap_client.merge_adjacent_crosswalks(crossings, gap_m=8)
+        self.assertEqual(len(merged), 2)
 
 
 if __name__ == "__main__":

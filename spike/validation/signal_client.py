@@ -5,7 +5,8 @@
 
 * 첫 도보 + 짧은 예측 지평: 실시간 상태/잔여시간을 주기에 투영
 * 뒤쪽 도보 또는 실시간 적용 불가: 주기 기반 기대대기
-* 주기조차 모름: 값을 꾸며내지 않고 unavailable
+* 실시간 위상·주기 기대대기 모두 불가: TMAP 횡단거리별 보수 상한
+* TMAP 횡단보도도 없음: 신호 모델 unavailable
 """
 from __future__ import annotations
 
@@ -19,12 +20,31 @@ from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-ENV_FILE = os.path.join(PROJECT_ROOT, "collector", ".env")
+LOCAL_ENV_FILE = os.path.join(HERE, ".env")
+ROOT_ENV_FILE = os.path.join(PROJECT_ROOT, ".env")
+CALIBRATION_FILE = os.path.join(HERE, "signal_calibration.json")
 BASE_URL = "https://apis.data.go.kr/B551982/rti"
 DIRECTIONS = ("nt", "ne", "et", "se", "st", "sw", "wt", "nw")
 GREEN_STATE = "protected-Movement-Allowed"
 RED_STATE = "stop-And-Remain"
 NO_DATA_CS = 36001
+SENSITIVITY_SECONDS = {"OTP15": 15.0, "Expected20": 20.0}
+
+
+def load_road_upper_bands(path: str = CALIBRATION_FILE) -> list[dict]:
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    bands = payload.get("bands") or []
+    if not bands:
+        raise ValueError("signal_calibration.json에 bands가 없습니다.")
+    for band in bands:
+        upper_s = float(band["upper_s"])
+        if upper_s <= 0:
+            raise ValueError(f"잘못된 신호 상한: {band}")
+    return bands
+
+
+ROAD_UPPER_BANDS = load_road_upper_bands()
 
 
 def _dotenv_value(path: str, name: str) -> str | None:
@@ -45,13 +65,15 @@ def _dotenv_value(path: str, name: str) -> str | None:
 def load_key() -> str:
     key = (
         os.environ.get("SIGNAL_API_KEY")
-        or _dotenv_value(ENV_FILE, "SIGNAL_API_KEY")
-        or os.environ.get("GBIS_BUS_KEY")
-        or _dotenv_value(ENV_FILE, "GBIS_BUS_KEY")
+        or os.environ.get("DATA_GO_KR_KEY")
+        or _dotenv_value(LOCAL_ENV_FILE, "SIGNAL_API_KEY")
+        or _dotenv_value(ROOT_ENV_FILE, "SIGNAL_API_KEY")
+        or _dotenv_value(ROOT_ENV_FILE, "DATA_GO_KR_KEY")
     )
     if not key:
         raise RuntimeError(
-            "SIGNAL_API_KEY 또는 GBIS_BUS_KEY가 없습니다. collector/.env에 추가하세요."
+            "SIGNAL_API_KEY 또는 DATA_GO_KR_KEY가 없습니다. "
+            "spike/validation/.env 또는 find-path/.env에 추가하세요."
         )
     return key
 
@@ -106,6 +128,53 @@ def haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
         + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     )
     return 2 * 6_371_000 * math.asin(math.sqrt(h))
+
+
+def road_upper_seconds(crossing: dict) -> float:
+    """7월 23일 관측으로 학습한 거리 밴드의 보수 상한을 반환한다.
+
+    현재 표본은 15m→3.54초, 16m→45.52초, 24m→120.77초 세 개다.
+    따라서 20m 이하 60초, 초과 150초의 초기 2밴드 모델이며 새 test
+    Case는 이 파일을 수정하지 않고 평가한다.
+    """
+    distance_m = float(crossing["distance_m"])
+    if distance_m <= 0:
+        raise ValueError(f"잘못된 횡단거리: {distance_m}")
+    for band in ROAD_UPPER_BANDS:
+        maximum = band.get("max_distance_m")
+        if maximum is None or distance_m <= float(maximum):
+            return float(band["upper_s"])
+    raise ValueError(f"횡단거리 밴드가 범위를 덮지 못합니다: {distance_m}")
+
+
+def fallback_signal_sensitivity(crossings: list[dict]) -> dict:
+    """주기·실시간이 없을 때 설계 문서 §7.4의 fallback을 계산한다.
+
+    RoadUpper는 제품·공식 평가값이고 OTP15와 Expected20은 민감도 값이다.
+    ⚠️ 입력 crossings 는 이미 신호 단위로 병합된 것이어야 한다 — 2단계 횡단의
+    세그먼트 분할은 tmap_client.merge_adjacent_crosswalks 가 상류에서 합친다
+    (여기서 crossing 마다 상한을 더하므로, 세그먼트째 들어오면 과다 계상된다).
+    """
+    raw_count = len(crossings)
+    crossing_upper_bounds = [
+        {
+            "feature_index": crossing.get("feature_index"),
+            "distance_m": float(crossing["distance_m"]),
+            "road_type": crossing.get("road_type"),
+            "category_road_type": crossing.get("category_road_type"),
+            "upper_s": road_upper_seconds(crossing),
+        }
+        for crossing in crossings
+    ]
+    return {
+        "raw_count": raw_count,
+        "crossing_upper_bounds": crossing_upper_bounds,
+        "road_upper_s": sum(row["upper_s"] for row in crossing_upper_bounds),
+        "raw_waits_s": {
+            name: seconds * raw_count
+            for name, seconds in SENSITIVITY_SECONDS.items()
+        },
+    }
 
 
 def nearest_intersection(
@@ -185,11 +254,46 @@ def projected_wait(
 
 
 def expected_wait(cycle_s: float, green_s: float, dist_m: float, speed_mps: float) -> float:
+    """균일 위상 기대대기 (설계 문서 §7.1·§7.4 step 2): red^2 / (2*cycle).
+
+    횡단 이동시간은 도보시간에 포함되므로 대기창에 더하지 않는다.
+    crossing_time ≤ green 은 통과 가능 전제로만 검사한다.
+    """
     crossing_s = dist_m / speed_mps
     if crossing_s > green_s:
         raise ValueError("crossing cannot finish during pedestrian green")
     red_s = cycle_s - green_s
-    return (red_s + crossing_s) ** 2 / (2 * cycle_s)
+    return red_s ** 2 / (2 * cycle_s)
+
+
+# ── 유도 추정 — cycle/green 이 없을 때 채워진 '횡단거리'로 만든다 ──────────
+# (docs/signal-data-pipeline.md §3.1) 표준데이터에 타이밍이 비어도 횡단거리·도로등급은
+# 대체로 있으므로, 순수 추측이 아니라 경찰청 매뉴얼 기반으로 green 을 유도한다.
+# ⚠️ RoadUpper 와 성격이 다르다: RoadUpper 는 '상한'(항상 과대), 유도는 '평균'(양방향).
+DESIGN_SPEED_MPS = 1.0    # 경찰청 매뉴얼: 보행녹색시간 산정용 설계속도
+ENTRY_TIME_S = 7.0        # 진입시간 (보행녹색 앞 고정분)
+DEFAULT_CYCLE_S = 150.0   # 도로등급 미상 시 도시 신호주기 prior (간선 통상). 이면도로면 ~90
+
+
+def derived_timing(dist_m: float, cycle_s: float = DEFAULT_CYCLE_S) -> tuple[float, float]:
+    """횡단거리 → (cycle, green). green = 진입 7s + 횡단거리 ÷ 1.0 m/s (경찰청)."""
+    if dist_m <= 0:
+        raise ValueError("dist_m must be positive")
+    green = ENTRY_TIME_S + dist_m / DESIGN_SPEED_MPS
+    green = min(green, cycle_s - 5.0)   # red 최소 5s 보장 (green 이 cycle 을 못 삼키게)
+    return cycle_s, green
+
+
+def derived_wait(dist_m: float, cycle_s: float = DEFAULT_CYCLE_S) -> float:
+    """유도 cycle/green 으로 균일 위상 기대대기 red²/(2·cycle) 를 계산한다."""
+    cyc, green = derived_timing(dist_m, cycle_s)
+    red = cyc - green
+    return red ** 2 / (2 * cyc)
+
+
+def fallback_derived_total(crossings: list[dict], cycle_s: float = DEFAULT_CYCLE_S) -> float:
+    """유도값 합계 — RoadUpper 대신 쓸 수 있는 '평균' 추정. 배포 가능(도보 전 아는 값만)."""
+    return sum(derived_wait(float(c["distance_m"]), cycle_s) for c in crossings)
 
 
 def infer_timing(samples: list[tuple[datetime, str]]) -> dict:
@@ -260,7 +364,13 @@ def estimate_route_wait(
     fetched_at: datetime,
     max_live_horizon_s: float = 180,
 ) -> dict:
-    """경로 전체 신호대기와 각 횡단보도에서 쓴 근거를 반환한다."""
+    """경로 전체 신호대기와 각 횡단보도에서 쓴 근거를 반환한다.
+
+    실시간 위상과 주기 기반 기대대기 중 어느 것도 계산할 수 없으면
+    설계 문서 §7.4에 따라 TMAP 횡단거리별 보수 상한을 공식 예측
+    fallback으로 쓴다. TMAP 횡단보도 자체가 없을 때만 신호대기 0초
+    (신호 없음)가 된다.
+    """
     signal_by_id = {
         (str(row.get("stdgCd")), str(row.get("crsrdId"))): row
         for row in signal_rows
@@ -269,11 +379,24 @@ def estimate_route_wait(
     details = []
     complete = True
     accumulated_wait = 0.0
+    unresolved_crossings = []
     for crossing_index, crossing in enumerate(tmap_crossings):
         intersection, distance = nearest_intersection(crossing, intersections)
         if intersection is None:
             complete = False
-            details.append({"method": "unavailable", "nearest_m": distance})
+            unresolved_crossings.append(crossing)
+            upper_s = road_upper_seconds(crossing)
+            total += upper_s
+            accumulated_wait += upper_s
+            details.append(
+                {
+                    "method": "tmap-road-upper-fallback",
+                    "nearest_m": distance,
+                    "distance_m": float(crossing["distance_m"]),
+                    "wait_s": upper_s,
+                    "reason": "intersection unavailable",
+                }
+            )
             continue
         direction = direction_from_geometry(crossing)
         cwid, static, direction = _static_for(
@@ -315,12 +438,18 @@ def estimate_route_wait(
             method = "expected"
         else:
             complete = False
+            unresolved_crossings.append(crossing)
+            upper_s = road_upper_seconds(crossing)
+            total += upper_s
+            accumulated_wait += upper_s
             details.append(
                 {
-                    "method": "unavailable",
+                    "method": "tmap-road-upper-fallback",
                     "intersection": intersection.get("crsrdNm"),
                     "direction": direction,
                     "nearest_m": distance,
+                    "distance_m": float(crossing["distance_m"]),
+                    "wait_s": upper_s,
                     "reason": "cycle/green missing",
                 }
             )
@@ -337,9 +466,16 @@ def estimate_route_wait(
                 "wait_s": wait_s,
             }
         )
+    fallback = (
+        fallback_signal_sensitivity(unresolved_crossings)
+        if unresolved_crossings
+        else None
+    )
     return {
-        "wait_s": total if complete else None,
+        "wait_s": total,
         "complete": complete,
+        "used_fallback": fallback is not None,
+        "fallback": fallback,
         "crossings": len(tmap_crossings),
         "details": details,
     }

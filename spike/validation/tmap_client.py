@@ -15,10 +15,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 URL = "https://apis.openapi.sk.com/tmap/routes/pedestrian?version=1&format=json"
-KEY_FILES = (
-    os.path.join(PROJECT_ROOT, "collector", ".env"),
-    os.path.abspath(os.path.join(PROJECT_ROOT, "..", "bus-test", ".env.local")),
-)
+ENV_FILES = (os.path.join(HERE, ".env"), os.path.join(PROJECT_ROOT, ".env"))
 
 # 문서에 확인된 시설 유형만 보수적으로 보정한다.
 # 나머지는 개인 평지 속도 1.0배로 계산한다.
@@ -46,14 +43,12 @@ def _dotenv_value(path: str, name: str) -> str | None:
 
 def load_key() -> str:
     key = os.environ.get("TMAP_APP_KEY")
+    for path in ENV_FILES:
+        key = key or _dotenv_value(path, "TMAP_APP_KEY")
     if key:
         return key
-    for path in KEY_FILES:
-        key = _dotenv_value(path, "TMAP_APP_KEY")
-        if key:
-            return key
     raise RuntimeError(
-        "TMAP_APP_KEY가 없습니다. collector/.env에 TMAP_APP_KEY=...를 추가하세요."
+        "TMAP_APP_KEY가 없습니다. spike/validation/.env 또는 find-path/.env에 추가하세요."
     )
 
 
@@ -181,6 +176,8 @@ def extract_crosswalks(payload: dict, speed_mps: float) -> list[dict]:
                 {
                     "feature_index": properties.get("index"),
                     "distance_m": distance_m,
+                    "road_type": properties.get("roadType"),
+                    "category_road_type": properties.get("categoryRoadType"),
                     "offset_s": elapsed_s,
                     "lon": float(middle[0]),
                     "lat": float(middle[1]),
@@ -189,7 +186,37 @@ def extract_crosswalks(payload: dict, speed_mps: float) -> list[dict]:
                 }
             )
         elapsed_s += distance_m / speed_mps
-    return rows
+    return merge_adjacent_crosswalks(rows)
+
+
+def merge_adjacent_crosswalks(crossings: list[dict], gap_m: float = 8.0) -> list[dict]:
+    """2단계 횡단(중앙분리대)으로 쪼개진 연속 세그먼트를 하나의 신호로 합친다.
+
+    TMAP은 한 신호 교차로를 2단계로 건너면 ``facilityType=15`` 세그먼트 2개로
+    쪼갠다. 그대로 두면 신호 대기 페널티가 세그먼트마다 붙어 실제 신호 수보다
+    과다 계상된다 (✅ Case 1: 실제 신호 3개인데 세그먼트 6개 → RoadUpper 630초).
+    앞 세그먼트 끝과 다음 세그먼트 시작이 ``gap_m`` 안이면(중앙섬 폭) 같은 신호로
+    보고 합친다 — 별개 교차로는 그 사이에 일반보행로가 있어 멀리 떨어진다.
+
+    합친 횡단보도의 ``distance_m``은 세그먼트 거리의 합(도로 총 횡단폭), 위치는
+    첫 시작~끝 중점, ``offset_s``는 첫 세그먼트 시작 시각을 쓴다. 몇 개를 합쳤는지
+    ``segments``로 남긴다.
+    """
+    if not crossings:
+        return crossings
+    ordered = sorted(crossings, key=lambda c: c["offset_s"])
+    merged = [dict(ordered[0], segments=1)]
+    for c in ordered[1:]:
+        prev = merged[-1]
+        if _haversine_m(prev["end"], c["start"]) <= gap_m:
+            prev["distance_m"] = float(prev["distance_m"]) + float(c["distance_m"])
+            prev["end"] = c["end"]
+            prev["lon"] = (prev["start"][0] + prev["end"][0]) / 2
+            prev["lat"] = (prev["start"][1] + prev["end"][1]) / 2
+            prev["segments"] += 1
+        else:
+            merged.append(dict(c, segments=1))
+    return merged
 
 
 def personal_walk_seconds(
