@@ -596,9 +596,19 @@ function renderBus(d){
      + (nkey>=2 ? ' — 세션·rate 가 키 단위라 커버 속도 ×'+nkey : '') + `</div>`;
   // 완성률
   h += `<div class=big>${pctFine(d.pct)}</div>`;
-  const etaTxt = d.etaMeasuring ? ' · 남은 기간 <b>측정 중</b> (관측 하루치 쌓이면 표시)'
-    : d.etaDays!=null ? ` · 남은 기간 약 <b>${Math.round(d.etaDays)}~${Math.round(d.etaDaysHi)}일</b>`
-       + ` (${(d.etaDays/7).toFixed(0)}~${(d.etaDaysHi/7).toFixed(0)}주 · 현재 확인된 도달 가능 셀 기준)` : '';
+  // ETA 는 이제 단일값이다(eta==etaHi). minDays×7 이 하한 — 완료는 서로 다른 날짜
+  //   minDays 개가 필요해 관측 건수가 빨리 차도 그 아래로는 못 내려간다.
+  let etaTxt = '';
+  if(d.etaMeasuring){
+    etaTxt = ' · 남은 기간 <b>측정 중</b> (관측 하루치 쌓이면 표시)';
+  } else if(d.etaDays!=null){
+    const days = Math.round(d.etaDays), wk = (d.etaDays/7).toFixed(0);
+    const floor = (d.minDays||2)*7;
+    const atFloor = days <= floor;   // 날짜 다양성 하한에 걸림 (건수는 더 빨리 참)
+    etaTxt = ` · 남은 기간 <b>약 ${days}일</b> (${wk}주)`
+      + (atFloor ? ` <span style="opacity:.6">— 날짜 다양성 하한 (같은 요일 ${d.minDays||2}회 필요)</span>`
+                 : ` <span style="opacity:.6">— 확인된 도달 가능 셀 기준</span>`);
+  }
   h += `<div class=sub>${num(d.done)} / ${num(d.goal)} 셀 충족${etaTxt}</div>`;
   h += bar(d.pct);
   if((d.effectiveMaxRoutes||0) < (d.maxRoutes||0))
