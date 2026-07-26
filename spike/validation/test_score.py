@@ -209,15 +209,34 @@ class ScoreTests(unittest.TestCase):
         self.assertEqual(result["product_model"], "Speed+Signal(유도)")
         self.assertEqual(result["status"], "pass")
 
-    def test_cliff_product_conservative_bias_on_demo(self):
-        # 빠듯한 절벽(지하철): 유도(과소예측 60s)는 T1 을 '탄다'고 위험오답,
-        # 보수(150s)는 '놓친다'고 T2 적중. 맥락별 제품은 절벽에서 보수를 골라
-        # 위험오답 0 을 지킨다. (목적: 어느 모델이 이기나가 아니라, 접근이 지도보다
-        # 안전하게 나은가.)
-        # ⚠ 이 케이스는 보수(150s) > 실제(130s) 로 설정한 **데모**다. 보수가 항상
-        #   실제를 덮는다는 보장은 아니며(3관측 경험치), 실측 절벽 이벤트로 검증되기
-        #   전까지 '보수 편향'을 확인하는 용도로만 읽는다(score.py verdict 주석 참조).
-        base = {
+    def test_exact_signal_source_is_preferred(self):
+        scenarios, sig = [], {}
+        for i in range(3):
+            sc = deepcopy(self._cliff_base())
+            sc["id"] = f"exact-{i}"
+            sc["split"] = "test"
+            scenarios.append(sc)
+            sig[sc["id"]] = {"정확": 130.0}
+        result = score.verdict(scenarios, {}, 60, None, signal_estimates=sig)
+        self.assertEqual(result["product_model"], "Speed+Signal(정확)")
+        self.assertEqual(result["status"], "pass")
+
+    def test_test_verdict_requires_explicit_real_source(self):
+        sc = deepcopy(self._cliff_base())
+        sc["id"] = "missing-source"
+        sc.pop("source")
+        sc["split"] = "test"
+        result = score.verdict(
+            [sc], {}, 60, None, signal_estimates={sc["id"]: {"유도": 130.0}}
+        )
+        self.assertEqual(result["n"], 0)
+        self.assertEqual(result["status"], "insufficient")
+
+    def _cliff_base(self):
+        # 빠듯한 절벽(지하철): 무신호면 T1 을 '탄다'고 하지만 실제론 신호 때문에
+        # T1 을 놓치고 T2 를 탄다. 실측 신호 130s, T1 08:04:10 · T2 08:07:10.
+        return {
+            "source": "real",
             "cliff": True,
             "walk_start": "2026-07-25T08:00:00",
             "profile": {"walk_time_ratio": 0.68, "speed_mps": 1.66},
@@ -231,22 +250,47 @@ class ScoreTests(unittest.TestCase):
                            {"id": "T2", "departed_at": "2026-07-25T08:07:10"}],
                        "boarded": "T2"},
         }
+
+    def test_cliff_product_uses_derived_plus_margin(self):
+        # 절벽 전략 = **유도 + §6.6 안전마진(buffer)**. 유도가 실측(130s)에 가까우면
+        # 유도+마진이 T2 를 맞혀, RoadUpper 과대예측 없이 신호 차별점을 실증한다.
+        # 무신호(Speed)는 T1 을 '탄다'고 위험오답. 제품은 유도를 고른다.
         scenarios, sig = [], {}
         for i in range(3):
-            sc = deepcopy(base)
-            sc["id"] = f"cliff-{i}"
-            sc["split"] = "test"
+            sc = deepcopy(self._cliff_base())
+            sc["id"] = f"cliff-{i}"; sc["split"] = "test"
             scenarios.append(sc)
-            sig[sc["id"]] = {"보수": 150.0, "유도": 60.0}
+            sig[sc["id"]] = {"유도": 130.0, "보수": 150.0}
         _, metrics = score.evaluate(scenarios, {}, signal_estimates=sig)
-        # 유도는 위험오답, 보수는 (이 데모에서) 안전 — 절벽에서 둘이 갈린다.
-        self.assertGreater(metrics["Speed+Signal(유도)"]["dangerous"], 0)
-        self.assertEqual(metrics["Speed+Signal(보수)"]["dangerous"], 0)
+        self.assertGreater(metrics["Speed"]["dangerous"], 0)              # 무신호 위험
+        self.assertEqual(metrics["Speed+Signal(유도)"]["dangerous"], 0)   # 유도+마진 안전
         result = score.verdict(scenarios, {}, 60, None, signal_estimates=sig)
-        # 맥락별 제품이 절벽에서 보수를 골라 안전하게 통과한다.
-        self.assertEqual(result["product_model"], "Speed+Signal(보수)")
+        self.assertEqual(result["product_model"], "Speed+Signal(유도)")   # 보수 아님
         self.assertEqual(result["dangerous"], 0)
         self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["safety_validated"])                       # 실측 cliff 표본 존재
+
+    def test_cliff_derived_under_margin_can_still_miss(self):
+        # ⚠️ 유도는 평균이라, 신호 오차가 마진(60s)을 넘게 과소예측하면(유도 60 < 실측 130)
+        # 절벽에서 T1 을 놓친다 — 유도+고정마진이 안전을 보장하지 않는다는 증거.
+        # 이 경우 보수(150s·최후수단)는 안전하지만 실측 전부에서 오차가 더 크다.
+        # → 절벽 마진 크기는 실측 절벽 관측으로 교정해야 한다(safety_validated).
+        scenarios, sig = [], {}
+        for i in range(3):
+            sc = deepcopy(self._cliff_base())
+            sc["id"] = f"cliff-{i}"; sc["split"] = "test"
+            scenarios.append(sc)
+            sig[sc["id"]] = {"유도": 60.0, "보수": 150.0}
+        _, metrics = score.evaluate(scenarios, {}, signal_estimates=sig)
+        self.assertGreater(metrics["Speed+Signal(유도)"]["dangerous"], 0)  # 과소예측 → 놓침
+        self.assertEqual(metrics["Speed+Signal(보수)"]["dangerous"], 0)    # 보수는 이 경우 안전
+        result = score.verdict(scenarios, {}, 60, None, signal_estimates=sig)
+        # 제품은 유도를 쓰므로 위험오답이 잡혀 통과하지 못한다(honest fail).
+        self.assertEqual(result["product_model"], "Speed+Signal(유도)")
+        self.assertGreater(result["dangerous"], 0)
+        self.assertNotEqual(result["status"], "pass")
+        self.assertTrue(result["cliff_observed"])
+        self.assertFalse(result["safety_validated"])
 
     def test_three_new_events_can_pass_only_after_thresholds(self):
         here = os.path.dirname(os.path.abspath(__file__))

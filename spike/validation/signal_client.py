@@ -137,7 +137,8 @@ def road_upper_seconds(crossing: dict) -> float:
     으로 만든 20m↓60s·초과150s 2밴드 경험값이라, 주기가 더 긴 신호에선 150s 를 넘을 수
     있다(보장 없음). ⚠️ 또 밴드는 병합 전 단일세그먼트 거리로 학습됐는데 지금은 병합 신호
     거리에 적용된다 — 병합 단위로 재학습 필요(signal_calibration.json `_caveat`).
-    절벽 trip 과소예측 방지엔 보수적이라 쓰되 '항상 안전한 상한'으로 신뢰하지 말 것.
+    현재 제품은 유도값+안전마진을 절벽 판정에 사용한다. 이 값은 비교 진단과
+    유도값을 만들 수 없는 경우의 최후 fallback일 뿐이며 '항상 안전한 상한'이 아니다.
     """
     distance_m = float(crossing["distance_m"])
     if distance_m <= 0:
@@ -152,8 +153,8 @@ def road_upper_seconds(crossing: dict) -> float:
 def fallback_signal_sensitivity(crossings: list[dict]) -> dict:
     """주기·실시간이 없을 때 설계 문서 §7.4의 fallback을 계산한다.
 
-    RoadUpper(보수 경험추정 — 안전성 미검증, 상한 보장 아님)는 제품·공식 평가값이고
-    OTP15와 Expected20은 민감도 값이다.
+    RoadUpper(보수 경험추정 — 안전성 미검증, 상한 보장 아님)는 비교 진단 및
+    유도 계산 불가 시 fallback이고, OTP15와 Expected20은 민감도 값이다.
     ⚠️ 입력 crossings 는 이미 신호 단위로 병합된 것이어야 한다 — 2단계 횡단의
     세그먼트 분할은 tmap_client.merge_adjacent_crosswalks 가 상류에서 합친다
     (여기서 crossing 마다 보수값을 더하므로, 세그먼트째 들어오면 과다 계상된다).

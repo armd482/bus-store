@@ -4,9 +4,12 @@
 ★ 판정 대상은 **'어느 모델을 써야 하나'가 아니라, 이런 식으로 도보 속도 + 보행신호
    대기를 반영한 접근이 기존 지도보다 나은가(적합성)**이다. 여러 추정 방법(보수·유도)이
    있고, 그 방법들로도 지도보다 개선되는가를 본다. 그래서 '제품'은 단일 모델이 아니라
-   **맥락별 추정기**로 둔다 (verdict: 절벽=보수(안전성 미검증)·배차=유도(정확)).
-   ⚠️ '절벽=보수'의 안전은 실측 cliff=true 표본으로만 검증된다 — 없으면 verdict 의
-   `safety_validated=false` 로 표시하고 pass 는 연결(속도) 축 한정으로 읽는다.
+   **추정기**로 둔다: 절벽·배차 모두 **유도(유효녹색 평균)를 기본**으로 쓰고, 절벽 안전은
+   RoadUpper 과대예측이 아니라 **§6.6 안전마진(buffer)**으로 확보한다. 보수(RoadUpper)는
+   실측 전부에서 오차가 더 커(과대예측) **유도를 못 만들 때만 최후수단**으로 쓴다.
+   ⚠️ 유도+마진의 절벽 안전은 실측 cliff=true 표본에서 위험오답이 없어야 검증된다.
+   표본이 없거나 위험오답이 있으면 verdict의 `safety_validated=false`로 표시하고,
+   절벽 표본이 없는 pass는 연결(속도) 축 한정으로 읽는다.
 
 검증 대상 가설: **도보 속도와 보행신호 대기를 반영하면, 기존 지도(네이버·카카오)
 보다 더 정확한 연결 안내를 준다.** 여기서 '정확'은 도착시각 정밀도가 아니라
@@ -302,6 +305,10 @@ def eligible(sc: dict, selected_split: str) -> bool:
         return False
     if not sc.get("valid", True):
         return False
+    # 공식 검증은 명시적인 실측 자료만 허용한다. source 누락·오타가 조용히
+    # test 판정에 들어가면 demo/calibration 제외 규칙이 무력화된다.
+    if selected_split == "test" and sc.get("source") != "real":
+        return False
     return selected_split == "all" or sc.get("split", "test") == selected_split
 
 
@@ -425,15 +432,10 @@ def verdict(
     n = len(rows)
     # ★ 판정 대상은 '어느 모델이 이기나'가 아니라, **이 접근(도보 속도 + 신호,
     #   맥락별 추정기)이 지도보다 나은가**의 적합성이다. 그래서 제품을 단일 모델이
-    #   아니라 **이벤트 맥락별 추정기**로 둔다:
-    #     · 절벽(cliff=true, 지하철)  → 보수(RoadUpper): 과소예측→놓침을 줄이려는 보수 추정
-    #     · 배차(cliff=false)         → 유도(derived):   도착시각이 정확한 평균값
-    #   소스 변형(보수/유도)이 없으면(단일 신호) 그 신호 모델을 그대로 쓴다.
-    #   ⚠ 주의: 보수(RoadUpper)는 3관측 경험치일 뿐 수학적 상한이 아니다(§P1-4 caveat,
-    #      signal_calibration.json._caveat 참조). 따라서 "절벽=보수 → 놓침 0"은 **보장이
-    #      아니라 기대**다. 실측 절벽 이벤트(cliff=true 실데이터)로 검증되기 전까지 이 선택은
-    #      '안전 보장'이 아니라 '보수 편향'으로만 해석하고, verdict 의 위험오답 0 도
-    #      배차(cliff=false) 표본에 한정된 결과임을 밝힌다.
+    #   아니라 **이벤트 맥락별 판정 규칙**으로 둔다:
+    #     · 절벽(cliff=true, 지하철)  → 유도(derived) + §6.6 안전마진(buffer_s)
+    #     · 배차(cliff=false)         → 유도(derived), 연결 게이트에는 신호를 넣지 않음
+    #   유도를 만들 수 없을 때만 보수(RoadUpper)를 최후 fallback으로 쓴다.
     def base_present(base):
         return n > 0 and all(
             any(k == base or k.startswith(base + "(") for k in row["predictions"])
@@ -454,22 +456,24 @@ def verdict(
 
     def product_pred(row):
         preds = row["predictions"]
-        src = "보수" if row["cliff"] else "유도"   # 절벽 보수(미검증) / 배차 정확
-        return (preds.get(f"{product_base}({src})")
+        # 실측 주기 기반 정확값이 있으면 최우선, 없으면 유도 평균을 쓴다.
+        # 보수(RoadUpper)는 유도도 만들 수 없을 때만 최후수단이다.
+        return (preds.get(f"{product_base}(정확)")
+                or preds.get(f"{product_base}(유도)")
                 or preds.get(product_base)
-                or preds.get(f"{product_base}(보수)")
-                or preds.get(f"{product_base}(유도)"))
+                or preds.get(f"{product_base}(보수)"))
     pp = [product_pred(row) for row in rows]
     used = {p.model for p in pp}
     product_model = (next(iter(used)) if len(used) == 1
-                     else f"{product_base}(맥락별: 절벽=보수·배차=유도)")
+                     else f"{product_base}(정확/유도, 보수 최후수단)")
 
-    # ★ 절벽 안전(보수 선택)은 **실측 cliff=true 표본으로만 검증된다.** 지금 채점 표본이
-    #   전부 배차버스(cliff=false)면 보수 경로는 한 번도 실측으로 검증되지 않은 것이라,
-    #   'pass' 가 나와도 그건 **속도(배차) 축의 통과**일 뿐 절벽 안전 보장이 아니다.
-    #   product 가 보수를 고르는 절벽 행이 채점에 실제로 들어왔는지로 판별한다.
-    cliff_scored = sum(1 for row in rows if row["cliff"])
-    safety_validated = cliff_scored > 0
+    # 절벽 표본의 존재와 안전 결과를 분리한다. 표본이 있다는 이유만으로 위험오답을
+    # 낸 모델까지 "안전 검증됨"으로 표시하면 안 된다.
+    cliff_pp = [p for row, p in zip(rows, pp) if row["cliff"]]
+    cliff_scored = len(cliff_pp)
+    cliff_dangerous = sum(p.dangerous is True for p in cliff_pp)
+    cliff_observed = cliff_scored > 0
+    safety_validated = cliff_observed and cliff_dangerous == 0
 
     uplift = sum(
         (not row["predictions"]["Naver"].connection_ok) and p.connection_ok
@@ -480,7 +484,9 @@ def verdict(
             "status": "insufficient", "n": n, "uplift": uplift,
             "product_model": product_model,
             "safety_validated": safety_validated,
+            "cliff_observed": cliff_observed,
             "cliff_scored": cliff_scored,
+            "cliff_dangerous": cliff_dangerous,
             "reason": f"새 test 표본 {MIN_TEST_EVENTS}건 필요",
         }
 
@@ -504,8 +510,10 @@ def verdict(
         "n": n,
         "uplift": uplift,
         "product_model": product_model,
-        "safety_validated": safety_validated,   # 실측 cliff=true 표본이 있어야 True
+        "safety_validated": safety_validated,
+        "cliff_observed": cliff_observed,
         "cliff_scored": cliff_scored,
+        "cliff_dangerous": cliff_dangerous,
         "map_accuracy": naver["connection_accuracy"],
         "product_accuracy": product_accuracy,
         "map_wrong": map_wrong,
@@ -565,10 +573,15 @@ def print_report(rows: list[dict], metrics: dict, result: dict, buffer_s: int) -
         )
     # ★ 절벽 안전 검증 여부 — status(연결 축)와 분리해 항상 명시한다.
     if result.get("safety_validated"):
-        print(f"  절벽 안전: ✅ 검증됨 (실측 cliff=true 표본 {result.get('cliff_scored', 0)}건)")
+        print(f"  절벽 안전: ✅ 관측 표본 내 위험오답 없음 "
+              f"(실측 cliff=true {result.get('cliff_scored', 0)}건)")
+    elif result.get("cliff_observed"):
+        print(f"  절벽 안전: ❌ 위험오답 {result.get('cliff_dangerous', 0)}건 "
+              f"(실측 cliff=true {result.get('cliff_scored', 0)}건)")
     else:
         print("  절벽 안전: ⚠️ 미검증 — 채점 표본이 전부 배차버스(cliff=false)라 "
-              "보수(RoadUpper) 안전 경로가 실측된 적 없다. 위 판정은 연결(속도) 축 한정이다.")
+              "유도+§6.6 안전마진의 절벽 안전이 실측된 적 없다(마진 크기 미교정). "
+              "위 판정은 연결(속도) 축 한정이다.")
 
 
 def sweep_flip(crosswalks: dict, slow: float = 1.0, fast: float = 1.66) -> None:
