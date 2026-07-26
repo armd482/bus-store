@@ -373,18 +373,22 @@ def snapshot():
     today = O.day_type(now)
     nowband = O.band_of(now, bands)
     with _DB_LOCK:
-        byband = {b: (n, cells) for b, n, cells in c.execute(
-            "SELECT band, SUM(n), COUNT(*) FROM cell WHERE daytype=? GROUP BY band",
-            (today,)).fetchall()}
+        # ⚠️ 진행률 분자는 **셀별로 target 까지만 센 SUM(MIN(n,target))** — 한 셀의 초과
+        #    관측이 다른 미관측 셀을 보상해 허위/초과 100% 가 되는 것을 막는다. 원시 SUM(n)
+        #    은 표시용으로만(obs) 남긴다.
+        byband = {b: (n, cells, filled) for b, n, cells, filled in c.execute(
+            "SELECT band, SUM(n), COUNT(*), COALESCE(SUM(MIN(n,?)),0) "
+            "FROM cell WHERE daytype=? GROUP BY band",
+            (tgt, today)).fetchall()}
     band_rows = []
     for i, (a, b) in enumerate(bands):
-        n, cells = byband.get(i, (0, 0))
+        n, cells, filled = byband.get(i, (0, 0, 0))
         band_goal = eligible.get((today, i), 0)
         band_need = band_goal * tgt
         band_rows.append({
             "i": i, "from": a, "to": b if b <= 24 else b - 24, "wrap": b > 24,
-            "obs": n, "cells": cells, "goal": band_goal, "need": band_need,
-            "pct": n / band_need if band_need else 0,
+            "obs": n, "filled": filled, "cells": cells, "goal": band_goal, "need": band_need,
+            "pct": min(filled / band_need, 1.0) if band_need else 0,
             "peak": (a, b) in ((7, 9), (17, 20)),
         })
 
@@ -686,8 +690,11 @@ function renderBus(d){
     const cur = d.nowBand!=null && b.i===d.nowBand;
     h += `<div class=row><div class=lbl>${label}${b.peak?'<span class=tag>첨두</span>':''}${b.wrap?'<span class=tag>익일</span>':''}${cur?'<span class=tag style="color:#3b82f6">진행 중</span>':''}</div>`
        + bar(b.pct, b.pct>=1?'ok':'')
-       + `<div class=val>${num(b.obs)} / ${num(b.need)} · <b>${pct(b.pct)}</b></div></div>`;
+       + `<div class=val>${num(b.filled)} / ${num(b.need)} · <b>${pct(b.pct)}</b>`
+       + `<span style="opacity:.5"> (관측 ${num(b.obs)})</span></div></div>`;
   }
+  h += `<div class=sub style="opacity:.6">진행률 = Σmin(관측,${d.target}) ÷ 필요 — 셀별 목표까지만 세어 `
+     + `초과 관측이 미관측 셀을 가리지 못한다. 괄호 안은 원시 총관측.</div>`;
 
   // 요일 — 7종 전부 분리
   h += `<h2>요일별 완성률 (전부 분리)</h2>

@@ -258,10 +258,14 @@ def predict(
 
     walk_s = base_walk_s + signal_component
     arrival = walk_start + timedelta(seconds=walk_s)
-    # §6.3: 시각표를 지키는 수단(지하철·기점 광역)에만 절벽이 있다. 배차버스
-    # (cliff=false)는 신호 Δ가 총시간엔 +Δ로 더해지지만(arrival/MAE) 어느 차를
-    # 잡는지는 안 바꾼다 — 놓쳐도 배차간격 안에 다음 차가 온다. 따라서 연결
-    # 선택 게이트에서는 신호를 제외하고 순수 이동 도착으로 판정한다.
+    # §6.3: 시각표를 지키는 수단(지하철·기점 광역)에만 '놓침 절벽'이 있다. 배차버스
+    # (cliff=false)는 신호 Δ가 총시간엔 +Δ로 더해지지만(arrival/MAE), **연결 선택
+    # 게이트에선 신호를 뺀 순수 이동 도착으로 판정**한다.
+    # ⚠️ 연결은 차량 단위로 유지한다(6211_early vs 6211_next 는 다르다 — 이른 차를 잡으면
+    #   그만큼 일찍 출발한다. 이 early/next 구분이 순증분의 핵심이라 노선으로 묶지 않는다).
+    #   그럼에도 게이트에서 신호를 빼는 건 [[cliff-aware-connection]] 의 의도적 결정이다:
+    #   배차버스는 놓쳐도 배차간격 안에 다음 차가 오므로(하드 절벽 없음), 신호 **과대예측**이
+    #   연결을 next 로 잘못 뒤집는 위험이 이득보다 크다. 신호의 효과는 MAE(+Δ)로 남는다.
     cliff = bool(sc.get("cliff", True))
     gate_arrival = (
         arrival if cliff else walk_start + timedelta(seconds=base_walk_s)
@@ -275,6 +279,7 @@ def predict(
 
     actual_arrival = parse_dt(sc["actual"]["stop_arrival"])
     truth = actual_connection(sc)
+    connection_ok = connection == truth
     actual_by_id = dict(actual_bus_times(sc))
     dangerous = None
     if connection in actual_by_id:
@@ -285,7 +290,7 @@ def predict(
         arrival=arrival,
         connection=connection,
         arrival_error_s=(arrival - actual_arrival).total_seconds(),
-        connection_ok=connection == truth,
+        connection_ok=connection_ok,
         dangerous=dangerous,
     )
 
@@ -383,15 +388,14 @@ def evaluate(
             continue
         ps = [p for p, _ in pr]
         abs_errors = [abs(p.arrival_error_s) for p in ps]
-        boarded_pairs = [(p, r["boarded"]) for p, r in pr if r.get("boarded")]
+        boarded_hits = [p.connection == r["boarded"] for p, r in pr if r.get("boarded")]
         metrics[model] = {
             "n": len(ps),
             "mae_s": mean(abs_errors),
             "median_ae_s": median(abs_errors),
             "connection_accuracy": sum(p.connection_ok for p in ps) / len(ps),
-            "boarded_accuracy": (sum(p.connection == b for p, b in boarded_pairs)
-                                 / len(boarded_pairs)) if boarded_pairs else math.nan,
-            "boarded_n": len(boarded_pairs),
+            "boarded_accuracy": (sum(boarded_hits) / len(boarded_hits)) if boarded_hits else math.nan,
+            "boarded_n": len(boarded_hits),
             "dangerous": sum(p.dangerous is True for p in ps),
         }
     return rows, metrics

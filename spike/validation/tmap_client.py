@@ -142,14 +142,21 @@ def extract_segments(payload: dict) -> list[dict]:
     return segments
 
 
-def extract_crosswalks(payload: dict, speed_mps: float) -> list[dict]:
+def extract_crosswalks(payload: dict, speed_mps: float,
+                       multipliers: dict | None = None) -> list[dict]:
     """TMAP 횡단보도 세그먼트를 신호 매칭용 위치와 도착 오프셋으로 만든다.
 
     ``offset_s``는 신호 대기를 제외하고 해당 횡단보도 시작점까지 걷는 시간이다.
     실시간 신호는 첫 도보에서 이 시각에만 투영한다.
+    ⚠️ **시설 배수(계단·지하도 등)를 personal_walk_seconds 와 동일하게 적용**한다 —
+    안 하면 계단·지하도 뒤 횡단보도의 offset_s 가 실제 도달보다 빨라져 실시간 위상
+    투영 시각이 전체 도보 계산과 어긋난다(빠른 사용자·시설 구간에서 특히).
     """
     if speed_mps <= 0:
         raise ValueError("speed_mps must be positive")
+    factors = dict(DEFAULT_FACILITY_MULTIPLIERS)
+    if multipliers:
+        factors.update({int(k): float(v) for k, v in multipliers.items()})
     elapsed_s = 0.0
     rows = []
     for feature in payload.get("features", []):
@@ -185,7 +192,7 @@ def extract_crosswalks(payload: dict, speed_mps: float) -> list[dict]:
                     "end": [float(coordinates[-1][0]), float(coordinates[-1][1])],
                 }
             )
-        elapsed_s += distance_m / speed_mps
+        elapsed_s += distance_m / (speed_mps * factors.get(facility_type, 1.0))
     return merge_adjacent_crosswalks(rows)
 
 
@@ -201,6 +208,12 @@ def merge_adjacent_crosswalks(crossings: list[dict], gap_m: float = 8.0) -> list
     합친 횡단보도의 ``distance_m``은 세그먼트 거리의 합(도로 총 횡단폭), 위치는
     첫 시작~끝 중점, ``offset_s``는 첫 세그먼트 시작 시각을 쓴다. 몇 개를 합쳤는지
     ``segments``로 남긴다.
+
+    ⚠️ **한계**: TMAP 에 신호 제어기 ID 가 없어 **기하 거리(gap_m)만으로** 판단한다.
+    같은 제어기의 2단계 횡단은 잘 합치지만, 서로 다른 신호가 gap_m 안에 붙어 있는
+    복잡 교차로는 하나로 잘못 합칠 수 있다(별개 교차로는 사이에 일반보행로가 끼어
+    대개 gap_m 밖이라 실무상 드물지만 보장은 아니다). 제어기 정보가 생기면 그걸로
+    가르고, 정밀이 필요한 지점은 현장 실측으로 신호 수를 확정할 것.
     """
     if not crossings:
         return crossings
@@ -252,7 +265,8 @@ def event_walk_seconds(sc: dict, key: str | None = None) -> tuple[float, dict]:
         "distance_m": sum(s["distance_m"] for s in segments),
         "segments": len(segments),
         "crosswalk_segments": sum(s["facility_type"] == 15 for s in segments),
-        "crosswalks": extract_crosswalks(payload, speed_mps),
+        "crosswalks": extract_crosswalks(
+            payload, speed_mps, config.get("facility_speed_multipliers")),
     }
     return seconds, summary
 

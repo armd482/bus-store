@@ -128,12 +128,40 @@ def kill_manual(why="정리"):
              "| ForEach-Object {Stop-Process -Id $_.ProcessId -Force}"], ok_fail=True)
         return
 
+    # ⚠️ 프로젝트 소속만 죽인다 — argv 가 상대경로('python server.py')라 커맨드라인만으론
+    #    다른 디렉터리의 server.py 와 구분이 안 된다. 각 PID 의 **cwd** 가 이 프로젝트
+    #    (HERE 또는 mac 실행본)인지 확인해 스코핑한다. cwd 를 못 읽으면 **안 죽인다**
+    #    (남의 프로세스를 잘못 죽이는 것보다 우리 것 하나 못 죽여 경고하는 게 낫다).
+    project_dirs = {os.path.realpath(HERE)}
+    if sys.platform == "darwin":
+        project_dirs.add(os.path.realpath(mac_workdir()))
+
+    def _proc_cwd(pid):
+        try:
+            if sys.platform == "darwin":
+                r = subprocess.run(["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"],
+                                   capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines():
+                    if line.startswith("n"):
+                        return os.path.realpath(line[1:])
+                return None
+            return os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+
     def alive():
         # ⚠️ -i 필수 — macOS 프레임워크 파이썬은 프로세스명이 대문자 'Python' 이라
         #    소문자 패턴이 빗나간다 (✅ 실측: stop 이 수동 실행분을 못 내렸다).
         p = subprocess.run(["pgrep", "-if", PROC_PAT], capture_output=True, text=True)
         me = {os.getpid(), os.getppid()}
-        return [int(x) for x in p.stdout.split() if x.isdigit() and int(x) not in me]
+        out = []
+        for x in p.stdout.split():
+            if not (x.isdigit() and int(x) not in me):
+                continue
+            cwd = _proc_cwd(int(x))
+            if cwd in project_dirs:          # 프로젝트 소속만 (cwd 미확인은 제외)
+                out.append(int(x))
+        return out
 
     pids = alive()
     if not pids:
@@ -340,13 +368,22 @@ WantedBy=timers.target
 """)
     kill_manual("install")   # nohup/screen 으로 띄운 것도 — 안 그러면 유닛과 중복으로 돈다
     ensure_pool(HERE)                                             # 풀이 비었으면 fetch_routes 부터
-    user = os.environ.get("USER", "")
-    run(["loginctl", "enable-linger", user], ok_fail=True)  # 부팅 자동 실행 (로그인 불요)
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    # ⚠️ enable-linger 실패를 삼키고 성공을 출력하면 안 된다 — linger 없이는 SSH 로그아웃
+    #    때 user 서비스가 통째로 죽어 수집이 조용히 멈춘다. 성공을 확인하고, 실패하면
+    #    똑똑히 경고한다(설치는 계속하되 '완료'라고 속이지 않는다).
+    run(["loginctl", "enable-linger", user], ok_fail=True)
+    lr = run(["loginctl", "show-user", user, "-p", "Linger"], ok_fail=True)
+    linger_ok = "Linger=yes" in (lr.stdout or "")
     run(["systemctl", "--user", "daemon-reload"])
     for name, _, _ in LX_UNITS:
         run(["systemctl", "--user", "enable", "--now", name])
     run(["systemctl", "--user", "enable", "--now", "findpath-routes.timer"])
-    print("설치·시작됨 (버스+지하철+서울). 대시보드: http://localhost:8080 (리눅스는 877이 특권 포트라 8080)")
+    if not linger_ok:
+        print(f"⚠️ loginctl enable-linger 실패 — linger 미설정({user}). SSH 로그아웃/세션 종료 시 "
+              "수집기가 조용히 멈춘다. sudo loginctl enable-linger " + user + " 로 직접 켤 것.", flush=True)
+    print("설치·시작됨 (버스+지하철+서울). 대시보드: http://localhost:8080 (리눅스는 877이 특권 포트라 8080)"
+          + ("" if linger_ok else "  ⚠️ 단 linger 미설정 — 위 경고 참조"))
     print("⚠️ 지하철은 config.subwayKeys에 등록된 .env 키를 사용한다 "
           "(현재 SEOUL_SUBWAY_KEY~KEY5) — 없는 키는 로그에 표시하고 건너뛴다")
     maybe_follow(lx_logs)
@@ -409,11 +446,15 @@ def win_install():
     #    창에는 그대로 흐르고 파일에는 복사본이 남아야 한다.
     # 지하철은 별도 창에서 같이 띄운다 — 리눅스의 두 유닛과 같은 구성.
     # start "" 로 새 창을 열어 각자 감시 루프를 돌린다 (한쪽이 죽어도 다른 쪽 유지).
-    with open(os.path.join(HERE, "run_subway.bat"), "w") as f:
-        f.write(f"""@echo off
+    # 지하철·서울을 각자 별도 창의 감시 루프로 — 리눅스의 findpath-subway·findpath-seoul
+    # 두 유닛과 같은 구성 (서울 수집기가 윈도우에서만 빠져 있던 것을 맞춘다).
+    for script, name in (("subway_collector.py", "run_subway.bat"),
+                         ("seoul_collector.py", "run_seoul.bat")):
+        with open(os.path.join(HERE, name), "w") as f:
+            f.write(f"""@echo off
 cd /d "{HERE}"
 :loop
-"{PY}" subway_collector.py
+"{PY}" {script}
 timeout /t 30
 goto loop
 """)
@@ -421,6 +462,7 @@ goto loop
         f.write(f"""@echo off
 cd /d "{HERE}"
 start "findpath-subway" cmd /c run_subway.bat
+start "findpath-seoul" cmd /c run_seoul.bat
 :loop
 "{PY}" server.py --log logs\\server.log
 timeout /t 10
