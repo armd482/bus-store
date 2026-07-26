@@ -105,14 +105,19 @@ systemctl --user restart findpath   # 코드 고친 뒤 반영
 python3 server.py        # 개발 — 터미널에서 직접. Ctrl-C 로 종료
 ```
 
-**상시 실행 (크래시·재부팅 자동 재시작)** — `launchd` 를 쓴다. 크래시하든 재부팅하든 알아서 다시 뜨고, **사용자가 명시적으로 내린 경우에만**(아래 bootout — 터미널의 Ctrl-C 에 해당) 꺼진 채로 있는다:
+**상시 실행 (크래시·재부팅 자동 재시작)** — `launchd` 를 쓴다.
+
+> ✅ **권장: `python3 service.py install`** — 버스(`com.findpath.collector`)·**지하철(`.subway`)·서울(`.seoul`)** LaunchAgent **셋을 한 번에** 걸고 TCC 밖 복사·풀 조회까지 알아서 한다. 아래 수동 절차는 **버스 하나만** 설치하므로 지하철·서울이 빠진다 — 셋 다 필요하면 `service.py install` 을 쓸 것.
+
+수동으로(버스만) 직접 제어하고 싶을 때:
 
 ```bash
 # 1. TCC 보호 밖으로 복사본을 둔다 (아래 ⚠️ 참조)
 rsync -a --exclude data --exclude logs ~/Desktop/assignment/find-path/collector/ ~/findpath/collector/
 mkdir -p ~/findpath/collector/logs
 
-# 2. plist 의 USERNAME 치환 후 설치
+# 2. plist 의 USERNAME 치환 후 설치 (⚠️ 이건 버스+대시보드 하나뿐 —
+#    지하철·서울까지 원하면 service.py install)
 sed "s/USERNAME/$(whoami)/g" ~/findpath/collector/com.findpath.collector.plist \
   > ~/Library/LaunchAgents/com.findpath.collector.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.findpath.collector.plist
