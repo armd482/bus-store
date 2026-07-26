@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-지하철 실시간 위치 수집기 — 정시성 검증용 (docs/transit-routing-gtfs.md §3.3.3 · §8 #1)
+지하철 실시간 도착정보 일괄 수집기 — 정시성 검증용 (docs/transit-routing-gtfs.md §3.3.3 · §8 #1)
+(엔드포인트는 `realtimeStationArrival/.../ALL` 이다 — 열차 위치 API(`realtimePosition`)가 아니라
+전 노선 역 도착정보를 한 번에 받는다. 아래 ★ 참조.)
 
 계획 시각표(신분당선은 운영사 공식 PDF — §3.3.1)와 실측 통과 시각을 대조해
 정시성 분포를 잰다. ⚠️ 시각표 "복원"용이 아니다 — 관측으로 복원한 시각표에

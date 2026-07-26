@@ -289,16 +289,26 @@ def derived_timing(dist_m: float, cycle_s: float = DEFAULT_CYCLE_S) -> tuple[flo
     return cycle_s, green
 
 
-def derived_wait(dist_m: float, cycle_s: float = DEFAULT_CYCLE_S) -> float:
-    """유도 cycle/green 으로 균일 위상 기대대기 red²/(2·cycle) 를 계산한다."""
+def derived_wait(dist_m: float, speed_mps: float, cycle_s: float = DEFAULT_CYCLE_S) -> float:
+    """유도 cycle/green + **유효녹색**으로 균일 위상 기대대기.
+
+    expected_wait 과 같은 형태로 통일한다: (cycle − effective_green)²/(2·cycle),
+    effective_green = green − 횡단시간(dist/speed). green 은 유도값(진입 7s + 거리/1.0).
+    ⚠️ 이전 판은 red²/(2·cycle)에 speed 무관이라 **유도 fallback(대부분 경로)에서 속도
+    개인화가 빠졌다** — expected_wait 만 고치고 여기를 안 고치면 정작 공공 주기가 없는
+    다수 경로가 개인화 안 됨. crossing 이 green 보다 길면(느린 사용자·긴 횡단) effective 를
+    0 으로 클램프한다(fallback 은 예외를 던지지 않고 보수적으로 최대 대기에 수렴)."""
+    if speed_mps <= 0:
+        raise ValueError("speed_mps must be positive")
     cyc, green = derived_timing(dist_m, cycle_s)
-    red = cyc - green
-    return red ** 2 / (2 * cyc)
+    effective_green = max(0.0, green - dist_m / speed_mps)
+    return (cyc - effective_green) ** 2 / (2 * cyc)
 
 
-def fallback_derived_total(crossings: list[dict], cycle_s: float = DEFAULT_CYCLE_S) -> float:
+def fallback_derived_total(crossings: list[dict], speed_mps: float,
+                           cycle_s: float = DEFAULT_CYCLE_S) -> float:
     """유도값 합계 — RoadUpper 대신 쓸 수 있는 '평균' 추정. 배포 가능(도보 전 아는 값만)."""
-    return sum(derived_wait(float(c["distance_m"]), cycle_s) for c in crossings)
+    return sum(derived_wait(float(c["distance_m"]), speed_mps, cycle_s) for c in crossings)
 
 
 def infer_timing(samples: list[tuple[datetime, str]]) -> dict:

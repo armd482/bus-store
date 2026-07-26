@@ -187,7 +187,7 @@ class ScoreTests(unittest.TestCase):
         self.assertEqual(result["corrected"], 3)
 
     def test_signal_estimates_dict_makes_source_variants(self):
-        # 상한·유도를 dict 로 주면 소스별 모델(…(상한)·…(유도))이 만들어지고,
+        # 보수·유도를 dict 로 주면 소스별 모델(…(보수)·…(유도))이 만들어지고,
         # 제품 모델은 유도(더 정확한 평균)를 우선한다. cliff=false 라 연결은 동일.
         here = os.path.dirname(os.path.abspath(__file__))
         with open(os.path.join(here, "ground_truth.json"), encoding="utf-8") as f:
@@ -198,22 +198,25 @@ class ScoreTests(unittest.TestCase):
             sc["id"] = f"src-{i}"
             sc["split"] = "test"
             scenarios.append(sc)
-            sig[sc["id"]] = {"상한": 300.0, "유도": 100.0}
+            sig[sc["id"]] = {"보수": 300.0, "유도": 100.0}
         rows, metrics = score.evaluate(scenarios, {}, signal_estimates=sig)
-        self.assertIn("Speed+Signal(상한)", rows[0]["predictions"])
+        self.assertIn("Speed+Signal(보수)", rows[0]["predictions"])
         self.assertIn("Speed+Signal(유도)", rows[0]["predictions"])
-        # 두 소스의 도착 MAE 는 다르다(상한이 더 과대 → MAE 큼).
-        self.assertGreater(metrics["Speed+Signal(상한)"]["mae_s"],
+        # 두 소스의 도착 MAE 는 다르다(보수이 더 과대 → MAE 큼).
+        self.assertGreater(metrics["Speed+Signal(보수)"]["mae_s"],
                            metrics["Speed+Signal(유도)"]["mae_s"])
         result = score.verdict(scenarios, {}, 60, None, signal_estimates=sig)
         self.assertEqual(result["product_model"], "Speed+Signal(유도)")
         self.assertEqual(result["status"], "pass")
 
-    def test_cliff_product_uses_upper_bound_for_safety(self):
+    def test_cliff_product_conservative_bias_on_demo(self):
         # 빠듯한 절벽(지하철): 유도(과소예측 60s)는 T1 을 '탄다'고 위험오답,
-        # 상한(150s)은 '놓친다'고 T2 적중. 맥락별 제품은 절벽에서 상한을 골라
+        # 보수(150s)는 '놓친다'고 T2 적중. 맥락별 제품은 절벽에서 보수를 골라
         # 위험오답 0 을 지킨다. (목적: 어느 모델이 이기나가 아니라, 접근이 지도보다
         # 안전하게 나은가.)
+        # ⚠ 이 케이스는 보수(150s) > 실제(130s) 로 설정한 **데모**다. 보수가 항상
+        #   실제를 덮는다는 보장은 아니며(3관측 경험치), 실측 절벽 이벤트로 검증되기
+        #   전까지 '보수 편향'을 확인하는 용도로만 읽는다(score.py verdict 주석 참조).
         base = {
             "cliff": True,
             "walk_start": "2026-07-25T08:00:00",
@@ -234,14 +237,14 @@ class ScoreTests(unittest.TestCase):
             sc["id"] = f"cliff-{i}"
             sc["split"] = "test"
             scenarios.append(sc)
-            sig[sc["id"]] = {"상한": 150.0, "유도": 60.0}
+            sig[sc["id"]] = {"보수": 150.0, "유도": 60.0}
         _, metrics = score.evaluate(scenarios, {}, signal_estimates=sig)
-        # 유도는 위험오답, 상한은 안전 — 절벽에서 둘이 갈린다.
+        # 유도는 위험오답, 보수는 (이 데모에서) 안전 — 절벽에서 둘이 갈린다.
         self.assertGreater(metrics["Speed+Signal(유도)"]["dangerous"], 0)
-        self.assertEqual(metrics["Speed+Signal(상한)"]["dangerous"], 0)
+        self.assertEqual(metrics["Speed+Signal(보수)"]["dangerous"], 0)
         result = score.verdict(scenarios, {}, 60, None, signal_estimates=sig)
-        # 맥락별 제품이 절벽에서 상한을 골라 안전하게 통과한다.
-        self.assertEqual(result["product_model"], "Speed+Signal(상한)")
+        # 맥락별 제품이 절벽에서 보수를 골라 안전하게 통과한다.
+        self.assertEqual(result["product_model"], "Speed+Signal(보수)")
         self.assertEqual(result["dangerous"], 0)
         self.assertEqual(result["status"], "pass")
 

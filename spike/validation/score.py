@@ -2,9 +2,9 @@
 """개인화 길찾기 해결책 평가기.
 
 ★ 판정 대상은 **'어느 모델을 써야 하나'가 아니라, 이런 식으로 도보 속도 + 보행신호
-   대기를 반영한 접근이 기존 지도보다 나은가(적합성)**이다. 여러 추정 방법(상한·유도)이
+   대기를 반영한 접근이 기존 지도보다 나은가(적합성)**이다. 여러 추정 방법(보수·유도)이
    있고, 그 방법들로도 지도보다 개선되는가를 본다. 그래서 '제품'은 단일 모델이 아니라
-   **맥락별 추정기**로 둔다 (verdict: 절벽=상한(안전)·배차=유도(정확)).
+   **맥락별 추정기**로 둔다 (verdict: 절벽=보수(안전)·배차=유도(정확)).
 
 검증 대상 가설: **도보 속도와 보행신호 대기를 반영하면, 기존 지도(네이버·카카오)
 보다 더 정확한 연결 안내를 준다.** 여기서 '정확'은 도착시각 정밀도가 아니라
@@ -232,7 +232,7 @@ def predict(
     # 둘을 분리해야 §6.3의 절벽 판정을 신호와 독립적으로 적용할 수 있다.
     signal_component = 0.0
     # 신호 추정 소스 접미사 제거 — "Speed+Signal(유도)" → base "Speed+Signal".
-    # 어느 소스(상한/유도)의 값을 넣었는지는 signal_wait_s 로 이미 들어와 있다.
+    # 어느 소스(보수/유도)의 값을 넣었는지는 signal_wait_s 로 이미 들어와 있다.
     base = model.split("(", 1)[0]
     if base == "Naver":
         base_walk_s = naver_walk_s
@@ -322,7 +322,7 @@ def evaluate(
         # 신호 추정 소스 정규화 → [(label, value)].
         #   None(비-strict)  → [("", None)]  : crosswalks.json 기대대기로 계산(라벨 없음)
         #   float            → [("", float)]  : 단일 소스(라벨 없음) — 하위호환
-        #   dict{상한:x,유도:y} → 소스별 모델 변형 (Speed+Signal(상한)·(유도) …)
+        #   dict{보수:x,유도:y} → 소스별 모델 변형 (Speed+Signal(보수)·(유도) …)
         strict_signal = signal_estimates is not None
         raw = signal_estimates.get(sc["id"]) if strict_signal else None
         if not strict_signal:
@@ -367,7 +367,7 @@ def evaluate(
             }
         )
 
-    # 모델 목록은 실제 예측 키에서 동적으로 — 신호 소스 접미사(상한/유도)가 붙어
+    # 모델 목록은 실제 예측 키에서 동적으로 — 신호 소스 접미사(보수/유도)가 붙어
     # 이름이 가변이기 때문. 등장 순서를 보존한다.
     models = []
     for row in rows:
@@ -424,9 +424,14 @@ def verdict(
     # ★ 판정 대상은 '어느 모델이 이기나'가 아니라, **이 접근(도보 속도 + 신호,
     #   맥락별 추정기)이 지도보다 나은가**의 적합성이다. 그래서 제품을 단일 모델이
     #   아니라 **이벤트 맥락별 추정기**로 둔다:
-    #     · 절벽(cliff=true, 지하철)  → 상한(RoadUpper): 과소예측→놓침 위험을 막는 안전값
+    #     · 절벽(cliff=true, 지하철)  → 보수(RoadUpper): 과소예측→놓침을 줄이려는 보수 추정
     #     · 배차(cliff=false)         → 유도(derived):   도착시각이 정확한 평균값
-    #   소스 변형(상한/유도)이 없으면(단일 신호) 그 신호 모델을 그대로 쓴다.
+    #   소스 변형(보수/유도)이 없으면(단일 신호) 그 신호 모델을 그대로 쓴다.
+    #   ⚠ 주의: 보수(RoadUpper)는 3관측 경험치일 뿐 수학적 상한이 아니다(§P1-4 caveat,
+    #      signal_calibration.json._caveat 참조). 따라서 "절벽=보수 → 놓침 0"은 **보장이
+    #      아니라 기대**다. 실측 절벽 이벤트(cliff=true 실데이터)로 검증되기 전까지 이 선택은
+    #      '안전 보장'이 아니라 '보수 편향'으로만 해석하고, verdict 의 위험오답 0 도
+    #      배차(cliff=false) 표본에 한정된 결과임을 밝힌다.
     def base_present(base):
         return n > 0 and all(
             any(k == base or k.startswith(base + "(") for k in row["predictions"])
@@ -447,15 +452,15 @@ def verdict(
 
     def product_pred(row):
         preds = row["predictions"]
-        src = "상한" if row["cliff"] else "유도"   # 절벽 안전 / 배차 정확
+        src = "보수" if row["cliff"] else "유도"   # 절벽 안전 / 배차 정확
         return (preds.get(f"{product_base}({src})")
                 or preds.get(product_base)
-                or preds.get(f"{product_base}(상한)")
+                or preds.get(f"{product_base}(보수)")
                 or preds.get(f"{product_base}(유도)"))
     pp = [product_pred(row) for row in rows]
     used = {p.model for p in pp}
     product_model = (next(iter(used)) if len(used) == 1
-                     else f"{product_base}(맥락별: 절벽=상한·배차=유도)")
+                     else f"{product_base}(맥락별: 절벽=보수·배차=유도)")
 
     uplift = sum(
         (not row["predictions"]["Naver"].connection_ok) and p.connection_ok
@@ -611,7 +616,7 @@ def main() -> None:
     ap.add_argument(
         "--signals",
         action="store_true",
-        help="TMAP 횡단보도에 신호 API를 매칭하고 불가하면 거리별 상한 사용",
+        help="TMAP 횡단보도에 신호 API를 매칭하고 불가하면 거리별 보수 사용",
     )
     args = ap.parse_args()
     if args.signals:
@@ -696,7 +701,7 @@ def main() -> None:
                 signal_rows = []
                 print(
                     f"신호 API 사용 불가({exc}) → "
-                    "TMAP 횡단보도마다 거리별 보수 상한 fallback"
+                    "TMAP 횡단보도마다 거리별 보수 fallback"
                 )
             fetched_at = datetime.now()
             for sc in scenarios:
@@ -715,14 +720,14 @@ def main() -> None:
                     signal_rows,
                     fetched_at,
                 )
-                # ★ 상한(RoadUpper)과 유도(derived) 둘 다 계산해서 소스별로 넣는다.
+                # ★ 보수(RoadUpper)과 유도(derived) 둘 다 계산해서 소스별로 넣는다.
                 #   crosswalks.json 에 실측 주기가 있으면 estimate_route_wait 의
                 #   wait_s(정확)도 함께 넣어 세 소스가 된다.
                 mc = summary["crosswalks"]
                 sources = {}
                 if mc:
-                    sources["상한"] = fallback_signal_sensitivity(mc)["road_upper_s"]
-                    sources["유도"] = fallback_derived_total(mc)
+                    sources["보수"] = fallback_signal_sensitivity(mc)["road_upper_s"]
+                    sources["유도"] = fallback_derived_total(mc, speed_mps)
                 if result["wait_s"] is not None and result.get("complete"):
                     sources["정확"] = result["wait_s"]   # 실측 주기 기반(있을 때만)
                 signal_estimates[sc["id"]] = sources or (result["wait_s"])
@@ -745,7 +750,7 @@ def main() -> None:
                         for row in fallback["crossing_upper_bounds"]
                     )
                     print(
-                        f"  TMAP-only fallback (거리별 상한 공식 평가 반영): "
+                        f"  TMAP-only fallback (거리별 보수 공식 평가 반영): "
                         f"횡단보도 {fallback['raw_count']}개 [{bounds}], "
                         f"합계={fallback['road_upper_s']:.0f}s [{raw}]"
                     )

@@ -57,17 +57,22 @@ class SignalClientTests(unittest.TestCase):
         self.assertEqual(timing["cycle_s"], 90)
         self.assertEqual(timing["green_s"], 20)
 
-    def test_derived_wait_from_crossing_length(self):
-        # 43m 횡단, cycle 150: green = 7 + 43 = 50, red = 100, wait = 100^2/(2*150).
-        self.assertAlmostEqual(signal_client.derived_wait(43, 150), 100 ** 2 / (2 * 150), places=4)
+    def test_derived_wait_uses_effective_green_and_speed(self):
+        # 43m, cycle 150 → green = 7 + 43/1.0 = 50. 유효녹색 = green − 횡단시간(dist/speed).
+        # 설계속도 1.0 → 횡단 43, eff=7, wait=(150−7)²/(2·150).
         cyc, green = signal_client.derived_timing(43, 150)
         self.assertEqual((cyc, green), (150, 50))
+        self.assertAlmostEqual(signal_client.derived_wait(43, 1.0, 150),
+                               (150 - 7) ** 2 / (2 * 150), places=4)
+        # 속도 개인화 — 빠를수록 유효녹색↑ → 대기↓ (옛 red²/(2·cycle) 은 speed 무관이었다).
+        self.assertLess(signal_client.derived_wait(43, 2.0, 150),
+                        signal_client.derived_wait(43, 1.0, 150))
 
     def test_derived_total_sums_merged_signals(self):
-        # Case 1 병합 3신호: 신당 43m, 판교 39m·42m.
+        # Case 1 병합 3신호: 신당 43m, 판교 39m·42m. 개인 속도 1.45.
         crossings = [{"distance_m": 43}, {"distance_m": 39}, {"distance_m": 42}]
-        total = signal_client.fallback_derived_total(crossings, 150)
-        self.assertAlmostEqual(total, sum(signal_client.derived_wait(d, 150)
+        total = signal_client.fallback_derived_total(crossings, 1.45, 150)
+        self.assertAlmostEqual(total, sum(signal_client.derived_wait(d, 1.45, 150)
                                           for d in (43, 39, 42)), places=4)
 
     def test_rejects_intersection_far_from_tmap_crossing(self):

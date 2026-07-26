@@ -121,10 +121,15 @@ def kill_manual(why="정리"):
     """
     if os.name == "nt":
         # 스케줄러 트리는 schtasks /End 가 내리지만 수동 `py server.py` 는 남는다.
-        # 커맨드라인으로 골라 죽인다 (service.py 자신은 이 패턴에 안 걸린다).
+        # ⚠️ **프로젝트 소속만** 죽인다 — POSIX 는 cwd 로 스코핑하지만 Win32_Process 엔
+        #    cwd 필드가 없다. 대신 install 이 bat 에 스크립트를 **절대경로**로 박아 두므로
+        #    (win_install), CommandLine 에 이 프로젝트 경로(HERE)가 들어 있는 것만 고른다.
+        #    -like 는 backslash 를 리터럴로 보므로 Windows 경로에 그대로 쓸 수 있다.
+        #    (service.py 자신은 스크립트 패턴에 안 걸린다.)
         run(["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process | Where-Object "
-             "{$_.CommandLine -match '(server|subway_collector|seoul_collector)\\.py'} "
+             f"{{$_.CommandLine -like '*{HERE}*' -and "
+             "$_.CommandLine -match '(server|subway_collector|seoul_collector)\\.py'} "
              "| ForEach-Object {Stop-Process -Id $_.ProcessId -Force}"], ok_fail=True)
         return
 
@@ -451,10 +456,12 @@ def win_install():
     for script, name in (("subway_collector.py", "run_subway.bat"),
                          ("seoul_collector.py", "run_seoul.bat")):
         with open(os.path.join(HERE, name), "w") as f:
+            # 스크립트를 **절대경로**로 띄운다 — 그래야 CommandLine 에 프로젝트 경로가
+            # 박혀 kill_manual 이 다른 디렉터리의 동명 스크립트와 구분해 죽일 수 있다.
             f.write(f"""@echo off
 cd /d "{HERE}"
 :loop
-"{PY}" {script}
+"{PY}" "{os.path.join(HERE, script)}"
 timeout /t 30
 goto loop
 """)
@@ -464,7 +471,7 @@ cd /d "{HERE}"
 start "findpath-subway" cmd /c run_subway.bat
 start "findpath-seoul" cmd /c run_seoul.bat
 :loop
-"{PY}" server.py --log logs\\server.log
+"{PY}" "{os.path.join(HERE, 'server.py')}" --log "{os.path.join(HERE, 'logs', 'server.log')}"
 timeout /t 10
 goto loop
 """)

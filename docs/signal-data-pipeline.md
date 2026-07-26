@@ -15,7 +15,7 @@
 | 구간 | 쓰는 값 | 필요 데이터 |
 |---|---|---|
 | **첫 횡단보도만** | 실시간 위상 투영 | 실시간 API(있는 도시만) |
-| **나머지 전 구간** | 기대대기 `red²/(2·cycle)` | **정적 cycle/green** (그래프에 미리 구움) |
+| **나머지 전 구간** | 기대대기 `(cycle − 유효녹색)²/(2·cycle)`, 유효녹색=green−횡단시간(§7.4) | **정적 cycle/green** (그래프에 미리 구움) |
 
 → 프로덕션의 데이터 문제 = **전국 cycle/green 정적 테이블을 배치로 조립·갱신**하는 것.
 요청 경로에선 신호 API 0콜(§7.3). 이게 확장 가능한 이유다.
@@ -65,8 +65,9 @@ cycle/green 을 지자체가 조사하지 않기 때문(그건 경찰청 소관)
 | **`횡단보도연장`**(횡단거리) | **green ≈ 연장 ÷ 1.0 m/s + 여유** | 경찰청 매뉴얼: 녹색시간을 설계속도 1.0 m/s 로 산정 |
 | `차로수`·도로등급 | **cycle ≈ 도로등급별 국가평균**(간선~150s·이면~90s) | 신호운영 지침 통상값 |
 
-→ `expected_wait = red²/(2·cycle)` 를 **유도된 cycle/green** 으로 계산하고 `source=derived`,
-`confidence=low` 로 표시한다. 순수 거리밴드(RoadUpper)보다 원칙적이다.
+→ `expected_wait = (cycle − 유효녹색)²/(2·cycle)`(유효녹색=green−횡단거리/개인속도, §7.4)를
+**유도된 cycle/green** 으로 계산하고 `source=derived`, `confidence=low` 로 표시한다. 순수
+거리밴드(RoadUpper)보다 원칙적이다. 유효녹색으로 개인 도보속도까지 반영된다.
 
 > 확인 도구: [`spike/validation/check_crosswalk_std.py`](../spike/validation/check_crosswalk_std.py) —
 > 참여 지자체 CSV 를 받아 타이밍 채움률·해당 지역 커버를 판정한다.
