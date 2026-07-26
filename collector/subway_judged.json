@@ -215,12 +215,12 @@
   },
   {
    "name": "GTX-A",
-   "matched": 11099,
-   "unmatchedPct": 0.362,
-   "biasSec": 5,
+   "matched": 16794,
+   "unmatchedPct": 0.034,
+   "biasSec": 6,
    "sigmaRawSec": 144,
    "sigmaInSec": 143,
-   "sigmaInMin": 2.38,
+   "sigmaInMin": 2.39,
    "headwayMin": 8.0,
    "ratio": 0.298,
    "verdict": "buffer"

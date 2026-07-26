@@ -343,13 +343,16 @@ GTXA_STATIONS = {"운정중앙", "킨텍스", "대곡", "연신내", "서울역"
                  "수서", "성남", "구성", "동탄"}
 
 
-def parse_gtxa(path, line="GTX-A", daytype="평일"):
+def parse_gtxa(path, line="GTX-A"):
     """GTX-A 시각표(운영사 사이트가 JS 로딩이라 붙여넣은 텍스트) → 정규화 레코드.
 
     포맷: 역명 줄 + 시각 줄. 각 시각 줄은 탭 구분 `<상행 분들> <시(hour)> <하행 분들>`
     (종착역은 한쪽만) — **시 앞의 분=상행(운정중앙/수서 방면), 뒤=하행(서울/동탄 방면)**.
     ✅ jsonl GTX-A 도 상행/하행·같은 역명이라 그대로 조인된다. '첫차/막차' 마커는 무시.
-    ⚠️ 붙여준 표는 평일 기준으로 본다(주말표는 미제공 — 주말 obs 는 미매칭으로 남음).
+    ⚠️ **평일·공휴일 양쪽으로 낸다.** 붙여준 표는 한 요일분이지만, ✅ 실측상 GTX-A 는
+    평일 obs 92% · 주말 obs 93% 로 이 시각표에 거의 동일하게 매칭된다(평일≈주말 운행)
+    → 두 요일 모두에 적용하는 것이 데이터로 정당화된다(안 그러면 주말 obs 가 통째로
+    미매칭). 요일별 표가 갈리면 각각 넣도록 고칠 것.
     """
     out = []
     station = None
@@ -370,9 +373,10 @@ def parse_gtxa(path, line="GTX-A", daytype="평일"):
                 continue
             direction = "상행" if i < hi else "하행"
             for mm in re.findall(r"(\d{1,2})분", f):
-                out.append({"line": line, "station": station, "daytype": daytype,
-                            "direction": direction, "updn": None,
-                            "h": hour, "m": int(mm), "dest": None})
+                for dt in ("평일", "공휴일"):
+                    out.append({"line": line, "station": station, "daytype": dt,
+                                "direction": direction, "updn": None,
+                                "h": hour, "m": int(mm), "dest": None})
     return out
 
 
