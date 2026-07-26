@@ -4,10 +4,10 @@
  "span": "2026-07-18~2026-07-25",
  "days": 8,
  "signalMin": 1.5,
- "linesJudged": 17,
- "belowSignalLines": 7,
- "medRatio": 0.19,
- "sigmaMinMed": 1.57,
+ "linesJudged": 18,
+ "belowSignalLines": 8,
+ "medRatio": 0.182,
+ "sigmaMinMed": 1.56,
  "lines": [
   {
    "name": "1호선",
@@ -139,6 +139,18 @@
    "sigmaInMin": 1.81,
    "headwayMin": 7.0,
    "ratio": 0.258,
+   "verdict": "buffer"
+  },
+  {
+   "name": "신림선",
+   "matched": 28604,
+   "unmatchedPct": 0.007,
+   "biasSec": 16,
+   "sigmaRawSec": 56,
+   "sigmaInSec": 50,
+   "sigmaInMin": 0.83,
+   "headwayMin": 7.0,
+   "ratio": 0.119,
    "verdict": "buffer"
   },
   {

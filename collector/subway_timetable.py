@@ -214,6 +214,57 @@ def parse_xlsx(path, line):
     return out
 
 
+# 경전철(신림선·우이신설선) 붙여넣기 텍스트 역 목록 — 데이터 행 판별·역 라벨 인식용.
+LRT_STATIONS = {
+    "신림선": {"샛강", "대방", "서울지방병무청", "보라매", "보라매공원", "보라매병원",
+             "당곡", "신림", "서원", "서울대벤처타운", "관악산"},
+    "우이신설선": {"북한산우이", "솔밭공원", "4.19민주묘지", "가오리", "화계", "삼양",
+                "삼양사거리", "솔샘", "북한산보국문", "정릉", "성신여대입구", "보문", "신설동"},
+}
+
+
+def parse_lrt(path, line):
+    """경전철 시각표(운영사 사이트가 JS/SSL 막혀 붙여넣은 텍스트) → 정규화 레코드.
+
+    포맷: 역명 + (평일/주말·공휴일) + (하행선/상행선) 라벨이 순서 제각각으로 나오고,
+    그 뒤 '시 분' 행들(`5 30 40 50`)이 이어진다. 라벨을 만날 때마다 상태(역·요일·방향)를
+    갱신하고 데이터 행을 현재 상태로 귀속한다. 종착역의 빈 방향, '24 -', 설명줄, 오타
+    (분 병합 '1522'→15·22, 콤마)에 견디게 만든다.
+    """
+    stations = LRT_STATIONS.get(line, set())
+    out = []
+    station = daytype = direction = None
+    for raw in open(path, encoding="utf-8"):
+        s = raw.strip()
+        if not s:
+            continue
+        base = re.sub(r"\(.*?\)", "", s).strip()
+        if base in stations:                       # 역명 줄 (괄호 병기 허용)
+            station = base
+            continue
+        if "주말" in s or "휴일" in s or "공휴일" in s:
+            daytype = "공휴일"
+        elif "평일" in s:
+            daytype = "평일"
+        if "하행선" in s:
+            direction = "하행"
+        elif "상행선" in s:
+            direction = "상행"
+        m = re.match(r"^(\d{1,2})\b", s)           # 데이터 행: 시(hour)로 시작
+        if not m:
+            continue
+        hour = int(m.group(1))
+        if hour > 24 or station is None or daytype is None or direction is None:
+            continue                               # 설명줄('0626 …')·상태 미정 배제
+        for mm in re.findall(r"\d{2}", s[m.end():]):
+            minute = int(mm)
+            if minute < 60:
+                out.append({"line": line, "station": station, "daytype": daytype,
+                            "direction": direction, "updn": None,
+                            "h": hour, "m": minute, "dest": None})
+    return out
+
+
 def parse_arex(path, line="공항철도"):
     """공항철도 xlsx → 정규화 레코드. 코레일 matrix 와 다르다:
     시트=평일/휴일, **방향은 시트 안 섹션 헤더**('하 행 (서울⇒인천공항)'·'상 행 (…⇒서울)'),
