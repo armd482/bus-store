@@ -73,13 +73,18 @@ def fmt_dt(value: datetime) -> str:
 
 
 def expected_wait(green_s: float, cycle_s: float, dist_m: float, speed_mps: float) -> float:
-    """균일 위상에서 보행신호 기대대기 (설계 문서 §7.1·§7.4 step 2).
+    """균일 위상에서 보행신호 기대대기 (설계 문서 §7.1·§7.4).
 
-    E[wait] = red^2 / (2*cycle).
+    E[wait] = (cycle − effective_green)² / (2·cycle),
+    effective_green = green − 횡단시간(dist/speed).
 
-    횡단 이동시간 자체는 도보시간에 이미 포함되므로 기대대기 분기에서는
-    대기창에 더하지 않는다. crossing_time ≤ green 은 통과 가능 전제로만
-    검사한다(불가하면 신호가 보행자 속도로 건널 수 없는 데이터 오류).
+    ⚠️ 유효 녹색 규칙(§7.4: 통과 ⟺ 녹색 잔여 ≥ 횡단시간)과 **일치시킨다.** 녹색이라도
+    남은 시간이 횡단시간보다 짧으면 못 건너므로, 실제로 '출발 가능한' 창은 green 이
+    아니라 effective_green 이다. 그래서 대기 발생 구간은 red 가 아니라 (red + 횡단시간)이고
+    기대대기는 red²/(2·cycle) 이 아니라 (cycle − effective_green)²/(2·cycle) 이다.
+    이 형태라야 **빠른 사용자일수록 effective_green 이 커져 기대대기가 준다** — 속도
+    개인화가 기대대기에 반영된다(옛 red²/(2·cycle) 은 속도 무관이라 개인화가 빠졌다).
+    횡단 이동시간 자체는 도보시간에 이미 포함되므로 여기(대기창)에만 반영하고 따로 더하지 않는다.
     """
     if not (0 < green_s < cycle_s):
         raise ValueError(f"green_s must be between 0 and cycle_s: {green_s}/{cycle_s}")
@@ -90,8 +95,8 @@ def expected_wait(green_s: float, cycle_s: float, dist_m: float, speed_mps: floa
         raise ValueError(
             f"crossing cannot finish in green: crossing={crossing_s:.1f}s green={green_s:.1f}s"
         )
-    red_s = cycle_s - green_s
-    return red_s ** 2 / (2 * cycle_s)
+    effective_green = green_s - crossing_s
+    return (cycle_s - effective_green) ** 2 / (2 * cycle_s)
 
 
 def profile(sc: dict, ratio_override: float | None = None) -> tuple[float, float]:
@@ -149,10 +154,17 @@ def choose_connection(
     return None
 
 
-def actual_connection(sc: dict, buffer_s: int) -> str | None:
-    """실제 정류장 도착시각으로 물리적으로 잡을 수 있었던 가장 이른 후보."""
+def actual_connection(sc: dict) -> str | None:
+    """정답 = 실측만으로 정한 **물리적으로 잡을 수 있었던 가장 이른 후보** (안전버퍼 미적용).
+
+    ⚠️ 정답은 관측이 정한다 — `--buffer`(제품 안전마진)와 무관해야 한다. 버퍼를 정답에
+    섞으면 같은 관측인데도 버퍼값에 따라 정답이 달라진다(이전 버그). 제품 버퍼는 **예측**
+    (choose_connection)과 **위험 판정**(dangerous)에만 쓴다. §9.3: 실제 탑승은 정의상
+    catchable 이고 도착 이후 출발이라 이 buffer=0 최초값 이상이므로, 이 값이 정답이다.
+    별도로 실제 탑승(`actual.boarded`)·제품 버퍼 예측은 각 모델 예측으로 따로 보고한다.
+    """
     arrival = parse_dt(sc["actual"]["stop_arrival"])
-    return choose_connection(actual_bus_times(sc), arrival, buffer_s)
+    return choose_connection(actual_bus_times(sc), arrival, 0)
 
 
 MAP_FAILURE_LABELS = {
@@ -176,18 +188,20 @@ def classify_map_outcome(sc: dict, buffer_s: int) -> list[str]:
     빈 리스트면 지도 안내가 실제와 일치(정확)한 것이다.
     """
     named = sc["naver"].get("selected_connection")
-    truth = actual_connection(sc, buffer_s)
+    truth = actual_connection(sc)
     actual_arrival = parse_dt(sc["actual"]["stop_arrival"])
     departures = dict(actual_bus_times(sc))
-    ready = actual_arrival + timedelta(seconds=buffer_s)
     naver_arrival = parse_dt(sc["walk_start"]) + timedelta(
         seconds=float(sc["naver"]["walk_time_s"])
     )
     modes = []
     if named and truth and named != truth:
         modes.append("different_bus")
-    if named in departures and departures[named] < ready:
+    # 놓침 = 지도 버스가 **실제 도착 전에** 이미 떠남(물리적 사실, 버퍼 무관). arrival+buffer 로
+    # 재면 도착 뒤 출발한 잡을 수 있는 버스를 놓침으로 오검출한다.
+    if named in departures and departures[named] < actual_arrival:
         modes.append("miss")
+    # 더 대기 = 실제 도착이 지도 예측보다 늦음. 여기 buffer_s 는 분 단위 ETA 반올림 허용오차다.
     if (actual_arrival - naver_arrival).total_seconds() > buffer_s:
         modes.append("more_wait")
     return modes
@@ -260,7 +274,7 @@ def predict(
         )
 
     actual_arrival = parse_dt(sc["actual"]["stop_arrival"])
-    truth = actual_connection(sc, buffer_s)
+    truth = actual_connection(sc)
     actual_by_id = dict(actual_bus_times(sc))
     dangerous = None
     if connection in actual_by_id:
@@ -341,7 +355,7 @@ def evaluate(
                 "id": sc["id"],
                 "split": sc.get("split", "test"),
                 "cliff": bool(sc.get("cliff", True)),
-                "truth": actual_connection(sc, buffer_s),
+                "truth": actual_connection(sc),
                 "boarded": sc["actual"].get("boarded"),
                 "map_failure": classify_map_outcome(sc, buffer_s),
                 "predictions": preds,
@@ -357,26 +371,27 @@ def evaluate(
                 models.append(k)
     metrics = {}
     for model in models:
-        ps = [
-            row["predictions"][model]
-            for row in rows
-            if model in row["predictions"]
-        ]
-        if not ps:
-            metrics[model] = {
-                "n": 0,
-                "mae_s": math.nan,
-                "median_ae_s": math.nan,
-                "connection_accuracy": math.nan,
-                "dangerous": 0,
-            }
+        # 세 정답 개념을 분리해 각각 집계한다 (같은 관측, 다른 질문):
+        #   connection_accuracy — 예측 == **물리적 최초 연결**(truth, 버퍼 무관 관측)
+        #   boarded_accuracy    — 예측 == **실제 탑승**(actual.boarded), boarded 있는 행만
+        #   dangerous           — 예측 버스가 실제로 도착+버퍼 전에 떠남(제품 안전, 버퍼 적용)
+        pr = [(row["predictions"][model], row) for row in rows if model in row["predictions"]]
+        if not pr:
+            metrics[model] = {"n": 0, "mae_s": math.nan, "median_ae_s": math.nan,
+                              "connection_accuracy": math.nan, "boarded_accuracy": math.nan,
+                              "boarded_n": 0, "dangerous": 0}
             continue
+        ps = [p for p, _ in pr]
         abs_errors = [abs(p.arrival_error_s) for p in ps]
+        boarded_pairs = [(p, r["boarded"]) for p, r in pr if r.get("boarded")]
         metrics[model] = {
             "n": len(ps),
             "mae_s": mean(abs_errors),
             "median_ae_s": median(abs_errors),
             "connection_accuracy": sum(p.connection_ok for p in ps) / len(ps),
+            "boarded_accuracy": (sum(p.connection == b for p, b in boarded_pairs)
+                                 / len(boarded_pairs)) if boarded_pairs else math.nan,
+            "boarded_n": len(boarded_pairs),
             "dangerous": sum(p.dangerous is True for p in ps),
         }
     return rows, metrics

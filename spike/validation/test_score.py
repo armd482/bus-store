@@ -8,14 +8,15 @@ import score
 
 class ScoreTests(unittest.TestCase):
     def test_expected_wait_matches_numeric_integration(self):
-        # 설계 문서 §7.1·§7.4 step 2: 기대대기 = red^2 / (2*cycle).
-        # 횡단시간은 대기창에 넣지 않으므로 녹색 도착은 대기 0.
+        # 설계 문서 §7.1·§7.4: 기대대기 = (cycle − effective_green)² / (2*cycle),
+        # effective_green = green − 횡단시간. 유효 녹색 안에 도착해야만 대기 0.
         cycle, green, dist, speed = 95, 20, 18, 1.45
+        eff_green = green - dist / speed          # = 7.586s
         step = 0.001
         phases = int(cycle / step)
         numeric = (
             sum(
-                0 if i * step <= green else cycle - i * step
+                0 if i * step <= eff_green else cycle - i * step
                 for i in range(phases)
             )
             * step
@@ -23,6 +24,11 @@ class ScoreTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             score.expected_wait(green, cycle, dist, speed), numeric, places=2
+        )
+        # 속도 개인화가 실제로 반영되는지 — 빠를수록 대기가 줄어야 한다(옛 공식은 불변).
+        self.assertLess(
+            score.expected_wait(green, cycle, dist, 2.0),
+            score.expected_wait(green, cycle, dist, 1.0),
         )
 
     def test_impossible_crossing_is_rejected(self):

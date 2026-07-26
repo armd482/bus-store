@@ -1,5 +1,6 @@
 {
-  "_description": "API 부재 시 TMAP 횡단거리별 신호대기 보수 상한. 2026-07-23 이전 관측만 학습에 사용한다. ⚠️ 밴드는 이제 세그먼트가 아니라 '병합된 신호' 단위의 거리에 적용된다 — 2단계 횡단(중앙분리대)의 세그먼트는 tmap_client.merge_adjacent_crosswalks 가 하나로 합치고, 그 합산 횡단폭(예 신당 15+28=43m)으로 밴드를 조회한다. excluded_unlabeled_crossings(28m·31m·10m)가 바로 그렇게 병합되는 2단계분이다.",
+  "_description": "API 부재 시 TMAP 횡단거리별 신호대기 **보수적 경험 추정치**(empirical_conservative_estimate). 2026-07-23 이전 관측만 학습.",
+  "_caveat": "⚠️ 이름이 'upper/상한'이지만 **수학적 상한이 아니다** — 관측 3건(15·16·24m)으로 만든 경험 추정이라 주기가 더 긴 신호에서는 150초를 넘을 수 있다(보장 없음). ⚠️ 단위 불일치: 밴드는 **병합 전 단일 세그먼트 거리**(15/16/24m)로 학습됐는데, 현재는 tmap_client.merge_adjacent_crosswalks 로 **병합된 신호 거리**(예 신당 15+28=43m)에 적용된다 — 병합 단위로 **재학습 필요**(표본이 늘면 empirical_conservative_estimate 로 개명·재라벨). 절벽 trip 의 과소예측 방지엔 여전히 보수적이라 쓰되, '항상 안전한 상한'으로 신뢰하지 말 것. excluded_unlabeled_crossings(28·31·10m)가 그 병합되는 2단계분이다.",
   "training_cutoff": "2026-07-23",
   "mapped_observations": [
     {

@@ -31,10 +31,16 @@ class SignalClientTests(unittest.TestCase):
         self.assertEqual(wait, 0)
 
     def test_expected_wait_matches_design_formula(self):
-        # 설계 문서 §7.1·§7.4 step 2: red^2 / (2*cycle). cycle=90, green=30 → red=60.
+        # 설계 §7.1·§7.4: (cycle − effective_green)²/(2*cycle).
+        # cycle=90, green=30, dist=15, speed=1.5 → 횡단 10s, eff_green=20, (90−20)²/180.
         self.assertAlmostEqual(
             signal_client.expected_wait(90, 30, 15, 1.5),
-            60 * 60 / 180,
+            70 * 70 / 180,
+        )
+        # 속도 개인화 — 빠를수록 대기 감소.
+        self.assertLess(
+            signal_client.expected_wait(90, 30, 15, 2.0),
+            signal_client.expected_wait(90, 30, 15, 1.0),
         )
 
     def test_infers_cycle_and_green_from_polled_transitions(self):

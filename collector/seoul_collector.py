@@ -250,7 +250,10 @@ def main():
         d = service_day(t)
         if d != day:
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d} (전일 {written:,}행)", flush=True)
-            day, done, written, fail_log = d, {}, 0, {}
+            # ⚠️ fails 도 반드시 초기화 — 전날 MAX_TRIES 실패한 (밴드,노선)이 남으면
+            #    다음 운행일 내내(재시작 전까지) todo 에서 영구 제외된다 (done/fail_log 만
+            #    비우던 버그). fails 는 '오늘 안에서' 재시도를 포기하는 카운터라 매일 리셋.
+            day, done, written, fail_log, fails = d, {}, 0, {}, {}
             save_done(day, done)
             save_failures(day, fail_log)
             continue

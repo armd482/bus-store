@@ -131,11 +131,13 @@ def haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 
 def road_upper_seconds(crossing: dict) -> float:
-    """7월 23일 관측으로 학습한 거리 밴드의 보수 상한을 반환한다.
+    """횡단거리 밴드의 **보수적 경험 추정치**(empirical conservative estimate)를 반환한다.
 
-    현재 표본은 15m→3.54초, 16m→45.52초, 24m→120.77초 세 개다.
-    따라서 20m 이하 60초, 초과 150초의 초기 2밴드 모델이며 새 test
-    Case는 이 파일을 수정하지 않고 평가한다.
+    ⚠️ 이름과 달리 **수학적 상한이 아니다** — 관측 3건(15m→3.54s·16m→45.52s·24m→120.77s)
+    으로 만든 20m↓60s·초과150s 2밴드 경험값이라, 주기가 더 긴 신호에선 150s 를 넘을 수
+    있다(보장 없음). ⚠️ 또 밴드는 병합 전 단일세그먼트 거리로 학습됐는데 지금은 병합 신호
+    거리에 적용된다 — 병합 단위로 재학습 필요(signal_calibration.json `_caveat`).
+    절벽 trip 과소예측 방지엔 보수적이라 쓰되 '항상 안전한 상한'으로 신뢰하지 말 것.
     """
     distance_m = float(crossing["distance_m"])
     if distance_m <= 0:
@@ -254,22 +256,25 @@ def projected_wait(
 
 
 def expected_wait(cycle_s: float, green_s: float, dist_m: float, speed_mps: float) -> float:
-    """균일 위상 기대대기 (설계 문서 §7.1·§7.4 step 2): red^2 / (2*cycle).
+    """균일 위상 기대대기 (설계 문서 §7.1·§7.4).
 
-    횡단 이동시간은 도보시간에 포함되므로 대기창에 더하지 않는다.
-    crossing_time ≤ green 은 통과 가능 전제로만 검사한다.
+    E[wait] = (cycle − effective_green)² / (2·cycle), effective_green = green − dist/speed.
+    유효 녹색 규칙(§7.4: 녹색 잔여 ≥ 횡단시간)과 일치 — 빠른 사용자일수록 대기가 준다
+    (옛 red²/(2·cycle) 은 속도 무관이라 개인화가 빠졌다). 횡단 이동시간은 도보시간에
+    이미 포함되므로 대기창에만 반영하고 따로 더하지 않는다.
     """
     crossing_s = dist_m / speed_mps
     if crossing_s > green_s:
         raise ValueError("crossing cannot finish during pedestrian green")
-    red_s = cycle_s - green_s
-    return red_s ** 2 / (2 * cycle_s)
+    effective_green = green_s - crossing_s
+    return (cycle_s - effective_green) ** 2 / (2 * cycle_s)
 
 
 # ── 유도 추정 — cycle/green 이 없을 때 채워진 '횡단거리'로 만든다 ──────────
 # (docs/signal-data-pipeline.md §3.1) 표준데이터에 타이밍이 비어도 횡단거리·도로등급은
 # 대체로 있으므로, 순수 추측이 아니라 경찰청 매뉴얼 기반으로 green 을 유도한다.
-# ⚠️ RoadUpper 와 성격이 다르다: RoadUpper 는 '상한'(항상 과대), 유도는 '평균'(양방향).
+# ⚠️ RoadUpper 와 성격이 다르다: RoadUpper 는 '보수 추정'(대개 과대이나 상한 보장 아님),
+#    유도는 '평균'(양방향). 둘 다 병합 신호 거리로 계산한다.
 DESIGN_SPEED_MPS = 1.0    # 경찰청 매뉴얼: 보행녹색시간 산정용 설계속도
 ENTRY_TIME_S = 7.0        # 진입시간 (보행녹색 앞 고정분)
 DEFAULT_CYCLE_S = 150.0   # 도로등급 미상 시 도시 신호주기 prior (간선 통상). 이면도로면 ~90
