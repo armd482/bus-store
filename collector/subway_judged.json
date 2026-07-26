@@ -4,10 +4,10 @@
  "span": "2026-07-18~2026-07-25",
  "days": 8,
  "signalMin": 1.5,
- "linesJudged": 10,
+ "linesJudged": 14,
  "belowSignalLines": 7,
- "medRatio": 0.191,
- "sigmaMinMed": 1.37,
+ "medRatio": 0.182,
+ "sigmaMinMed": 1.49,
  "lines": [
   {
    "name": "1호선",
@@ -58,6 +58,18 @@
    "verdict": "buffer"
   },
   {
+   "name": "수인분당선",
+   "matched": 101686,
+   "unmatchedPct": 0.04,
+   "biasSec": 36,
+   "sigmaRawSec": 126,
+   "sigmaInSec": 124,
+   "sigmaInMin": 2.07,
+   "headwayMin": 14.0,
+   "ratio": 0.148,
+   "verdict": "buffer"
+  },
+  {
    "name": "3호선",
    "matched": 100825,
    "unmatchedPct": 0.047,
@@ -94,6 +106,18 @@
    "verdict": "buffer"
   },
   {
+   "name": "경의중앙선",
+   "matched": 56780,
+   "unmatchedPct": 0.067,
+   "biasSec": 42,
+   "sigmaRawSec": 123,
+   "sigmaInSec": 122,
+   "sigmaInMin": 2.03,
+   "headwayMin": 15.0,
+   "ratio": 0.135,
+   "verdict": "buffer"
+  },
+  {
    "name": "2호선",
    "matched": 34124,
    "unmatchedPct": 0.089,
@@ -127,6 +151,30 @@
    "sigmaInMin": 1.2,
    "headwayMin": 11.0,
    "ratio": 0.109,
+   "verdict": "buffer"
+  },
+  {
+   "name": "서해선",
+   "matched": 20581,
+   "unmatchedPct": 0.076,
+   "biasSec": 16,
+   "sigmaRawSec": 236,
+   "sigmaInSec": 235,
+   "sigmaInMin": 3.92,
+   "headwayMin": 15.0,
+   "ratio": 0.261,
+   "verdict": "buffer"
+  },
+  {
+   "name": "경춘선",
+   "matched": 17967,
+   "unmatchedPct": 0.075,
+   "biasSec": 45,
+   "sigmaRawSec": 176,
+   "sigmaInSec": 173,
+   "sigmaInMin": 2.88,
+   "headwayMin": 25.0,
+   "ratio": 0.115,
    "verdict": "buffer"
   }
  ],

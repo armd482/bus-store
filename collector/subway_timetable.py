@@ -154,6 +154,66 @@ def summarize(records):
         print(f"{st:<12}{d:<10}{len(ts):>5}  {first[0]:02d}:{first[1]:02d} {last[0]:02d}:{last[1]:02d}")
 
 
+def _cell_hm(v):
+    """xlsx 시각 셀 → (h, m). '05:02:00' 문자열 또는 datetime.time/datetime 모두 처리."""
+    if v is None:
+        return None
+    if hasattr(v, "hour") and hasattr(v, "minute"):   # datetime.time / datetime
+        return v.hour, v.minute
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})", str(v))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def parse_xlsx(path, line):
+    """운영사 xlsx 시각표(코레일 계열) → 정규화 레코드. **line 을 넘겨줘야 한다**(파일이
+    노선을 안 담음). 역명은 축약/변형이 심해(시흥청≠시흥시청·신김포 등) 그대로 두고,
+    judge_subway 의 역명 재조정(reconcile)이 실측 역명에 맞춘다.
+
+    포맷 (✅ 실측 4개 파일): matrix — 열=열차(열차번호), 행=역, 셀=시각(HH:MM:SS).
+      시트명 = 방향(상행/하행) + 요일(평일/휴일). r0 시발역·r1 종착역·r2 열차번호(헤더).
+      그 뒤 각 역이 **두 행**: 역명 행=도착, 다음 무명 행=출발. 도착(역명 행)을 쓴다
+      (기점은 도착이 비어 다음 출발 행으로 대체). '연계열번' 등 라벨 행은 건너뛴다.
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    out = []
+    SKIP = {"시발역", "종착역", "열차번호", "연계열번", ""}
+    for sh in wb.sheetnames:
+        dtn = "공휴일" if ("휴일" in sh) else "평일"
+        direction = "상행" if "상행" in sh else "하행" if "하행" in sh else None
+        if direction is None:
+            continue                              # 광운대시종착 등 방향 불명 시트는 제외
+        rows = list(wb[sh].iter_rows(values_only=True))
+        # 헤더(열차번호 행) 위치 — 그 아래부터 역 행
+        hdr = next((i for i, r in enumerate(rows)
+                    if r and str(r[0]).strip() == "열차번호"), 2)
+        i = hdr + 1
+        while i < len(rows):
+            name = str(rows[i][0]).strip() if rows[i] and rows[i][0] is not None else ""
+            if name in SKIP:
+                i += 1
+                continue
+            times = [_cell_hm(c) for c in rows[i][1:]]
+            # 도착 행이 전부 비면(기점) 다음 출발 행 사용
+            if not any(times) and i + 1 < len(rows):
+                times = [_cell_hm(c) for c in rows[i + 1][1:]]
+            for hm in times:
+                if hm:
+                    out.append({"line": line, "station": name, "daytype": dtn,
+                                "direction": direction, "updn": None,
+                                "h": hm[0], "m": hm[1], "dest": None})
+            # 역은 두 행(도착/출발)이므로 다음 무명 행을 건너뛴다
+            j = i + 1
+            if j < len(rows):
+                nxt = str(rows[j][0]).strip() if rows[j] and rows[j][0] is not None else ""
+                if nxt == "":
+                    i = j + 1
+                    continue
+            i += 1
+    wb.close()
+    return out
+
+
 def parse_stcs(csv_path):
     """서울교통공사 15098251 CSV → 정규화 레코드 (1~9호선).
 

@@ -93,8 +93,20 @@ def obs_daytype_to_plan(dt, has_saturday):
     return "평일"
 
 
-def build_plan(stcs_csv, sinbundang_pdfs):
-    """계획 인덱스 — plan[(line,station,daytype,dir)] = 정렬된 절대분 리스트."""
+# xlsx 축약역명 → 실측(jsonl) 역명. 접두 유일매칭으로 안 잡히는 것만 (✅ 전 노선 대조).
+RECONCILE_OVERRIDE = {
+    "수인분당선": {"로데오": "압구정로데오", "신인천": "인천", "신수원": "수원",
+                "수원시": "수원시청", "인천논": "인천논현"},
+    "경의중앙선": {"디엠시": "디지털미디어시티", "항공대": "한국항공대",
+                "1양원": "양원", "1양정": "양정"},
+    "서해선": {"시흥청": "시흥시청", "신김포": "김포공항", "신소사": "소사",
+             "신신천": "신천", "신신현": "신현", "신초지": "초지"},
+}
+
+
+def build_plan(stcs_csv, sinbundang_pdfs, xlsx_specs=None):
+    """계획 인덱스 — plan[(line,station,daytype,dir)] = 정렬된 절대분 리스트.
+    xlsx_specs = [(line, path)...]. 역명 재조정은 load 후 reconcile_plan 에서."""
     plan = {}
     daytypes_with_sat = set()
     recs = []
@@ -103,6 +115,8 @@ def build_plan(stcs_csv, sinbundang_pdfs):
     for p in (sinbundang_pdfs or []):
         dt = "공휴일" if "공휴일" in p else "토요일" if "토요일" in p else "평일"
         recs += T.parse_sinbundang(p, dt)
+    for line, path in (xlsx_specs or []):
+        recs += T.parse_xlsx(path, line)
     for r in recs:
         d = DIR_CANON.get(r["direction"])
         if d is None:
@@ -114,6 +128,34 @@ def build_plan(stcs_csv, sinbundang_pdfs):
     for k in plan:
         plan[k].sort()
     return plan, daytypes_with_sat
+
+
+def reconcile_plan(plan, obs):
+    """xlsx 축약역명을 실측 역명에 맞춘다 — plan 키의 역명을 obs 에 있는 역명으로 재매핑.
+    exact → override → 접두 유일매칭 순. 못 맞추면 그대로 두고(미매칭으로 남음) 보고한다.
+    1~9호선·신분당선(CSV·PDF)은 이미 실측명과 맞아 이 단계가 no-op."""
+    obs_names = {}
+    for (ln, st, _dt, _d) in obs:
+        obs_names.setdefault(ln, set()).add(st)
+    out = {}
+    unresolved = {}
+    for (ln, st, dt, d), times in plan.items():
+        names = obs_names.get(ln, set())
+        if st in names:
+            tgt = st
+        else:
+            ov = RECONCILE_OVERRIDE.get(ln, {})
+            tgt = ov.get(st)
+            if tgt is None:
+                cands = [j for j in names if j.startswith(st) or st.startswith(j)]
+                tgt = cands[0] if len(cands) == 1 else None
+        if tgt is None:
+            unresolved.setdefault(ln, set()).add(st)
+            tgt = st                       # 남겨두면 미매칭으로 잡혀 티가 난다
+        out.setdefault((ln, tgt, dt, d), []).extend(times)
+    for k in out:
+        out[k].sort()
+    return out, unresolved
 
 
 def headway(times):
@@ -354,17 +396,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stcs", help="15098251 CSV (1~9호선)")
     ap.add_argument("--sinbundang", nargs="*", default=[], help="신분당선 PDF(평일/공휴일)")
+    ap.add_argument("--xlsx", nargs="*", default=[], help="운영사 xlsx: '노선명=경로' (예 경춘선=/x.xlsx)")
     ap.add_argument("--obs", required=True, help="실측 glob (예 'data/subway-*.jsonl*')")
     ap.add_argument("--line", help="이 노선 역별 상세도 출력")
     ap.add_argument("--emit", help="판정 스냅샷 JSON 경로 (대시보드 배너용, 오프라인 계산)")
     args = ap.parse_args()
-    if not args.stcs and not args.sinbundang:
-        sys.exit("계획 소스가 없다 — --stcs 또는 --sinbundang 중 하나는 필요.")
+    if not args.stcs and not args.sinbundang and not args.xlsx:
+        sys.exit("계획 소스가 없다 — --stcs · --sinbundang · --xlsx 중 하나는 필요.")
 
-    plan, sat_lines = build_plan(args.stcs, args.sinbundang)
+    xlsx_specs = [tuple(s.split("=", 1)) for s in args.xlsx if "=" in s]
+    plan, sat_lines = build_plan(args.stcs, args.sinbundang, xlsx_specs)
     plan_lines = {k[0] for k in plan}
     print(f"계획: {len(plan):,} (노선,역,요일,방향) 슬롯 · 노선 {sorted(plan_lines)}")
     obs, kept, subbed, stale, nodir = load_obs(args.obs, plan_lines)
+    if xlsx_specs:
+        plan, unresolved = reconcile_plan(plan, obs)
+        for ln, sts in unresolved.items():
+            print(f"⚠️ {ln} 역명 미해결 {len(sts)}개(계획에만·미매칭 처리): {sorted(sts)[:10]}")
     print(f"실측 도착 {kept:,}건 채택 (§8.3 도착대용 {subbed:,} = {subbed/kept*100 if kept else 0:.0f}%) "
           f"· stale 제외 {stale:,} · 방향불명 {nodir:,}")
     per_line, per_station = judge(plan, sat_lines, obs, args.line)
