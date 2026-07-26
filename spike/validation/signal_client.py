@@ -5,7 +5,7 @@
 
 * 첫 도보 + 짧은 예측 지평: 실시간 상태/잔여시간을 주기에 투영
 * 뒤쪽 도보 또는 실시간 적용 불가: 주기 기반 기대대기
-* 실시간 위상·주기 기대대기 모두 불가: TMAP 횡단거리별 보수 상한
+* 실시간 위상·주기 기대대기 모두 불가: TMAP 횡단거리별 보수 밴드(경험추정, 상한 보장 아님)
 * TMAP 횡단보도도 없음: 신호 모델 unavailable
 """
 from __future__ import annotations
@@ -152,10 +152,11 @@ def road_upper_seconds(crossing: dict) -> float:
 def fallback_signal_sensitivity(crossings: list[dict]) -> dict:
     """주기·실시간이 없을 때 설계 문서 §7.4의 fallback을 계산한다.
 
-    RoadUpper는 제품·공식 평가값이고 OTP15와 Expected20은 민감도 값이다.
+    RoadUpper(보수 경험추정 — 안전성 미검증, 상한 보장 아님)는 제품·공식 평가값이고
+    OTP15와 Expected20은 민감도 값이다.
     ⚠️ 입력 crossings 는 이미 신호 단위로 병합된 것이어야 한다 — 2단계 횡단의
     세그먼트 분할은 tmap_client.merge_adjacent_crosswalks 가 상류에서 합친다
-    (여기서 crossing 마다 상한을 더하므로, 세그먼트째 들어오면 과다 계상된다).
+    (여기서 crossing 마다 보수값을 더하므로, 세그먼트째 들어오면 과다 계상된다).
     """
     raw_count = len(crossings)
     crossing_upper_bounds = [
@@ -296,19 +297,36 @@ def derived_wait(dist_m: float, speed_mps: float, cycle_s: float = DEFAULT_CYCLE
     effective_green = green − 횡단시간(dist/speed). green 은 유도값(진입 7s + 거리/1.0).
     ⚠️ 이전 판은 red²/(2·cycle)에 speed 무관이라 **유도 fallback(대부분 경로)에서 속도
     개인화가 빠졌다** — expected_wait 만 고치고 여기를 안 고치면 정작 공공 주기가 없는
-    다수 경로가 개인화 안 됨. crossing 이 green 보다 길면(느린 사용자·긴 횡단) effective 를
-    0 으로 클램프한다(fallback 은 예외를 던지지 않고 보수적으로 최대 대기에 수렴)."""
+    다수 경로가 개인화 안 됨.
+
+    ⚠️ **횡단시간 > green 이면(느린 사용자·긴 횡단) 한 주기 안에 못 건넌다 → ValueError.**
+    expected_wait 과 **같은 의미**로 통일했다(옛 판은 effective 를 0 으로 클램프해 유한한
+    대기를 반환했으나, 그건 '불가능'을 '최대 대기'로 위장하는 것이라 두 경로가 어긋났다).
+    이 모델은 단일 주기 횡단 전제다 — 중앙섬 다단 횡단은 §8.4 병합에서 신호 단위로 쪼갠다.
+    호출부(fallback_derived_total)는 이 예외를 잡아 그 경로의 유도 소스를 '불가'로 남긴다."""
     if speed_mps <= 0:
         raise ValueError("speed_mps must be positive")
     cyc, green = derived_timing(dist_m, cycle_s)
-    effective_green = max(0.0, green - dist_m / speed_mps)
+    crossing_s = dist_m / speed_mps
+    if crossing_s > green:
+        raise ValueError("crossing cannot finish during derived pedestrian green")
+    effective_green = green - crossing_s
     return (cyc - effective_green) ** 2 / (2 * cyc)
 
 
 def fallback_derived_total(crossings: list[dict], speed_mps: float,
-                           cycle_s: float = DEFAULT_CYCLE_S) -> float:
-    """유도값 합계 — RoadUpper 대신 쓸 수 있는 '평균' 추정. 배포 가능(도보 전 아는 값만)."""
-    return sum(derived_wait(float(c["distance_m"]), speed_mps, cycle_s) for c in crossings)
+                           cycle_s: float = DEFAULT_CYCLE_S) -> float | None:
+    """유도값 합계 — RoadUpper 대신 쓸 수 있는 '평균' 추정. 배포 가능(도보 전 아는 값만).
+
+    ⚠️ 횡단보도 하나라도 단일 주기 내 횡단 불가(느린 사용자)면 **None** 을 돌려
+    그 경로의 유도 소스를 '불가'로 표시한다 — 불가능을 유한한 대기로 위장하지 않는다."""
+    total = 0.0
+    for c in crossings:
+        try:
+            total += derived_wait(float(c["distance_m"]), speed_mps, cycle_s)
+        except ValueError:
+            return None
+    return total
 
 
 def infer_timing(samples: list[tuple[datetime, str]]) -> dict:
@@ -382,7 +400,7 @@ def estimate_route_wait(
     """경로 전체 신호대기와 각 횡단보도에서 쓴 근거를 반환한다.
 
     실시간 위상과 주기 기반 기대대기 중 어느 것도 계산할 수 없으면
-    설계 문서 §7.4에 따라 TMAP 횡단거리별 보수 상한을 공식 예측
+    설계 문서 §7.4에 따라 TMAP 횡단거리별 보수 밴드(경험추정)를 공식 예측
     fallback으로 쓴다. TMAP 횡단보도 자체가 없을 때만 신호대기 0초
     (신호 없음)가 된다.
     """

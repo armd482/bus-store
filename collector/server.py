@@ -1073,6 +1073,10 @@ def main():
     ap.add_argument("--port", type=int, default=877)
     ap.add_argument("--no-collect", action="store_true", help="대시보드만")
     ap.add_argument("--log", help="출력을 이 파일에도 복사 (콘솔에는 그대로)")
+    # ⚠️ 대시보드는 인증이 없다. 기본은 하위호환 위해 0.0.0.0(공개)이지만, 외부 조회가
+    #    불필요하면 --host 127.0.0.1 + SSH 터널이 안전하다 (docs/collector-design.md §9 #3).
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="바인드 주소 (기본 0.0.0.0=공개, 잠그려면 127.0.0.1)")
     args = ap.parse_args()
 
     if args.log:
@@ -1104,8 +1108,9 @@ def main():
     # 스냅샷 캐시 워커 — /api 가 즉시 응답하도록 백그라운드에서 미리 계산
     threading.Thread(target=_snapshot_loop, daemon=True).start()
 
-    srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    print(f"대시보드 http://localhost:{args.port}  (수집 {'끔' if args.no_collect else '켬'})", flush=True)
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    _pub = " ⚠️ 공개(0.0.0.0)·인증 없음" if args.host == "0.0.0.0" else f" (bind {args.host})"
+    print(f"대시보드 http://localhost:{args.port}  (수집 {'끔' if args.no_collect else '켬'}){_pub}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

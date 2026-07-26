@@ -75,6 +75,19 @@ class SignalClientTests(unittest.TestCase):
         self.assertAlmostEqual(total, sum(signal_client.derived_wait(d, 1.45, 150)
                                           for d in (43, 39, 42)), places=4)
 
+    def test_slow_pedestrian_cannot_cross_is_infeasible(self):
+        # 43m, 유도 green=50s. 0.8m/s면 횡단 53.75s > 50s → 단일 주기 내 완주 불가.
+        # derived_wait 은 expected_wait 과 **같은 의미**로 ValueError 를 던진다(유한 대기 위장 금지).
+        with self.assertRaises(ValueError):
+            signal_client.derived_wait(43, 0.8, 150)
+        with self.assertRaises(ValueError):
+            signal_client.expected_wait(150, 50, 43, 0.8)
+        # 경로에 불가 횡단이 하나라도 있으면 fallback 총합은 None(그 경로 유도 소스 '불가').
+        crossings = [{"distance_m": 43}, {"distance_m": 39}]
+        self.assertIsNone(signal_client.fallback_derived_total(crossings, 0.8, 150))
+        # 충분히 빠르면 정상 합계.
+        self.assertIsNotNone(signal_client.fallback_derived_total(crossings, 1.45, 150))
+
     def test_rejects_intersection_far_from_tmap_crossing(self):
         crossing = {"lon": 127.0, "lat": 37.0}
         intersections = [

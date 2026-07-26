@@ -118,6 +118,16 @@ def kill_manual(why="정리"):
     (jsonl 이 진리라 사이클 단위 commit 로 손실은 그 사이클 하나뿐), TERM 을 먼저
     보내는 건 나중에 핸들러가 생겨도 그대로 맞기 때문이다. 3초 안에 안 죽으면
     승격한다 — TERM 을 무시하는 프로세스에 매달려 install 이 멈추면 안 된다.
+
+    ⚠️ **플랫폼별 커버리지 차이(외부 리뷰).**
+    - POSIX: 각 PID 의 **cwd** 로 스코핑하므로, 프로젝트 폴더에서 띄운 수동
+      `python server.py`(cwd=HERE)도 잡힌다 → '완전 종료' 계약을 지킨다.
+    - Windows: Win32_Process 에 cwd 가 없어 **CommandLine 의 절대경로(HERE)** 로만
+      스코핑한다. 따라서 **서비스가 생성한(BAT·절대경로) 프로세스만** 내려간다 —
+      프로젝트 폴더에서 `py server.py`(상대경로)로 띄운 **수동 실행분은 매칭되지 않아
+      살아남는다.** 완전 종료가 필요하면 그 창을 직접 닫거나, 수동 실행도
+      절대경로(`py C:\...\collector\server.py`)로 띄울 것. (근본 해법은 PID 파일/
+      Job Object — 후속 과제.)
     """
     if os.name == "nt":
         # 스케줄러 트리는 schtasks /End 가 내리지만 수동 `py server.py` 는 남는다.
