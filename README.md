@@ -39,8 +39,13 @@ collector/
   orchestrator.py           커버리지 DB + 미커버 우선 노선 선택 + 운행시간 필터
   fetch_routes.py           노선 풀 구축 (커버리지의 분모)
   subway_collector.py       지하철 도착 일괄(전 노선) → 정시성 검증용
+  seoul_collector.py        서울 버스 도착정보 스냅샷 (밴드별 노선당 1회 · CV)
+  subway_timetable.py       계획 시각표 파서 (신분당선 PDF · 15098251 CSV · 코레일 xlsx · GTX-A · 경전철)
+  judge_subway.py           지하철 정시성 판정 (계획 vs 실측 시각근접매칭, §8.1)
   holidays.py               공휴일 자동 조회 (대체·임시공휴일 포함) → 장부에서 제외
+  service.py                상시 실행 등록/제거 (macOS launchd · Linux systemd · Windows)
   config.json               목표·밴드·쿼터 — 각 값이 무엇을 지배하는지 주석
+  subway_judged.json        §8 #1 판정 스냅샷 (judge_subway --emit, 대시보드 배너용)
   README.md                 수집기 운영 (제어 · TCC · 쿼터)
 
 spike/validation/
@@ -50,7 +55,7 @@ spike/validation/
   MEASUREMENT.md            관측·평가 프로토콜
 ```
 
-**의존성 없음** — 파이썬 표준 라이브러리만 쓴다. `pip install` 불필요.
+**수집기·대시보드·조율기는 파이썬 표준 라이브러리만** 쓴다 (`pip install` 불필요). 단 분석용 시각표 파서(`subway_timetable.py`)만 PDF는 `pdftotext`(poppler), xlsx는 `openpyxl`이 필요하다 — 판정은 오프라인 분석이라 배포 서버엔 불요.
 
 ---
 
@@ -65,6 +70,14 @@ python3 server.py                         # 수집 + 대시보드 → http://loc
 ```
 
 ⚠️ **항상 켜진 기계에서 돌려야 한다.** 컴퓨터가 꺼진 시간대의 데이터는 며칠을 기다려도 **0**이다 — 무작위 손실이 아니라 구조적 구멍이고, 하필 **출근·퇴근 첨두**가 노트북이 덮여 있는 시간이다. [`collector-design.md` §1.2](docs/collector-design.md)
+
+> ### ⚠️ 실제 수집은 EC2에서 돈다 — 로컬 `data/*.jsonl`은 실데이터가 아니다
+>
+> **프로덕션 수집기는 별도 EC2(서울 리전, systemd user 유닛 `findpath`·`findpath-subway`·`findpath-seoul`)에서 24시간 무인 가동 중이다.** 대시보드는 그 기계의 `http://<EC2>:8080`.
+>
+> 로컬에서 `python3 server.py`를 돌리면 개발·검증용으로 데이터가 조금 쌓이지만, **그 `collector/data/*.jsonl`은 진짜 데이터셋이 아니다** — 켜둔 밴드/시간만 채워진 조각이고, 파일명이 같아도 내용이 다를 수 있다(예: 로컬 `subway-*.jsonl`에 버스 데이터가 섞여 있던 사례). **분석·판정에 쓰는 실측은 EC2의 `~/bus-store/collector/data/` 및 백업 `.gz`(exportDir·구글드라이브)다.** 로컬 분석이 필요하면 그 `.gz`를 받아서 쓴다.
+>
+> `data/`는 `.gitignore`로 저장소에서 제외된다 — 커밋되는 건 코드·설정·판정 스냅샷(`subway_judged.json`)뿐이다.
 
 ---
 

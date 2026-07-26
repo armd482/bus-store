@@ -807,8 +807,9 @@ function renderSubway(d){
   const prog = L => L.seen ? (L.fillN||0)/(L.seen*L.target) : 0;
   const days = L => L.seen ? (L.sumN||0)/L.seen : 0;      // 셀당 평균 관측 일수
   let h = '<div class=sub><b>전 노선 일괄(ALL)</b> 도착정보 — 1콜에 19노선·555역 (✅ 경기·인천 포함). '
-    + '<b>B안 셀</b> (노선,열차,역,요일)별 관측 일수 — trainNo 가 매일 반복이라 요일별 며칠이면 '
-    + '각 열차 정시성 σ 가 나온다 (docs §8.2).</div>';
+    + '<b>정시성 판정(§8 #1)은 아래 초록 배너 = judge_subway(공식 시각표 대조, §8.4)가 authoritative.</b> '
+    + '이 아래 <b>B안 셀</b>(노선,열차,역,요일 관측일수)·요일 분리 재검토는 <b>레거시 참고 지표</b>다 '
+    + '(요일별 σ 재검토용, docs §8.2 말미).</div>';
 
   // §8 #1 판정 결과 — 공식 시각표 대조(judge_subway). 존폐 항목이었고 통과했다.
   const jg = sub.judged;
@@ -883,7 +884,7 @@ function renderSubway(d){
   //   (다음 월요일에 mon 셀이 n=2 가 되면 오르지만, 그때도 19개가 나란히 오른다.)
   //   반면 준비도는 1.6~4.5일로 갈린다: 쌍당 관측 수라 trainNo 파편화가 드러난다.
   const jprog = L => Math.min(1, (L.judgeDays||0)/jt);
-  h += `<h2>노선별 쌍당 관측 <span class=sub style="font-weight:400">— §8 #1 은 판정 완료(§8.2). 이 표는 노선별 데이터 두께·trainNo 파편화 점검용</span></h2>`;
+  h += `<h2>노선별 쌍당 관측 <span class=sub style="font-weight:400">— (레거시) §8 #1 은 judge_subway 로 판정 완료(§8.4). 이 표는 데이터 두께·번호 파편화 점검용</span></h2>`;
   h += '<div style="margin-bottom:10px">' + lt('__all__','전체')
      + sub.lines.map(L=>lt(L.name, L.name, `<span style="opacity:.6;font-size:11px"> ${
          L.judgeSkip ? '—' : (L.judgeDays||0).toFixed(1)+'일'}</span>`)).join('') + '</div>';
