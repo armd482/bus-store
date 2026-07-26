@@ -59,7 +59,8 @@ def norm_station(s):
     도착이 통째로 미매칭된다 — ✅ 6호선은 이 때문에 미매칭 24%였다(정규화 후 1%)."""
     if not s:
         return s
-    s = re.sub(r"\(.*?\)", "", s).strip()
+    # 괄호 병기 제거 + 공백 제거 + 가운뎃점 통일(4·19민주묘지 ↔ 4.19 민주묘지)
+    s = re.sub(r"\(.*?\)", "", s).replace(" ", "").replace("·", ".").strip()
     return _STATION_ALIAS.get(s, s)
 
 
@@ -125,7 +126,8 @@ def build_plan(stcs_csv, sinbundang_pdfs, xlsx_specs=None, gtxa_path=None,
     if arex_path:
         recs += T.parse_arex(arex_path)      # 공항철도 (섹션 헤더 방향·직통/일반)
     for line, path in (lrt_specs or []):
-        recs += T.parse_lrt(path, line)      # 경전철 (신림선·우이신설선 붙여넣기 텍스트)
+        # 경전철 붙여넣기 — 우이신설선은 두컬럼·상선/하선 포맷(parse_uln), 신림선은 순차섹션
+        recs += T.parse_uln(path, line) if line == "우이신설선" else T.parse_lrt(path, line)
     for r in recs:
         d = DIR_CANON.get(r["direction"])
         if d is None:

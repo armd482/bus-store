@@ -265,6 +265,44 @@ def parse_lrt(path, line):
     return out
 
 
+def _lrt_norm(s):
+    """경전철 역명 정규화 — 괄호·공백 제거 + 가운뎃점 통일(4·19민주묘지→4.19민주묘지)."""
+    return re.sub(r"\(.*?\)", "", s).replace(" ", "").replace("·", ".").strip()
+
+
+def parse_uln(path, line="우이신설선"):
+    """우이신설선 시각표(붙여넣기) → 정규화 레코드. 신림선과 포맷이 다르다:
+    **두 컬럼**(하선 ｜ 시각 ｜ 상선), 시(hour)에 '시' 접미사('5시'), 방향은 '상선/하선'.
+    시 앞 분=하선(하행), 뒤 분=상선(상행) — 종착역 북한산우이는 상선만(시가 맨 앞).
+    상선(신설동 방향)=상행 · 하선(북한산우이 방향)=하행 (✅ jsonl 상행/하행)."""
+    stations = {_lrt_norm(x) for x in LRT_STATIONS.get(line, set())}
+    out = []
+    station = daytype = None
+    for raw in open(path, encoding="utf-8"):
+        s = raw.strip()
+        if not s:
+            continue
+        nb = _lrt_norm(s)
+        if nb in stations:
+            station = nb
+            continue
+        if "주말" in s or "휴일" in s or "공휴일" in s:
+            daytype = "공휴일"
+        elif "평일" in s:
+            daytype = "평일"
+        m = re.search(r"(\d{1,2})\s*시", s)         # 시(hour) — '5시'
+        if not m or station is None or daytype is None:
+            continue
+        hour = int(m.group(1))
+        for block, direction in ((s[:m.start()], "하행"), (s[m.end():], "상행")):
+            for mm in re.findall(r"\d{2}", block):
+                if int(mm) < 60:
+                    out.append({"line": line, "station": station, "daytype": daytype,
+                                "direction": direction, "updn": None,
+                                "h": hour, "m": int(mm), "dest": None})
+    return out
+
+
 def parse_arex(path, line="공항철도"):
     """공항철도 xlsx → 정규화 레코드. 코레일 matrix 와 다르다:
     시트=평일/휴일, **방향은 시트 안 섹션 헤더**('하 행 (서울⇒인천공항)'·'상 행 (…⇒서울)'),

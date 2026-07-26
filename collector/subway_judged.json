@@ -4,10 +4,10 @@
  "span": "2026-07-18~2026-07-25",
  "days": 8,
  "signalMin": 1.5,
- "linesJudged": 18,
- "belowSignalLines": 8,
- "medRatio": 0.182,
- "sigmaMinMed": 1.56,
+ "linesJudged": 19,
+ "belowSignalLines": 9,
+ "medRatio": 0.174,
+ "sigmaMinMed": 1.54,
  "lines": [
   {
    "name": "1호선",
@@ -127,6 +127,18 @@
    "sigmaInMin": 1.19,
    "headwayMin": 5.0,
    "ratio": 0.238,
+   "verdict": "buffer"
+  },
+  {
+   "name": "우이신설선",
+   "matched": 33443,
+   "unmatchedPct": 0.007,
+   "biasSec": 4,
+   "sigmaRawSec": 30,
+   "sigmaInSec": 27,
+   "sigmaInMin": 0.45,
+   "headwayMin": 5.0,
+   "ratio": 0.09,
    "verdict": "buffer"
   },
   {
