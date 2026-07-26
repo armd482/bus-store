@@ -80,6 +80,20 @@ def db():
     return _DB
 
 
+def load_judged():
+    """지하철 정시성 판정 스냅샷 — judge_subway.py --emit 산출물(오프라인 계산).
+
+    라이브로 계산하지 않는다: 판정은 계획 시각표(CSV·PDF)가 있어야 하고 상시 돌 일이
+    아니라 분석 단계 산출물이다. 파일이 없으면 done=False (배너가 '판정 전'을 표시).
+    """
+    p = os.path.join(O.HERE, "subway_judged.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"done": False}
+
+
 def _obs_rate_per_day():
     """(하루 관측률 행/일, 측정 창 일수) — 최근 1~2 운행일 jsonl 크기 ÷ 경과 시간.
 
@@ -302,9 +316,9 @@ def subway_snapshot():
         "lastObs": last_epoch, "lastStn": last_stn, "lastLine": last_line,
         "judgeTarget": 3,   # §8.1 ④ — 쌍당 3 관측이면 σ 를 잴 수 있다
         "target": tgt,      # 요일 분리 재검토 목표 (셀당 3 관측 = 3주)
-        # §8 #1 은 이미 판정됨 (§8.2) — 대시보드가 '진행 중 목표'로 오인하지 않게 결과를 실어 보낸다
-        "judged": {"done": True, "sigmaMed": 0.75, "signal": 1.5, "belowSignal": 0.75,
-                   "date": "2026-07-23", "cells": 99082},
+        # §8 #1 판정 결과 — judge_subway.py 가 공식 시각표 대조로 낸 오프라인 스냅샷
+        # (subway_judged.json). 없으면 done=False. '진행 중 목표'로 오인하지 않게 실어 보낸다.
+        "judged": load_judged(),
     }
 
 
@@ -796,15 +810,36 @@ function renderSubway(d){
     + '<b>B안 셀</b> (노선,열차,역,요일)별 관측 일수 — trainNo 가 매일 반복이라 요일별 며칠이면 '
     + '각 열차 정시성 σ 가 나온다 (docs §8.2).</div>';
 
-  // §8 #1 판정 결과 — 존폐 항목이었고 통과했다. 진행 중 목표가 아니라 완료다.
+  // §8 #1 판정 결과 — 공식 시각표 대조(judge_subway). 존폐 항목이었고 통과했다.
   const jg = sub.judged;
   if(jg && jg.done){
+    const VM={cliff:'✅절벽신뢰',buffer:'⚠️완충필요',none:'❌무의미'};
+    let rows='';
+    for(const L of (jg.lines||[])){
+      const cls = L.verdict==='none'?'bad':L.verdict==='cliff'?'ok':'';
+      rows += `<tr><td>${L.name}</td>`
+        + `<td class=n style="opacity:.7">${num(L.matched)}</td>`
+        + `<td class=n>${L.sigmaInSec}s</td>`
+        + `<td class=n style="opacity:.7">${L.headwayMin}분</td>`
+        + `<td class="n ${cls}"><b>${L.ratio}</b></td>`
+        + `<td style="opacity:.8">${VM[L.verdict]||''} · 미매칭 ${pct(L.unmatchedPct)}</td></tr>`;
+    }
     h += `<div class=card style="margin:12px 0;border-left:3px solid #22c55e;background:#22c55e11">
-      <div class=k>§8 #1 지하철 정시성 — <b class=ok>✅ 판정됨</b> (${jg.date})</div>
-      <div style="margin-top:4px">σ 중앙 <b>${jg.sigmaMed}분</b> &lt; 신호 ${jg.signal}분 · 신호보다 σ 작은 셀 <b>${pct(jg.belowSignal)}</b>
-      <span class=sub>(${num(jg.cells)}셀 · 5일치)</span></div>
-      <div class=sub style="margin-top:2px">§6.2가 버스를 기각한 논리가 지하철엔 적용 안 됨 → <b>절벽 성립, 차별점 유효.</b>
-      아래는 <b>요일 분리 재검토</b>(3주+)의 진행률이다.</div></div>`;
+      <div class=k>§8 #1 지하철 정시성 — <b class=ok>✅ 판정됨</b> (${jg.date} · 관측 ${jg.span} ${jg.days}일)</div>
+      <div style="margin-top:4px">σ역내 중앙 <b>${jg.sigmaMinMed}분</b> · σ/H 중앙 <b>${jg.medRatio}</b>
+      · <b>${jg.linesJudged}개 노선 전부 절벽 성립</b>(σ/H&lt;0.3)</div>
+      <div class=sub style="margin-top:2px">${jg.method||''}. §6.2가 버스를 기각한 논리(도착지터>신호)가
+      지하철엔 적용 안 됨 → <b>절벽 성립, 차별점 유효.</b></div>
+      <table style="margin-top:8px"><tr style="opacity:.5"><td>노선</td><td class=n>매칭</td>
+      <td class=n>σ역내</td><td class=n>배차H</td><td class=n>σ/H</td><td>판정</td></tr>${rows}</table>
+      <div class=sub style="margin-top:4px">σ역내 = 역별 offset(수신지연) 뺀 시각표 준수도(초).
+      σ원시엔 recptnDt 수신지연이 섞여 더 크다. §8.3 도착대용으로 놓친 도착을 회수해 판정.
+      ⚠️ 신분당선은 recptnDt 예측성(§8.1 ⑤ 가)이라 σ가 크게 잡힌다.</div></div>`;
+  } else if(jg && jg.done===false){
+    h += `<div class=card style="margin:12px 0;border-left:3px solid #f59e0b;background:#f59e0b11">
+      <div class=k>§8 #1 지하철 정시성 — 판정 스냅샷 없음</div>
+      <div class=sub style="margin-top:2px">계획 시각표로 <code>judge_subway.py --emit subway_judged.json</code> 을
+      돌리면 여기에 노선별 σ/H 판정이 뜬다 (오프라인 계산 — 시각표 CSV·PDF 필요).</div></div>`;
   }
 
   h += '<h2>건강 상태</h2><div class=grid>';
