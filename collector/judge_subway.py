@@ -32,12 +32,35 @@ import argparse
 import glob
 import gzip
 import json
+import re
 import statistics
 import sys
 from datetime import datetime
 
 import orchestrator as O
 import subway_timetable as T
+
+
+# 괄호 제거로도 안 맞는 별칭 — 양쪽(jsonl 실측·CSV 계획)을 한 canonical 로 수렴시킨다.
+# ✅ 전 노선 대조로 찾은 잔여 불일치: 실측 realtime 이 옛/기본명을, CSV 가 개정/병기명을
+#    (또는 그 반대) 쓰는 경우. 각 역은 노선 내 유일해 오병합 위험 없다.
+_STATION_ALIAS = {
+    "서울": "서울역",          # 1·4호선 realtime '서울' ↔ CSV '서울역'
+    "평택지제": "지제",        # 1호선 CSV '평택지제' ↔ realtime '지제'
+    "이수": "총신대입구",      # 7호선 CSV '이수' ↔ realtime '총신대입구'(4호선 병기명과 동일역)
+    "자양": "뚝섬유원지",      # 7호선 CSV '자양(뚝섬한강공원)' ↔ realtime '뚝섬유원지'(구명)
+    "응암순환": "응암",        # 6호선 루프 회차 라벨 ↔ CSV '응암'
+}
+
+
+def norm_station(s):
+    """역명 정규화 — 조인 키. ① 병기역명 괄호 제거(대흥(서강대앞)→대흥) ② 별칭 수렴.
+    실측 jsonl 과 15098251 CSV 의 역명 표기가 달라(괄호·구명·병기명) 안 맞추면 그 역
+    도착이 통째로 미매칭된다 — ✅ 6호선은 이 때문에 미매칭 24%였다(정규화 후 1%)."""
+    if not s:
+        return s
+    s = re.sub(r"\(.*?\)", "", s).strip()
+    return _STATION_ALIAS.get(s, s)
 
 
 # 계획 방향 라벨 → 정규 방향. 실측 updnLine 도 같은 정규값으로 맞춘다.
@@ -86,7 +109,7 @@ def build_plan(stcs_csv, sinbundang_pdfs):
             continue
         if r["daytype"] == "토요일":
             daytypes_with_sat.add(r["line"])
-        key = (r["line"], r["station"], r["daytype"], d)
+        key = (r["line"], norm_station(r["station"]), r["daytype"], d)
         plan.setdefault(key, []).append(absmin(r["h"], r["m"]))
     for k in plan:
         plan[k].sort()
@@ -152,7 +175,7 @@ def load_obs(obs_glob, plan_lines, substitute=True):
                 continue
             am = absmin(b.hour, b.minute, b.second)
             units.setdefault((ln, r.get("trainNo"), r.get("statnId"), sd), []).append(
-                (am, cd, r.get("statnNm"), d, O.day_type(b)))
+                (am, cd, norm_station(r.get("statnNm")), d, O.day_type(b)))
 
     obs = {}
     kept = subbed = 0
