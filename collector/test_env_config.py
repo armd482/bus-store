@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from collector import env_config
+import bus_collector
 
 
 class EnvConfigTests(unittest.TestCase):
@@ -48,6 +49,16 @@ class EnvConfigTests(unittest.TestCase):
             self.assertEqual(
                 env_config.get("GBIS_BUS_KEY", "DATA_GO_KR_KEY"), "process"
             )
+
+    def test_bus_primary_key_uses_common_fallback(self):
+        with patch.object(bus_collector.E, "get", return_value="key") as get:
+            self.assertEqual(bus_collector._load_key("GBIS_BUS_KEY"), "key")
+            get.assert_called_once_with("GBIS_BUS_KEY", "DATA_GO_KR_KEY")
+
+    def test_bus_secondary_key_does_not_duplicate_common_key(self):
+        with patch.object(bus_collector.E, "get", return_value=None) as get:
+            self.assertIsNone(bus_collector._load_key("GBIS_BUS_KEY2"))
+            get.assert_called_once_with("GBIS_BUS_KEY2", None)
 
 
 if __name__ == "__main__":
