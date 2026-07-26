@@ -101,10 +101,12 @@ RECONCILE_OVERRIDE = {
                 "1양원": "양원", "1양정": "양정"},
     "서해선": {"시흥청": "시흥시청", "신김포": "김포공항", "신소사": "소사",
              "신신천": "신천", "신신현": "신현", "신초지": "초지"},
+    "경강선": {"경광주": "경기광주", "도예촌": "신둔도예촌", "세종릉": "세종왕릉",
+             "신이매": "이매", "신판교": "판교"},
 }
 
 
-def build_plan(stcs_csv, sinbundang_pdfs, xlsx_specs=None, gtxa_path=None):
+def build_plan(stcs_csv, sinbundang_pdfs, xlsx_specs=None, gtxa_path=None, arex_path=None):
     """계획 인덱스 — plan[(line,station,daytype,dir)] = 정렬된 절대분 리스트.
     xlsx_specs = [(line, path)...]. 역명 재조정은 load 후 reconcile_plan 에서."""
     plan = {}
@@ -119,6 +121,8 @@ def build_plan(stcs_csv, sinbundang_pdfs, xlsx_specs=None, gtxa_path=None):
         recs += T.parse_xlsx(path, line)
     if gtxa_path:
         recs += T.parse_gtxa(gtxa_path)      # GTX-A (평일만 — 주말표 미제공)
+    if arex_path:
+        recs += T.parse_arex(arex_path)      # 공항철도 (섹션 헤더 방향·직통/일반)
     for r in recs:
         d = DIR_CANON.get(r["direction"])
         if d is None:
@@ -400,19 +404,20 @@ def main():
     ap.add_argument("--sinbundang", nargs="*", default=[], help="신분당선 PDF(평일/공휴일)")
     ap.add_argument("--xlsx", nargs="*", default=[], help="운영사 xlsx: '노선명=경로' (예 경춘선=/x.xlsx)")
     ap.add_argument("--gtxa", help="GTX-A 시각표 텍스트 경로 (평일)")
+    ap.add_argument("--arex", help="공항철도 xlsx 경로")
     ap.add_argument("--obs", required=True, help="실측 glob (예 'data/subway-*.jsonl*')")
     ap.add_argument("--line", help="이 노선 역별 상세도 출력")
     ap.add_argument("--emit", help="판정 스냅샷 JSON 경로 (대시보드 배너용, 오프라인 계산)")
     args = ap.parse_args()
-    if not args.stcs and not args.sinbundang and not args.xlsx and not args.gtxa:
-        sys.exit("계획 소스가 없다 — --stcs · --sinbundang · --xlsx · --gtxa 중 하나는 필요.")
+    if not any((args.stcs, args.sinbundang, args.xlsx, args.gtxa, args.arex)):
+        sys.exit("계획 소스가 없다 — --stcs · --sinbundang · --xlsx · --gtxa · --arex 중 하나는 필요.")
 
     xlsx_specs = [tuple(s.split("=", 1)) for s in args.xlsx if "=" in s]
-    plan, sat_lines = build_plan(args.stcs, args.sinbundang, xlsx_specs, args.gtxa)
+    plan, sat_lines = build_plan(args.stcs, args.sinbundang, xlsx_specs, args.gtxa, args.arex)
     plan_lines = {k[0] for k in plan}
     print(f"계획: {len(plan):,} (노선,역,요일,방향) 슬롯 · 노선 {sorted(plan_lines)}")
     obs, kept, subbed, stale, nodir = load_obs(args.obs, plan_lines)
-    if xlsx_specs or args.gtxa:
+    if xlsx_specs or args.gtxa or args.arex:
         plan, unresolved = reconcile_plan(plan, obs)
         for ln, sts in unresolved.items():
             print(f"⚠️ {ln} 역명 미해결 {len(sts)}개(계획에만·미매칭 처리): {sorted(sts)[:10]}")

@@ -214,6 +214,42 @@ def parse_xlsx(path, line):
     return out
 
 
+def parse_arex(path, line="공항철도"):
+    """공항철도 xlsx → 정규화 레코드. 코레일 matrix 와 다르다:
+    시트=평일/휴일, **방향은 시트 안 섹션 헤더**('하 행 (서울⇒인천공항)'·'상 행 (…⇒서울)'),
+    직통/일반 혼재(직통은 정차역만 시각·나머지 빈칸), 역은 두 행(도착=역명행/출발=다음행).
+    지상서울·수색직결선 등 비역 지점은 실측에 없어 자동 제외된다."""
+    import openpyxl
+    LABELS = {"열차번호", "시발역", "시발시간", "종착역", "종착시간", "비 고", "비고", ""}
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    out = []
+    for sh in wb.sheetnames:
+        dtn = "공휴일" if "휴일" in sh else "평일"
+        direction = None
+        rows = list(wb[sh].iter_rows(values_only=True))
+        for i, row in enumerate(rows):
+            joined = " ".join(str(c) for c in row if c is not None)
+            if "하 행" in joined or "하행" in joined:
+                direction = "하행"
+                continue
+            if "상 행" in joined or "상행" in joined:
+                direction = "상행"
+                continue
+            name = str(row[0]).strip() if row and row[0] is not None else ""
+            if direction is None or name in LABELS or name.startswith("["):
+                continue
+            times = [_cell_hm(c) for c in row[1:]]
+            if not any(times) and i + 1 < len(rows):
+                times = [_cell_hm(c) for c in rows[i + 1][1:]]
+            for hm in times:
+                if hm:
+                    out.append({"line": line, "station": name, "daytype": dtn,
+                                "direction": direction, "updn": None,
+                                "h": hm[0], "m": hm[1], "dest": None})
+    wb.close()
+    return out
+
+
 GTXA_STATIONS = {"운정중앙", "킨텍스", "대곡", "연신내", "서울역",
                  "수서", "성남", "구성", "동탄"}
 

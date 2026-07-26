@@ -4,10 +4,10 @@
  "span": "2026-07-18~2026-07-25",
  "days": 8,
  "signalMin": 1.5,
- "linesJudged": 15,
+ "linesJudged": 17,
  "belowSignalLines": 7,
  "medRatio": 0.19,
- "sigmaMinMed": 1.54,
+ "sigmaMinMed": 1.57,
  "lines": [
   {
    "name": "1호선",
@@ -130,6 +130,18 @@
    "verdict": "buffer"
   },
   {
+   "name": "공항철도",
+   "matched": 32423,
+   "unmatchedPct": 0.139,
+   "biasSec": 2,
+   "sigmaRawSec": 108,
+   "sigmaInSec": 108,
+   "sigmaInMin": 1.81,
+   "headwayMin": 7.0,
+   "ratio": 0.258,
+   "verdict": "buffer"
+  },
+  {
    "name": "신분당선",
    "matched": 26609,
    "unmatchedPct": 0.145,
@@ -187,6 +199,18 @@
    "sigmaInMin": 2.38,
    "headwayMin": 8.0,
    "ratio": 0.298,
+   "verdict": "buffer"
+  },
+  {
+   "name": "경강선",
+   "matched": 10508,
+   "unmatchedPct": 0.013,
+   "biasSec": 25,
+   "sigmaRawSec": 139,
+   "sigmaInSec": 135,
+   "sigmaInMin": 2.25,
+   "headwayMin": 21.0,
+   "ratio": 0.107,
    "verdict": "buffer"
   }
  ],
