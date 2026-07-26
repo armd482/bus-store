@@ -900,20 +900,20 @@ function renderSubway(d){
             <td class="n ${L.judgeSkip?'':(j>=jt?'ok':'')}" width=64 style="white-space:nowrap">${
               L.judgeSkip ? '<span style="opacity:.5">제외</span>' : '<b>'+j.toFixed(1)+'</b>/'+jt+'일'}</td>
             <td width=170>${L.judgeSkip
-              ? '<span class=sub style="font-size:11px" title="trainNo 가 종일 재사용돼 셀이 성립하지 않는다">시각표 대조 필요 (§8.1 ⑤)</span>'
+              ? '<span class=sub style="font-size:11px" title="trainNo 가 셀 모델에 안 맞음(신분당선=종일 재사용 16개 / 2호선=번호 팽창 1,373개). judge_subway 로 판정 완료">셀 부적합 · judge_subway 판정 완료</span>'
               : bar(jp, jp>=1?'ok':'')}</td>
             <td class=n style="white-space:nowrap;opacity:.6">${num(L.seen)}</td>
             <td class=n style="white-space:nowrap;opacity:.6">${L.trains}·${L.stations}</td>
             <td class=n style="white-space:nowrap;opacity:.6">${num(L.written)}</td></tr>`;
     }
     h += '</table>';
-    h += `<div class=sub style="margin-top:6px"><b>쌍당 관측</b> = Σ관측일 ÷ 서로 다른 (열차,역) 쌍 수 `
-       + `(<b>요일 무관</b>). ${jt}일이면 정시성 σ 를 잴 수 있어 <b>${jt}일째부터 §8 #1 판정이 가능</b>하다 `
-       + `— §8 #1 은 이미 이 방식으로 판정됐다(§8.2).<br>`
-       + `⚠️ <b>노선별 '수집률'은 여기 없다.</b> 전 노선이 1콜(ALL)에 함께 수집되므로 수집 노력이 노선마다 `
-       + `같고, 요일 분리 재검토 진행률은 19개 노선 전부 같은 값이다(각 요일이 아직 한 번씩만 와서 전 셀 n=1). `
-       + `노선을 가르는 것은 <b>쌍당 관측</b>이고, 낮은 노선은 trainNo 가 파편화돼 쌍이 부풀려진 `
-       + `것이다 — 2호선은 한 번호가 노선의 8% 구간에서만 잡힌다(§8.1 ⑤ 다).</div>`;
+    h += `<div class=sub style="margin-top:6px"><b>⚠️ 이 표는 레거시 지표다.</b> §8 #1 정시성은 이제 `
+       + `<b>judge_subway(공식 시각표 시각근접매칭)로 전 19노선 판정 완료</b> — 위 초록 배너 참조. `
+       + `쌍당 관측 = Σ관측일 ÷ 서로 다른 (열차,역) 쌍 수(요일 무관)로, 셀 모델 준비도일 뿐이다.<br>`
+       + `<b>낮은 값은 정시성 문제가 아니다:</b> 2호선(제외)은 trainNo 가 하루 1,373개로 churn(번호 팽창)해 `
+       + `쌍이 부풀고, 9호선(2.6)은 급행+폴링 도착누락으로 역당 포착이 불안정하다. 둘 다 `
+       + `judge_subway 판정은 정상이다(2호선 σ/H 0.24 · 9호선 0.11). 셀이 아니라 jsonl 원본으로 `
+       + `분석해야 하는 노선일 뿐, 수집·정시성 이상이 아니다(§8.1 ⑤ 다).</div>`;
   } else {
     const L = sub.lines.find(x=>x.name===lineTab);
     if(!L){ h += '<div class=sub>그 노선은 아직 관측되지 않았다.</div>'; }
