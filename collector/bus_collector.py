@@ -17,20 +17,22 @@
 
 import json
 import os
-import random
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import orchestrator as O
 import env_config as E
+from rolling_dispatcher import RollingDispatcher
 
 BASE = "https://apis.data.go.kr/1613000/BusLcInfoInqireService/getRouteAcctoBusLcList"
-REPICK_EVERY = 40  # 사이클마다 정기 재선정 (~30분). 밴드가 바뀌면 그 즉시도 재선정한다
+RESERVE_BLOCK = 64  # 쿼터 선예약 블록(reserve 참조). 파일 교체를 ~1/64로 줄이고
+                    # 크래시 시 키당 최대 63콜 과다계상(과소계상 없음).
+COUNTER_CHECK_SEC = 600  # 구버전 합계 장부 migration 안전망. 시작·자정 외 10분마다.
+REPICK_EVERY = 40  # 40×interval마다 정기 재선정 (~21분). 밴드 변경 시 즉시 재선정
                    # — 현재 밴드·요일 부족량으로 고르므로(pick_routes) 패널을 오래 고정하면
                    # 밴드가 넘어간 뒤 옛 밴드를 계속 노려 목적함수가 무력화된다 [리뷰 R2].
 
@@ -75,9 +77,23 @@ def service_day(t):
     return O.service_day_of(t).strftime("%Y-%m-%d")
 
 
-def next_inflight(current, maximum, saw99):
-    """AIMD 한 단계. 최초 실패가 재시도로 회복돼도 saw99=True를 전달한다."""
-    return max(8, int(current * 0.6)) if saw99 else min(maximum, current + 2)
+def next_inflight(current, maximum, saw99, attempted=1, minimum_samples=1):
+    """AIMD 한 단계. code99는 즉시 후퇴하고, 회복에만 충분한 표본을 요구한다."""
+    if saw99:
+        return max(8, int(current * 0.6))
+    if attempted < minimum_samples:
+        return current
+    return min(maximum, current + 2)
+
+
+def midnight_inflight(current, quota_was_blocked, restart=10):
+    """자정 직전 쿼터로 멈췄다면 새 날을 보수적으로 재개하되 값을 올리지는 않는다."""
+    return min(current, restart) if quota_was_blocked else current
+
+
+def counter_check_due(qday, counter_day, monotonic_now, next_check):
+    """호출 장부 migration을 시작·날짜 전환·안전망 주기에만 실행한다."""
+    return qday != counter_day or monotonic_now >= next_check
 
 
 # ── 일 호출수는 디스크에 (KeepAlive 재시작해도 상한을 넘지 않게) ────────
@@ -119,6 +135,19 @@ def add_calls(day, n, keyid=None):
     return v
 
 
+def reserve_calls(day, wanted, cap, keyid):
+    """cap 안에서 wanted만큼 원자적으로 선예약하고 실제 확보량을 반환한다."""
+    with _CALL_LOCK:
+        current = read_calls(day, keyid)
+        grant = min(max(0, int(wanted)), max(0, cap - current))
+        if not grant:
+            return 0
+        _write_calls(day, current + grant, keyid)
+        if keyid:
+            _write_calls(day, read_calls(day) + grant)
+        return grant
+
+
 def ensure_key_counters(keys, day):
     """구버전 합계 장부의 아직 미배분된 호출을 키별 장부로 마이그레이션.
 
@@ -127,98 +156,53 @@ def ensure_key_counters(keys, day):
     """
     if not keys:
         return
-    total = read_calls(day)
-    assigned = sum(read_calls(day, kid) for kid, _ in keys)
-    missing = max(0, total - assigned)
-    if not missing:
-        return
-    q, r = divmod(missing, len(keys))
-    for i, (kid, _) in enumerate(keys):
-        _write_calls(day, read_calls(day, kid) + q + (i < r), kid)
+    # reserve의 블록 갱신과 동시에 합계/키별 장부를 읽고 쓰면 migration이 갱신을
+    # 덮을 수 있다. 같은 프로세스의 모든 장부 변경을 한 락으로 직렬화한다.
+    with _CALL_LOCK:
+        total = read_calls(day)
+        assigned = sum(read_calls(day, kid) for kid, _ in keys)
+        missing = max(0, total - assigned)
+        if not missing:
+            return
+        q, r = divmod(missing, len(keys))
+        for i, (kid, _) in enumerate(keys):
+            _write_calls(day, read_calls(day, kid) + q + (i < r), kid)
 
 
-def paced(fn, items, rate, workers, max_inflight, hold=0):
-    """제약이 둘이라 방어도 둘이다 — 버스트(rate) 와 동시 세션(in-flight).
+class QuotaReservations:
+    """호출 장부를 블록 단위로 선예약하는 스케줄러 전용 캐시."""
 
-    ① 버스트 — 제출을 1/rate 간격으로 벌린다.
-       ThreadPoolExecutor.map 은 워커 수만큼 한꺼번에 던진다. 그 버스트가
-       토큰 버킷에 걸려 HTTP 429 "API token rate limit exceeded" 를 부른다.
-       ✅ 실측 (같은 평균 rate, 다른 결과):
-           균등 6.0/s (제출 간격 167ms) → 88건 전부 성공, 429 0건
-           버스트 6.7/s (20개 동시)     → 180건 중 140건 실패
-         → 문제는 rate 가 아니라 버스트다.
-           균등 2/4/6 /s = 무결점. 10/s 부터 429·세션99 가 섞이기 시작(141/144).
+    def __init__(self, cap, block=RESERVE_BLOCK, clock=now,
+                 allocate=reserve_calls):
+        self.cap = cap
+        self.block = block
+        self.clock = clock
+        self.allocate = allocate
+        self.day = None
+        self.left = {}
 
-    ② 동시 세션 30 — 세마포어로 in-flight 를 직접 센다.
-       ⚠️ rate 만으로 맞추려던 게 틀렸다. in-flight = rate × 응답시간인데
-          응답시간은 우리가 정하는 값이 아니다.
-       ✅ 실측: 응답 중앙값 2.48s / 평균 2.26s / **최대 4.99s**.
-           중앙값이면 6×2.5 = 15 로 여유롭지만, 꼬리에서 6×5 = 30 → 상한 정통.
-           그래서 실패가 평균이 아니라 꼬리에서 터졌다 (170노선 사이클 3.5%).
-       세마포어를 걸면 응답이 얼마나 느려지든 세션은 안 넘는다. 대신 느려지면
-       제출이 알아서 막혀 사이클이 길어진다 — 데이터를 버리는 것보다 낫다.
+    def reserve(self, kid, n):
+        qday = quota_day(self.clock())
+        if qday != self.day:
+            # 전날에 남은 선예약은 전날 장부에 이미 보수적으로 계상돼 있다.
+            # 새 달력일에는 절대 이 잔여를 재사용하지 않는다.
+            self.day = qday
+            self.left.clear()
 
-    ③ ★ 좀비 세션 — ②의 가정("release=세션 닫힘")은 **타임아웃에서 깨진다**.
-       우리가 15s 에 포기해도 TAGO 는 그 요청을 모른다 → 세션이 서버 쪽에 살아
-       있다(좀비). 슬롯을 곧장 반납하면 다음 요청이 아직 살아있는 세션 위에 쌓여
-       (우리 18 + 좀비 N) > 30 → code99 (✅ 2026-07-24: TAGO 지연 시 1~2노선 잔여).
-       그래서 **타임아웃난 슬롯은 hold 초만큼 붙잡았다 반납**한다 — 세마포어
-       카운트를 실제 TAGO 세션에 맞춘다. 타임아웃이 몰리면 그만큼 슬롯이 잠겨
-       동시성이 자동으로 준다(정확히 필요한 반응). 회복되면 저절로 풀린다.
-    """
-    sem = __import__("threading").Semaphore(max_inflight)
+        left = self.left.get(kid, 0)
+        if left >= n:
+            self.left[kid] = left - n
+            return True
 
-    def guarded(it):
-        r = None
-        try:
-            r = fn(it)
-            return r
-        finally:
-            # 타임아웃이면 좀비가 TAGO 에서 빠질 시간(hold)만큼 슬롯을 더 붙잡는다.
-            if hold and r is not None and r[2] and ("Timeout" in r[2] or "timed out" in r[2]):
-                time.sleep(hold)
-            sem.release()
-
-    out = [None] * len(items)
-    with ThreadPoolExecutor(max_workers=max(workers, max_inflight)) as ex:
-        futs = {}
-        for i, it in enumerate(items):
-            sem.acquire()          # in-flight 상한 — 넘치면 여기서 막힌다
-            futs[ex.submit(guarded, it)] = i
-            time.sleep(1.0 / rate)  # 버스트 방지 — 상한에 안 걸려도 항상 벌린다
-        for f, i in futs.items():
-            out[i] = f.result()
-    return out
-
-
-def fetch_all(keys, picked, rate, workers, inflight, hold=0, reserve=None):
-    """picked 를 키 수만큼 라운드로빈으로 나눠 **각 키로 병렬 paced**.
-
-    세션·rate 한도가 키 단위라(load_keys 참조) 키마다 독립 세마포어·독립 rate 로
-    돌린다 → 같은 IP 로도 동시성이 키 수만큼 곱해진다. 반환은 (routeid, items, err)
-    리스트 (picked 순서와 무관 — 호출부가 routeid 로 매핑).
-    """
-    if len(keys) == 1:
-        kid, key = keys[0]
-        if reserve:
-            reserve(kid, len(picked))
-        return paced(lambda p: fetch(key, p["cityCode"], p["routeid"]),
-                     picked, rate, workers, inflight, hold)
-    groups = [picked[i::len(keys)] for i in range(len(keys))]   # 균등 라운드로빈
-    parts = [None] * len(keys)
-
-    def worker(idx):
-        kid, key = keys[idx]
-        if reserve:
-            reserve(kid, len(groups[idx]))
-        parts[idx] = paced(lambda p: fetch(key, p["cityCode"], p["routeid"]),
-                           groups[idx], rate, workers, inflight, hold)
-    ths = [__import__("threading").Thread(target=worker, args=(i,)) for i in range(len(keys))]
-    for t in ths:
-        t.start()
-    for t in ths:
-        t.join()
-    return [r for part in parts for r in part]
+        needed = n - left
+        # room 확인과 장부 증가는 같은 _CALL_LOCK 임계구역에서 수행한다.
+        # migration이 사이에 끼어 stale room 기준으로 cap을 넘는 틈을 없앤다.
+        grant = self.allocate(qday, max(self.block, needed), self.cap, kid)
+        if grant < needed:
+            self.left[kid] = left + grant
+            return False
+        self.left[kid] = left + grant - n
+        return True
 
 
 def fetch(key, city, routeid):
@@ -267,313 +251,327 @@ def main():
     key_cap = k.get("busKeyDailyCap", 480000)
     conn = O.connect()
     bands, target, nb = k["timebands"], k["targetSamples"], len(k["timebands"])
-    interval, quota, maxr = k["intervalSec"], k["dailyQuota"], k["maxRoutes"]
+    interval, maxr = k["intervalSec"], k["maxRoutes"]
     configured_keys = len(k.get("busKeys") or ["GBIS_BUS_KEY"])
     effective_maxr = max(1, maxr * len(keys) // max(1, configured_keys))
     workers, rate = k["maxWorkers"], k["dispatchRate"]
     inflight_max = k["maxInflight"]
-    hold = k.get("busZombieHoldSec", 10)   # 타임아웃 슬롯을 붙잡을 초 (paced ③)
-    # ★ in-flight 를 사이클마다 TAGO 상태에 맞춰 조절한다 (AIMD — 혼잡제어와 같은 꼴).
-    #   code99(세션 30 초과)가 보이면 다음 사이클 in-flight 를 줄이고(×0.6), 깨끗한
-    #   사이클이면 조금씩 올린다(+2). TAGO 가 느려지면 자동으로 물러나고 회복되면
-    #   차오른다. 고정 20 은 TAGO 지연이 늘 때(2.48→3.94s) 좀비 세션과 겹쳐 code99
-    #   버스트를 냈다 (✅ 2026-07-23). 하한 8 — 그 밑이면 사이클이 너무 길어진다.
-    inflight = inflight_max
+    hold = k.get("busZombieHoldSec", 10)
     window = k["serviceWindow"]
 
     day = service_day(now())
-    # (routeid, vehicleno) -> (nodeord, 관측시각, nodeid, route_version).
-    # ⚠️ 키에 routeid 가 필요하다 — 같은 차량이 당일 다른 노선으로 재배차되면
-    #    (경기 시내버스 운영에서 실제로 있다) 이전 노선의 nodeord 가 새 노선의
-    #    전이 계산에 섞여 엉뚱한 구간 통과가 기록된다. ordv<=prev 와 4×interval
-    #    가드가 대부분 걸러주지만, 순번이 우연히 증가 방향이면 통과한다.
-    last = {}
+    last = {}  # (routeid, vehicleno) -> (nodeord, 관측시각, nodeid, route_version)
     route_versions = dict(conn.execute(
         "SELECT routeid,currentVersion FROM route WHERE currentVersion IS NOT NULL"))
-    picked, cyc, written = [], 0, 0
-    picked_band = None   # 마지막 재선정 시각의 밴드 — 밴드가 바뀌면 즉시 재선정
+    picked, written, report_no = [], 0, 0
+    picked_band = None
+    next_repick = 0.0
+    rotated_day = None
 
-    rotated_day = None   # 로테이션을 마친 운행일 — 하루 한 번만 돌게
+    # 선예약 블록 — 스케줄러 스레드 전용(단일 스레드라 자체 락 불필요). 요청 1건마다
+    # 디스크 장부를 교체하면 하루 ~200만 회의 tmp-write+os.replace가 나고 그동안
+    # 스케줄러 락을 잡는다. 대신 키별로 RESERVE_BLOCK 콜을 미리 디스크에 예약하고
+    # 실제 요청은 메모리 잔여만 차감한다 → 파일 쓰기 ~1/RESERVE_BLOCK. 크래시 시
+    # 키당 최대 RESERVE_BLOCK-1 콜을 과다계상하지만(48만 중 63) 절대 과소계상하지
+    # 않아 실제 쿼터를 넘지 않는다. 자정에는 전날 메모리 잔여를 버리고 새 장부를 쓴다.
+    quota = QuotaReservations(key_cap)
 
-    def kickoff_export():
-        """bus-*.jsonl 2단 로테이션(백업 어제 / 삭제 그저께) — 별도 스레드.
-        rclone 네트워크 호출이 있으니 사이클을 막지 않게 스레드로 돌린다."""
-        __import__("threading").Thread(
-            target=O.rotate_jsonl, args=("bus",), daemon=True).start()
+    dispatcher = RollingDispatcher(
+        keys, fetch, quota.reserve, interval, rate, workers, inflight_max, hold)
 
-    print(f"[{now():%H:%M:%S}] 수집 시작 · 목표 {target}샘플 · 밴드 {nb}개 · "
-          f"최대 {effective_maxr}노선 · 키 {len(keys)}개({', '.join(nm for nm, _ in keys)}) · "
-          f"키당 상한 {key_cap:,} (오늘 합계 {read_calls(quota_day(now())):,} 사용)", flush=True)
-    if len(keys) < 2:
-        print(f"[{now():%H:%M:%S}] ⚠️ 키 1개 — maxRoutes {maxr} 를 단일 세션풀로 돌리면 "
-              f"사이클이 길어진다. GBIS_BUS_KEY2 를 .env 에 넣으면 커버 속도 2배", flush=True)
+    def blank_stats():
+        return {
+            "attempted": 0, "successful": 0, "retried": 0, "residual": 0,
+            "moving": 0, "rows": 0, "errors": [], "final": {},
+        }
 
-    while True:
-        t = now()
-        d = service_day(t)
-        qday = quota_day(t)   # 쿼터는 달력일 — 운행일(d)과 자정~04시에 갈린다
-        ensure_key_counters(keys, qday)
-        if d != day:
-            print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d}", flush=True)
-            day, last, written, picked = d, {}, 0, []
-            with LOCK:
-                STATE["errLog"] = []   # 오류 로그 매일 초기화 — 어제 실패가 오늘 화면에 안 남게
-            # emptyStreak 도 매일 리셋 — 리셋 조건이 '폴링돼서 버스가 보이는 것'뿐이라,
-            # 콜드가 된 노선은 슬롯이 차 있는 한 다시 폴링될 기회가 없어 영구 고착된다
-            # (성긴 배차 노선은 운행 중에도 6사이클 연속 0대가 가능하다). 하루 단위로
-            # 재기회를 주면 고착이 최대 하루로 묶인다.
-            conn.execute("UPDATE route SET emptyStreak = 0")
-            conn.commit()
-            continue
-        # 로테이션은 운행일 경계(04시)가 아니라 rotateHour(기본 6시)에 — 경계를 걸친
-        # 사이클이 아직 전날 파일에 쓰고 있을 수 있고, 04시는 첫차·전환이 겹친다.
-        due = O.rotate_due(rotated_day, t)
-        if due:
-            rotated_day = due
-            kickoff_export()   # 어제 백업 + 그저께 삭제(백업 확인 후)
-        if not O.in_window(t, window):
-            # serviceWindow 밖 — 현재 설정은 [0,24](24시간)라 이 분기는 안 탄다.
-            # ⚠️ 전수 실측상 "버스가 0인 시간대는 없다"(config _serviceWindow —
-            #    '03-04시는 0'이라던 초기 판단은 194개 표본의 오판). 창을 좁힐 때만 유효.
-            with LOCK:
-                STATE["night"] = True
-            time.sleep(300)
-            continue
+    stats = blank_stats()
+    stats_qday = quota_day(now())
+    report_started = time.monotonic()
+    report_at = report_started + interval
+    report_waiting = False
+    counter_day = None
+    next_counter_check = 0.0
 
-        # ⚠️ 심야 노선 수를 상수로 정하지 않는다. 운행시간 필터 + 관측(emptyStreak)이
-        #    실제로 도는 것만 남긴다. ✅ 실측상 01시에 도는 노선은 17~418개 사이인데
-        #    (노선 소요시간을 몰라 추정 폭이 크다) 그걸 40 같은 숫자로 못 박으면
-        #    05:16 까지 달리는 36번을 버리고 차고에 있는 낮 노선을 찍게 된다.
-        want = effective_maxr
-
-        # 노선 재선정 — 채운 노선은 빠지고 미커버가 들어온다
-        # ⚠️ len(picked) != want 로 매 사이클 재선정하지 않는다 — 심야엔 운행 노선이
-        #    상한보다 적은 게 정상이라, 그 조건이면 밤새 사이클마다 무거운 커버리지
-        #    쿼리(cell 전체 GROUP BY)를 돌리고 로그도 도배된다. 모자랄 땐
-        #    10사이클(~7분)마다만 다시 본다 — 새벽 운행 재개도 그 안에 잡힌다.
-        cur_band = O.band_of(t, bands)
-        band_changed = picked and cur_band != picked_band   # 밴드 경계 넘음 → 부족량이 통째로 바뀐다
-        if (not picked or band_changed or cyc % REPICK_EVERY == 0
-                or (len(picked) < want and cyc % 10 == 0)):
-            picked = O.pick_routes(conn, want, target, nb, t=t)
-            picked_band = cur_band
-            if not picked:
-                # ⚠️ 빈 풀과 완주를 구분한다. 안 그러면 새로 배포한 사람이
-                #    "모든 노선 완주"를 보고 정상인 줄 안다.
-                pool = conn.execute("SELECT COUNT(*) FROM route").fetchone()[0]
-                if pool == 0:
-                    print(f"[{t:%H:%M:%S}] ❌ 노선 풀이 비어 있다 — 먼저 `python3 fetch_routes.py` 를 돌릴 것",
-                          flush=True)
-                    time.sleep(60)
-                else:
-                    print(f"[{t:%H:%M:%S}] 폴링할 노선 없음 (풀 {pool:,}) — "
-                          f"전부 완주했거나 지금 운행 중인 노선이 없다", flush=True)
-                    time.sleep(600)
-                continue
-            print(f"[{t:%H:%M:%S}] 노선 재선정: {len(picked)}개 "
-                  f"(충전율 {picked[0]['fill']*100:.1f}% ~ {picked[-1]['fill']*100:.1f}%)", flush=True)
-
-        active_keys = [(kid, key) for kid, key in keys if read_calls(qday, kid) < key_cap]
-        if not active_keys or sum(max(0, key_cap-read_calls(qday, kid)) for kid, _ in active_keys) < len(picked):
-            print(f"[{t:%H:%M:%S}] 키별 일 상한 근접 — 대기", flush=True)
-            time.sleep(300)
-            continue
-
-        started = time.time()
-        with LOCK:
-            STATE["fetching"] = True
-        meta = {p["routeid"]: p for p in picked}
-        # 그룹별 호출 직전에 해당 키 장부를 예약한다. 한 키가 빠져도 다른 키의
-        # 소프트캡을 빌려 쓰지 않는다.
-        reserve = lambda kid, n: add_calls(qday, n, kid)
-        results = fetch_all(active_keys, picked, rate, workers, inflight, hold, reserve)
-        # 재시도로 성공 결과가 원본 결과를 대체해도 AIMD가 최초 code99를 잊지 않게
-        # 교체 전에 저장한다.
-        initial_saw99 = any("code99" in (err or "") for _, _, err, _ in results)
-        initial_errs = [err or "" for _, _, err, _ in results if err]
-
-        # code99(세션 고갈)는 일시적이다 — 꼬리 지연이 세션 30개를 채우는 순간에만
-        # 몰리고 몇 초 뒤엔 풀린다 (✅ 실측: 사이클별 실패 7→8→0). rate/inflight 를
-        # 더 조이면 사이클만 길어지므로, 실패분만 잠깐 뒤에 한 번 더 흘린다.
-        failed = [meta[rid] for rid, _, err, _ in results if err]
-        retry_keys = [(kid, key) for kid, key in keys if read_calls(qday, kid) < key_cap]
-        retry_room = sum(key_cap-read_calls(qday, kid) for kid, _ in retry_keys)
-        if failed and retry_keys and retry_room >= len(failed):
-            # ⚠️ 재시도를 곧장 20개 동시로 던지면 code99(세션 30 초과)가 재발한다.
-            #    타임아웃난 요청은 우리가 포기해도 TAGO 쪽 세션이 살아 있어(좀비),
-            #    새 20개 + 좀비 > 30 → code99 연쇄. 실제로 이 연쇄가 75/170 같은
-            #    버스트를 만든다 (✅ 2026-07-23: TAGO 지연 2.48→3.94s 로 꼬리가
-            #    15s 를 넘기 시작하면서 악화). 그래서 실패 성격에 따라 물러선다:
-            #    - code99 가 섞였으면 세션이 빠지도록 오래 쉬고(6s) in-flight 를 반으로
-            #    - 타임아웃뿐이면 짧게(2s), 동시성 그대로
-            has99 = any("code99" in err for _, _, err, _ in results if err)
-            pause = 6 if has99 else 2
-            rinflight = max(6, inflight // 2) if has99 else inflight
-            time.sleep(pause)
-            retry = {rid: (rid, items, err, o)
-                     for rid, items, err, o in fetch_all(
-                         retry_keys, failed, rate, workers, rinflight, hold, reserve)}
-            results = [retry.get(r[0], r) if r[2] else r for r in results]
-        cyc += 1
-
-        cyc_obs = now()   # 사이클 종료 시각 — 로그·STATE 용 (데이터의 t 는 노선별 obs)
-        rows, bumps = [], []
-        moving = 0
-        errs = {}
-
-        for routeid, items, err, obs in results:   # ★ obs = 이 노선의 실제 응답시각
-            if err:
-                errs[err] = errs.get(err, 0) + 1
-                continue
-            # 밴드·요일·공휴일을 **노선별 관측시각**으로 계산 — 사이클이 밴드/운행일
-            # 경계를 걸치면(08:59~09:01, 03:59~04:01) 노선마다 다르게 떨어져야 정확하다.
-            band = O.band_of(obs, bands)
-            dtype = O.day_type(obs)
-            hol = O.is_holiday(obs)
-            O.mark_empty(conn, routeid, not items)   # 추정이 아니라 관측이 정한다
-            moving += len(items)
-            if band is not None and not hol:
-                O.mark_service(conn, routeid, band, dtype, service_day(obs), bool(items))
-            for b in items:
-                v, ordv = b.get("vehicleno"), b.get("nodeord")
-                try:
-                    ordv = int(ordv)
-                except (TypeError, ValueError):
-                    continue  # 순번 없는 항목 — 전이 계산 불가
-                if not v:
-                    continue  # 차량번호 없음 — last[None] 으로 서로 다른 버스가 섞인다
-                vk = (routeid, v)          # 노선까지 포함해야 재배차 오염이 없다
-                prev = last.get(vk)
-                nodeid = b.get("nodeid")
-                version = route_versions.get(routeid)
-                last[vk] = (ordv, obs, nodeid, version)
-                if prev is None or ordv <= prev[0]:
-                    # 처음 보거나, 같은 정류장이거나, **역방향** — 역방향은 회차 아티팩트다:
-                    # 종점 도착 후 재출발하면 ord 가 168→1 로 떨어진다 (✅ 실측 0.07%).
-                    # 물리적 전이가 아니므로 버린다. last 는 갱신했으므로 새 운행분
-                    # (1→2→…)은 다음 사이클부터 정상 기록된다.
-                    continue
-                if (obs - prev[1]).total_seconds() > interval * 4:
-                    # ⚠️ 유령 통과 방지 — 노선이 재선정에서 빠졌다 돌아오면 prev 가
-                    #    1시간+ 전 것이다. 그걸 전이로 치면 폭 1시간짜리 '통과'가 정상
-                    #    샘플처럼 셀에 들어간다 (최악: 우연히 인접 정류장이면 감지 불가).
-                    #    첫 관측으로 취급하고 버린다. 4×interval 인 이유: 실패 1사이클
-                    #    (~90s 공백)은 기존처럼 기록하고, 그 이상 공백만 자른다.
-                    continue
-                # 최소 필드만 저장한다 (행 381B → ~220B).
-                #   필수: 통과 구간 (t_prev, t] + 차량(소요시간 체인 키) + 노선/구간
-                #   참고: band/daytype — 행 단독 해석용. rebuild 는 t 에서 현 규칙으로 재계산
-                #   안전: 양 끝 nodeid + route_version — 노선 개편 뒤 ord 재해석 방지.
-                # 정류장명·좌표는 route_stop의 같은 version으로 조인한다.
-                rows.append({
-                    "t": obs.isoformat(), "t_prev": prev[1].isoformat(),
-                    "routeid": routeid, "vehicleno": v,
-                    "from_ord": prev[0], "to_ord": ordv,
-                    "from_nodeid": prev[2], "to_nodeid": nodeid,
-                    # 하위 호환: 기존 분석기가 nodeid를 도착 정류장으로 읽는다.
-                    "nodeid": nodeid, "route_version": version or prev[3],
-                    "band": band, "daytype": dtype,
-                })
-                if band is not None and not hol:
-                    sday = service_day(obs)   # 이 관측의 운행일 (n_days 계산용)
-                    # 정확한 셀 표본은 인접 정류장이고 시간대·운행일 경계를 넘지 않은
-                    # 전이뿐이다. 건너뜀/경계 관측은 span 장부로 분리한다.
-                    quality = O.transition_quality(prev[1], obs, prev[0], ordv, bands)
-                    if quality == "exact":
-                        bumps.append((routeid, prev[0], ordv, band, dtype, sday))
-                    else:
-                        gap = (obs-prev[1]).total_seconds()
-                        if quality == "skipped":
-                            quality = "censored" if ordv-prev[0] <= 3 else "implausible"
-                        O.bump_span(conn, routeid, prev[0], ordv, band, dtype, sday,
-                                    quality, gap)
-
-        if rows:
-            # 사이클이 04시 경계를 걸치면 노선별 응답시각에 따라 운행일이 갈린다.
-            # 사이클 시작 때 잡은 day 하나로 쓰면 새 운행일 행이 전날 파일에 섞이고,
-            # rebuild 의 날짜 다양성 계산과 live 장부가 달라진다. 행의 t 기준으로 분리한다.
-            by_day = {}
-            for r in rows:
-                rt = datetime.fromisoformat(r["t"])
-                by_day.setdefault(service_day(rt), []).append(r)
-            for row_day, day_rows in by_day.items():
-                with open(os.path.join(O.DATA, f"bus-{row_day}.jsonl"), "a", encoding="utf-8") as f:
-                    for r in day_rows:
-                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            written += len(rows)
-        if bumps:
-            for a in bumps:
-                O.bump(conn, *a)
-                O.mark_included_direct(conn, *a[:5])
-        # bumps 가 없어도 커밋 — mark_empty 의 emptyStreak 갱신이 트랜잭션에 걸려 있다.
-        # 조건부로 두면 전이 0건인 심야에 쓰기 트랜잭션이 몇 분씩 열린 채 유지되고
-        # (WAL 비대 + 다른 쓰기 차단) 크래시 시 그 갱신들이 유실된다.
-        conn.commit()
-
-        took = time.time() - started
-        final_errs = [err for err, n in errs.items() for _ in range(n)]
-        all_health_errs = initial_errs + final_errs
+    def report_window(report_day, report_band, elapsed, next_deadline):
+        """완료 이벤트를 한 건강 창으로 확정한다. DB 쓰기는 메인 스레드만 한다."""
+        nonlocal stats, report_no, report_started, report_at
+        report_obs = now()
+        elapsed = max(0.001, elapsed)
+        report_no += 1
+        snap = dispatcher.snapshot()
+        all_errors = stats["errors"]
         O.record_health(
-            conn, qday, cur_band, len(picked), len(picked)-sum(errs.values()),
-            len(failed), sum(errs.values()),
-            sum("code99" in e for e in all_health_errs),
-            sum("Timeout" in e or "timed out" in e for e in all_health_errs),
-            sum("HTTP429" in e for e in all_health_errs),
-            sum(e.startswith("HTTP5") for e in all_health_errs),
-            took, inflight)
+            conn, report_day, report_band, stats["attempted"], stats["successful"],
+            stats["retried"], stats["residual"],
+            sum("code99" in e for e in all_errors),
+            sum("Timeout" in e or "timed out" in e for e in all_errors),
+            sum("HTTP429" in e for e in all_errors),
+            sum(e.startswith("HTTP5") for e in all_errors),
+            elapsed, dispatcher.inflight_limit)
         conn.commit()
+
         mem = O.rss_mb()
         with LOCK:
-            STATE["cycles"] = cyc
-            STATE["lastObs"] = time.time()
-            STATE["lastCycleSec"] = took
+            STATE["cycles"] = report_no
+            if stats["attempted"]:
+                STATE["lastObs"] = time.time()
+            STATE["lastCycleSec"] = elapsed
             STATE["picked"] = len(picked)
-            STATE["moving"] = moving
+            STATE["moving"] = stats["moving"]
             STATE["written"] = written
-            STATE["errors"] = errs
-            STATE["retried"] = len(failed)
+            STATE["errors"] = dict(stats["final"])
+            STATE["retried"] = stats["retried"]
             STATE["rssMB"] = mem
             STATE["night"] = False
-            STATE["fetching"] = False
-            # 잔여 실패(재시도 후)만 이력에 남긴다 — 대시보드가 최근 오류 리스트로 보여준다.
-            # 회복된 재시도는 오류가 아니므로 제외. 최근 50건만 유지(메모리 상한).
-            if errs:
+            STATE["fetching"] = snap["inflight"] > 0
+            if stats["final"]:
+                detail = " ".join(
+                    f"{err}×{n}" for err, n in
+                    sorted(stats["final"].items(), key=lambda x: -x[1]))
                 log = STATE.setdefault("errLog", [])
-                detail = " ".join(f"{k}×{v}" for k, v in sorted(errs.items(), key=lambda x: -x[1]))
-                log.append({"t": time.time(), "n": sum(errs.values()),
-                            "picked": len(picked), "detail": detail})
+                log.append({"t": time.time(), "n": stats["residual"],
+                            "picked": stats["attempted"], "detail": detail})
                 del log[:-50]
 
-        # 실패는 항상 보인다. 조용히 데이터를 버리는 게 제일 나쁘다.
-        nerr = sum(errs.values())
-        ok = len(picked) - nerr
-        rec = len(failed) - nerr  # 재시도로 회복된 수
-        print(f"[{cyc_obs:%H:%M:%S}] 응답 {ok}/{len(picked)}노선 · 운행 {moving}대 · "
-              f"통과 +{len(rows)} (누적 {written:,}) · {took:.0f}s"
+        recovered = stats["retried"] - stats["residual"]
+        print(f"[{report_obs:%H:%M:%S}] {elapsed:.0f}초 창 응답 "
+              f"{stats['successful']}/{stats['attempted']} · "
+              f"운행 {stats['moving']}대 · 통과 +{stats['rows']} "
+              f"(누적 {written:,}) · 예약 {snap['queued']} · "
+              f"in-flight 합계 {snap['inflight']}/{snap['limit']*len(keys)}"
+              f"(키당 {snap['limit']})"
+              + (f" · 쿼터차단 {snap['quotaBlocked']}키"
+                 if snap["quotaBlocked"] else "")
               + (f" · {mem:.0f}MB" if mem else "")
-              + (f" · 재시도 {len(failed)}→회복 {rec}" if failed else ""), flush=True)
-        if errs:
-            # 재시도로 회복 못 한 것만 여기 온다 — 이 줄은 server.log 에도 남으므로
-            # (⚠️ 표식) 원인을 자르지 않고 전부 기록한다. 회복된 재시도는 위
-            # 사이클 줄(콘솔 전용)에만 나온다.
-            detail = " ".join(f"{k}×{v}" for k, v in sorted(errs.items(), key=lambda x: -x[1]))
-            print(f"[{cyc_obs:%H:%M:%S}] ⚠️ 실패 {nerr}/{len(picked)} (재시도 후) — {detail}", flush=True)
-        if cyc % 20 == 0:
-            detail = " ".join(f"{kid}={read_calls(qday,kid):,}/{key_cap:,}" for kid, _ in keys)
-            print(f"[{cyc_obs:%H:%M:%S}] 콜 {detail}", flush=True)
+              + (f" · 재시도 {stats['retried']}→회복 {recovered}"
+                 if stats["retried"] else ""), flush=True)
+        if stats["final"]:
+            detail = " ".join(
+                f"{err}×{n}" for err, n in
+                sorted(stats["final"].items(), key=lambda x: -x[1]))
+            print(f"[{report_obs:%H:%M:%S}] ⚠️ 실패 "
+                  f"{stats['residual']}/{stats['attempted']} — {detail}",
+                  flush=True)
+        if report_no % 20 == 0:
+            detail = " ".join(
+                f"{kid}={read_calls(report_day,kid):,}/{key_cap:,}"
+                for kid, _ in keys)
+            print(f"[{report_obs:%H:%M:%S}] 콜 {detail}", flush=True)
 
-        # ★ 다음 사이클 in-flight 조절 (AIMD). code99 는 세션 30 초과라 곧장 물러나고
-        #   (×0.6), 깨끗하면 천천히 차오른다(+2). errs 에 잔여 code99 가 없어도 이번
-        #   사이클에서 code99 를 겪었을 수 있으므로 원본 results 로 판단한다.
-        saw99 = initial_saw99 or any("code99" in (err or "") for _, _, err, _ in results)
-        prev_inflight = inflight
-        inflight = next_inflight(inflight, inflight_max, saw99)
-        if inflight != prev_inflight:
-            print(f"[{cyc_obs:%H:%M:%S}] in-flight {prev_inflight}→{inflight} "
+        # 빈 창·자정 직후의 짧은 부분 창을 '깨끗한 성공'으로 보아 동시성을 올리지
+        # 않는다. 정상 패널의 1/4 이상 결과가 있어야 AIMD가 판단한다.
+        minimum_samples = max(1, len(picked) // 4)
+        saw99 = any("code99" in err for err in all_errors)
+        old_limit = dispatcher.inflight_limit
+        new_limit = next_inflight(
+            old_limit, inflight_max, saw99, stats["attempted"], minimum_samples)
+        dispatcher.set_inflight_limit(new_limit)
+        if new_limit != old_limit:
+            print(f"[{report_obs:%H:%M:%S}] in-flight "
+                  f"{old_limit}→{new_limit} "
                   f"({'code99 후퇴' if saw99 else '회복'})", flush=True)
 
-        # 지터는 max 안에. 밖에 두면 took > interval 일 때 음수가 되어 죽는다.
-        time.sleep(max(1.0, interval - took + random.uniform(-2, 2)))
+        stats = blank_stats()
+        report_started = time.monotonic()
+        report_at = next_deadline
+
+    print(f"[{now():%H:%M:%S}] 연속 수집 시작 · 노선별 {interval}초 · 목표 {target}샘플 · "
+          f"밴드 {nb}개 · 최대 {effective_maxr}노선 · "
+          f"키 {len(keys)}개({', '.join(nm for nm, _ in keys)}) · "
+          f"키당 상한 {key_cap:,} (오늘 합계 {read_calls(quota_day(now())):,} 사용)", flush=True)
+
+    try:
+        while True:
+            t = now()
+            d, qday = service_day(t), quota_day(t)
+            dispatcher.raise_if_failed()
+
+            if qday != stats_qday:
+                # 쿼터는 00:00 달력일 기준이다. 전날 건강 통계를 먼저 닫아 새 날과
+                # 섞지 않고, cap으로 멈춘 키는 60초 타이머를 기다리지 않고 즉시 푼다.
+                mono = time.monotonic()
+                report_window(
+                    stats_qday, picked_band if picked_band is not None
+                    else O.band_of(t, bands),
+                    mono - report_started, mono + interval)
+                blocked = dispatcher.reset_quota_blocks()
+                old_limit = dispatcher.inflight_limit
+                new_limit = midnight_inflight(old_limit, blocked > 0)
+                if new_limit != old_limit:
+                    dispatcher.set_inflight_limit(new_limit)
+                print(f"[{t:%H:%M:%S}] 쿼터 날짜 전환 {stats_qday} → {qday} · "
+                      f"차단 해제 {blocked}키"
+                      + (f" · in-flight {old_limit}→{new_limit}"
+                         if new_limit != old_limit else ""), flush=True)
+                stats_qday = qday
+
+            mono = time.monotonic()
+            if counter_check_due(qday, counter_day, mono, next_counter_check):
+                ensure_key_counters(keys, qday)
+                counter_day = qday
+                next_counter_check = mono + COUNTER_CHECK_SEC
+            if d != day:
+                # 04시는 데이터 운행일만 바뀐다. data.go.kr 쿼터와 AIMD는 자정
+                # 기준이므로 여기서 선예약·in-flight를 초기화하지 않는다.
+                print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d}", flush=True)
+                day, last, written, picked = d, {}, 0, []
+                next_repick = 0
+                conn.execute("UPDATE route SET emptyStreak = 0")
+                conn.commit()
+                with LOCK:
+                    STATE["errLog"] = []
+
+            due = O.rotate_due(rotated_day, t)
+            if due:
+                rotated_day = due
+                __import__("threading").Thread(
+                    target=O.rotate_jsonl, args=("bus",), daemon=True).start()
+
+            if not O.in_window(t, window):
+                if picked:
+                    picked = []
+                    dispatcher.set_routes([])
+                report_waiting = True
+                with LOCK:
+                    STATE["night"] = True
+                time.sleep(1)
+                continue
+
+            if report_waiting:
+                # 대기 시간을 첫 건강 창 duration에 포함하지 않는다. 대기 직전의
+                # 부분 통계도 새 정상 창과 섞지 않는다.
+                stats = blank_stats()
+                report_started = time.monotonic()
+                report_at = report_started + interval
+                report_waiting = False
+
+            cur_band = O.band_of(t, bands)
+            band_changed = picked and cur_band != picked_band
+            mono = time.monotonic()
+            # 기존 REPICK_EVERY(40창≈21분)를 시간 기준으로 보존한다.
+            # 독립 스케줄러에는 전역 사이클 번호가 없으므로 벽시계가 더 정확하다.
+            if not picked or band_changed or mono >= next_repick:
+                picked = O.pick_routes(conn, effective_maxr, target, nb, t=t)
+                picked_band = cur_band
+                next_repick = mono + REPICK_EVERY * interval
+                dispatcher.set_routes(picked)
+                if not picked:
+                    report_waiting = True
+                    pool = conn.execute("SELECT COUNT(*) FROM route").fetchone()[0]
+                    msg = ("❌ 노선 풀이 비어 있다 — 먼저 `python3 fetch_routes.py`"
+                           if pool == 0 else f"폴링할 노선 없음 (풀 {pool:,})")
+                    print(f"[{t:%H:%M:%S}] {msg}", flush=True)
+                    time.sleep(10)
+                    continue
+                print(f"[{t:%H:%M:%S}] 노선 재선정: {len(picked)}개 "
+                      f"(충전율 {picked[0]['fill']*100:.1f}% ~ "
+                      f"{picked[-1]['fill']*100:.1f}%) · "
+                      f"{interval}초에 균등 배치", flush=True)
+
+            first = dispatcher.get(timeout=0.5)
+            events = dispatcher.drain(first)
+            if events:
+                # 연속 도착을 건별 커밋하면 작은 EC2에서 WAL fsync가 초당 여러 번
+                # 발생한다. 네트워크 스케줄과 obs 시각은 그대로 두고 최대 0.5초치만
+                # 모아 SQLite·JSONL을 한 번에 반영한다.
+                batch_until = min(report_at, time.monotonic() + 0.5)
+                while len(events) < 256:
+                    wait = batch_until - time.monotonic()
+                    if wait <= 0:
+                        break
+                    event = dispatcher.get(timeout=wait)
+                    if event is None:
+                        break
+                    events.extend(dispatcher.drain(event, 256 - len(events)))
+            if events:
+                rows, bumps = [], []
+                for event in events:
+                    routeid, items, err, obs = event["result"]
+                    stats["attempted"] += 1
+                    stats["retried"] += int(event["retried"])
+                    stats["errors"] += event["errors"]
+                    if err:
+                        stats["residual"] += 1
+                        stats["final"][err] = stats["final"].get(err, 0) + 1
+                        continue
+                    stats["successful"] += 1
+                    band = O.band_of(obs, bands)
+                    dtype = O.day_type(obs)
+                    hol = O.is_holiday(obs)
+                    O.mark_empty(conn, routeid, not items)
+                    stats["moving"] += len(items)
+                    if band is not None and not hol:
+                        O.mark_service(
+                            conn, routeid, band, dtype, service_day(obs), bool(items))
+                    for bus in items:
+                        v, ordv = bus.get("vehicleno"), bus.get("nodeord")
+                        try:
+                            ordv = int(ordv)
+                        except (TypeError, ValueError):
+                            continue
+                        if not v:
+                            continue
+                        vk = (routeid, v)
+                        prev = last.get(vk)
+                        nodeid = bus.get("nodeid")
+                        version = route_versions.get(routeid)
+                        last[vk] = (ordv, obs, nodeid, version)
+                        if prev is None or ordv <= prev[0]:
+                            continue
+                        if (obs - prev[1]).total_seconds() > interval * 4:
+                            continue
+                        row = {
+                            "t": obs.isoformat(), "t_prev": prev[1].isoformat(),
+                            "routeid": routeid, "vehicleno": v,
+                            "from_ord": prev[0], "to_ord": ordv,
+                            "from_nodeid": prev[2], "to_nodeid": nodeid,
+                            "nodeid": nodeid, "route_version": version or prev[3],
+                            "band": band, "daytype": dtype,
+                        }
+                        rows.append(row)
+                        if band is not None and not hol:
+                            sday = service_day(obs)
+                            quality = O.transition_quality(
+                                prev[1], obs, prev[0], ordv, bands)
+                            if quality == "exact":
+                                bumps.append(
+                                    (routeid, prev[0], ordv, band, dtype, sday))
+                            else:
+                                if quality == "skipped":
+                                    quality = ("censored" if ordv-prev[0] <= 3
+                                               else "implausible")
+                                O.bump_span(
+                                    conn, routeid, prev[0], ordv, band, dtype,
+                                    sday, quality, (obs-prev[1]).total_seconds())
+
+                if rows:
+                    by_day = {}
+                    for row in rows:
+                        rt = datetime.fromisoformat(row["t"])
+                        by_day.setdefault(service_day(rt), []).append(row)
+                    for row_day, day_rows in by_day.items():
+                        path = os.path.join(O.DATA, f"bus-{row_day}.jsonl")
+                        with open(path, "a", encoding="utf-8") as f:
+                            for row in day_rows:
+                                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    written += len(rows)
+                    stats["rows"] += len(rows)
+                for bump_args in bumps:
+                    O.bump(conn, *bump_args)
+                    O.mark_included_direct(conn, *bump_args[:5])
+                conn.commit()  # 네트워크 worker는 DB에 접근하지 않는다
+
+            if time.monotonic() < report_at:
+                continue
+
+            # 처리 시간이 길어도 밀린 보고를 연속 출력하지 않는다.
+            mono = time.monotonic()
+            report_window(
+                stats_qday, cur_band, mono - report_started,
+                max(report_at + interval, mono + 0.1))
+    finally:
+        dispatcher.close()
 
 
 if __name__ == "__main__":
