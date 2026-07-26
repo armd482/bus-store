@@ -813,10 +813,13 @@ function renderSubway(d){
   // §8 #1 판정 결과 — 공식 시각표 대조(judge_subway). 존폐 항목이었고 통과했다.
   const jg = sub.judged;
   if(jg && jg.done){
-    const VM={cliff:'✅절벽신뢰',buffer:'⚠️완충필요',none:'❌무의미'};
+    // ⚠️ 세 등급 모두 σ/H<0.3 이면 '절벽 성립'(통과)이다 — buffer 는 실패가 아니라
+    //    '절벽 유효 + §6.6 안전마진 권장'(§8.1③ 중간 등급). 경고(⚠️)로 칠하지 않는다.
+    //    cliff(≤0.05)=마진도 불필요 · buffer(<0.3)=마진 권장 · none(≥0.3)=절벽 무의미(진짜 경고).
+    const VM={cliff:'✅ 절벽 성립(견고)',buffer:'✅ 절벽 성립(마진 권장)',none:'❌ 절벽 무의미'};
     let rows='';
     for(const L of (jg.lines||[])){
-      const cls = L.verdict==='none'?'bad':L.verdict==='cliff'?'ok':'';
+      const cls = L.verdict==='none'?'bad':'ok';   // 성립(cliff·buffer)=초록, 무의미만 빨강
       rows += `<tr><td>${L.name}</td>`
         + `<td class=n style="opacity:.7">${num(L.matched)}</td>`
         + `<td class=n>${L.sigmaInSec}s</td>`
@@ -832,9 +835,11 @@ function renderSubway(d){
       지하철엔 적용 안 됨 → <b>절벽 성립, 차별점 유효.</b></div>
       <table style="margin-top:8px"><tr style="opacity:.5"><td>노선</td><td class=n>매칭</td>
       <td class=n>σ역내</td><td class=n>배차H</td><td class=n>σ/H</td><td>판정</td></tr>${rows}</table>
-      <div class=sub style="margin-top:4px">σ역내 = 역별 offset(수신지연) 뺀 시각표 준수도(초).
-      σ원시엔 recptnDt 수신지연이 섞여 더 크다. §8.3 도착대용으로 놓친 도착을 회수해 판정.
-      ⚠️ 신분당선은 recptnDt 예측성(§8.1 ⑤ 가)이라 σ가 크게 잡힌다.</div></div>`;
+      <div class=sub style="margin-top:4px"><b>판정 읽는 법</b>: σ/H&lt;0.3 이면 모두 <b>절벽 성립(통과)</b>이다
+      — '마진 권장'은 실패가 아니라 §6.6 안전마진을 얹으라는 정상 등급(§8.1③). σ/H≥0.3(무의미)만 실제 경고.
+      σ역내 = 역별 offset(수신지연) 뺀 시각표 준수도(초); σ원시엔 recptnDt 수신지연이 섞여 더 크다.
+      §8.3 도착대용으로 놓친 도착 회수. 미매칭%는 오류가 아니라 정시성 신호 자체(§8.1①) — 낮을수록 정확.
+      ⚠️ 신분당선은 recptnDt 예측성(§8.1 ⑤ 가)이라 σ·미매칭이 크게 잡힌다.</div></div>`;
   } else if(jg && jg.done===false){
     h += `<div class=card style="margin:12px 0;border-left:3px solid #f59e0b;background:#f59e0b11">
       <div class=k>§8 #1 지하철 정시성 — 판정 스냅샷 없음</div>
