@@ -214,6 +214,43 @@ def parse_xlsx(path, line):
     return out
 
 
+GTXA_STATIONS = {"운정중앙", "킨텍스", "대곡", "연신내", "서울역",
+                 "수서", "성남", "구성", "동탄"}
+
+
+def parse_gtxa(path, line="GTX-A", daytype="평일"):
+    """GTX-A 시각표(운영사 사이트가 JS 로딩이라 붙여넣은 텍스트) → 정규화 레코드.
+
+    포맷: 역명 줄 + 시각 줄. 각 시각 줄은 탭 구분 `<상행 분들> <시(hour)> <하행 분들>`
+    (종착역은 한쪽만) — **시 앞의 분=상행(운정중앙/수서 방면), 뒤=하행(서울/동탄 방면)**.
+    ✅ jsonl GTX-A 도 상행/하행·같은 역명이라 그대로 조인된다. '첫차/막차' 마커는 무시.
+    ⚠️ 붙여준 표는 평일 기준으로 본다(주말표는 미제공 — 주말 obs 는 미매칭으로 남음).
+    """
+    out = []
+    station = None
+    for raw in open(path, encoding="utf-8"):
+        s = raw.rstrip("\n")
+        if s.strip() in GTXA_STATIONS:
+            station = s.strip()
+            continue
+        if station is None or "분" not in s:
+            continue
+        fields = s.split("\t")
+        hi = next((i for i, f in enumerate(fields) if re.fullmatch(r"\d{1,2}", f.strip())), None)
+        if hi is None:
+            continue
+        hour = int(fields[hi].strip())
+        for i, f in enumerate(fields):
+            if i == hi:
+                continue
+            direction = "상행" if i < hi else "하행"
+            for mm in re.findall(r"(\d{1,2})분", f):
+                out.append({"line": line, "station": station, "daytype": daytype,
+                            "direction": direction, "updn": None,
+                            "h": hour, "m": int(mm), "dest": None})
+    return out
+
+
 def parse_stcs(csv_path):
     """서울교통공사 15098251 CSV → 정규화 레코드 (1~9호선).
 

@@ -4,10 +4,10 @@
  "span": "2026-07-18~2026-07-25",
  "days": 8,
  "signalMin": 1.5,
- "linesJudged": 14,
+ "linesJudged": 15,
  "belowSignalLines": 7,
- "medRatio": 0.182,
- "sigmaMinMed": 1.49,
+ "medRatio": 0.19,
+ "sigmaMinMed": 1.54,
  "lines": [
   {
    "name": "1호선",
@@ -175,6 +175,18 @@
    "sigmaInMin": 2.88,
    "headwayMin": 25.0,
    "ratio": 0.115,
+   "verdict": "buffer"
+  },
+  {
+   "name": "GTX-A",
+   "matched": 11099,
+   "unmatchedPct": 0.362,
+   "biasSec": 5,
+   "sigmaRawSec": 144,
+   "sigmaInSec": 143,
+   "sigmaInMin": 2.38,
+   "headwayMin": 8.0,
+   "ratio": 0.298,
    "verdict": "buffer"
   }
  ],
