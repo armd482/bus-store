@@ -23,6 +23,7 @@
   python3 seoul_collector.py            # 수집
   python3 seoul_collector.py --routes   # 노선 목록만 갱신하고 종료
 """
+import glob
 import json
 import os
 import random
@@ -215,6 +216,44 @@ def save_failures(day, failures):
     os.replace(tmp, failures_path(day))
 
 
+def cleanup_state_files(t):
+    """재시작 복원에 필요한 현재 서울 장부만 남긴다.
+
+    calls는 data.go.kr 쿼터와 같은 달력일(00시 경계), done/failures는 JSONL과
+    같은 운행일(04시 경계)이다. 00~04시에는 둘의 날짜가 다르므로 단순히 가장
+    최근 파일 하나를 남기면 안 된다. 각 기준의 현재 파일을 정확히 하나씩 보존한다.
+    과거 장부는 원본 데이터도 rebuild 입력도 아니어서 삭제해도 수집 결과가 줄지 않는다.
+    """
+    service_day_now = service_day(t)
+    keep = {
+        os.path.abspath(calls_path(quota_day(t))),
+        os.path.abspath(done_path(service_day_now)),
+        os.path.abspath(failures_path(service_day_now)),
+    }
+    patterns = (
+        os.path.join(O.DATA, "seoul-calls-*.txt"),
+        os.path.join(O.DATA, "seoul-done-*.json"),
+        os.path.join(O.DATA, ".seoul-failures-*.json"),
+    )
+    removed = []
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            if os.path.abspath(path) in keep:
+                continue
+            try:
+                os.remove(path)
+                removed.append(os.path.basename(path))
+            except OSError as e:
+                # 상태 정리 실패가 수집 중단으로 번지면 안 된다. 다음 날짜 경계나
+                # 재시작 때 다시 시도할 수 있도록 로그만 남긴다.
+                print(f"[상태 정리] ⚠️ {os.path.basename(path)} 삭제 실패: {e}",
+                      flush=True)
+    if removed:
+        print(f"[상태 정리] 과거 서울 장부 {len(removed)}개 삭제: "
+              + ", ".join(sorted(removed)), flush=True)
+    return removed
+
+
 def main():
     key = load_key()
     if not key:
@@ -235,7 +274,10 @@ def main():
         tp_n[v["tp"]] = tp_n.get(v["tp"], 0) + 1
     print("  " + " · ".join(f"{TYPE_NM.get(k, k)}{v}" for k, v in sorted(tp_n.items())), flush=True)
 
-    day = service_day(now())
+    started_at = now()
+    day = service_day(started_at)
+    cleanup_state_files(started_at)
+    state_days = (quota_day(started_at), day)
     done = load_done(day)   # (band, routeid) -> **성공**만. 재시작해도 이어간다
     fails = {}              # (band, routeid) -> 연속 실패 횟수 (메모리 — 재시작 시 새 시도)
     fail_log = load_failures(day)
@@ -248,6 +290,10 @@ def main():
     while True:
         t = now()
         d = service_day(t)
+        current_state_days = (quota_day(t), d)
+        if current_state_days != state_days:
+            cleanup_state_files(t)
+            state_days = current_state_days
         if d != day:
             print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d} (전일 {written:,}행)", flush=True)
             # ⚠️ fails 도 반드시 초기화 — 전날 MAX_TRIES 실패한 (밴드,노선)이 남으면
