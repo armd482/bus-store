@@ -51,7 +51,7 @@ class RollingDispatcher:
         self._stop = threading.Event()
         self._seq = 0
         self._fatal = None
-        # maxInflight는 키별 상한이다. 두 키를 동시에 담을 수 있게 풀만 넉넉히 둔다.
+        # maxInflight는 키별 상한이다. 활성 키를 동시에 담을 수 있게 풀만 넉넉히 둔다.
         self._executor = ThreadPoolExecutor(
             max_workers=max(workers, max_inflight) * max(1, len(keys)))
         self._thread = threading.Thread(

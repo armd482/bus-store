@@ -60,6 +60,34 @@ class EnvConfigTests(unittest.TestCase):
             self.assertIsNone(bus_collector._load_key("GBIS_BUS_KEY2"))
             get.assert_called_once_with("GBIS_BUS_KEY2", None)
 
+    def test_duplicate_actual_bus_key_is_activated_once(self):
+        values = {"GBIS_BUS_KEY": "first", "GBIS_BUS_KEY2": "first",
+                  "GBIS_BUS_KEY3": "third"}
+        with patch.object(
+            bus_collector.O, "cfg",
+            return_value={"busKeys": list(values)}
+        ), patch.object(
+            bus_collector, "_load_key", side_effect=values.get
+        ), patch("builtins.print") as log:
+            self.assertEqual(
+                bus_collector.load_keys(),
+                [("GBIS_BUS_KEY", "first"), ("GBIS_BUS_KEY3", "third")],
+            )
+        log.assert_called_once()
+        self.assertIn("중복 제외", log.call_args.args[0])
+
+    def test_missing_configured_bus_key_is_skipped(self):
+        values = {"GBIS_BUS_KEY": "first", "GBIS_BUS_KEY2": None,
+                  "GBIS_BUS_KEY3": "third"}
+        with patch.object(
+            bus_collector.O, "cfg",
+            return_value={"busKeys": list(values)}
+        ), patch.object(bus_collector, "_load_key", side_effect=values.get):
+            self.assertEqual(
+                bus_collector.load_keys(),
+                [("GBIS_BUS_KEY", "first"), ("GBIS_BUS_KEY3", "third")],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

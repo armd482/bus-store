@@ -63,10 +63,25 @@ def load_keys():
     IP 에서 키1·키2 를 나란히 던져 처리량 2.16배, 키2 는 429 0건). 두 키를 쓰면
     같은 IP 로도 동시 세션 60·처리량 2배 → 커버 속도 2배, 수집 기간 절반.
     쿼터도 계정마다 별개라 두 배가 된다.
+
+    환경변수 이름만 다르고 실제 키 값이 같으면 독립 계정이 아니다. 그대로 두 키로
+    세면 같은 세션 풀에 동시 요청을 더 넣고 쿼터 장부만 나눠 code99·하드캡 초과를
+    부를 수 있으므로, 실제 값 중복은 첫 번째 하나만 활성화한다.
     """
     names = O.cfg().get("busKeys") or ["GBIS_BUS_KEY"]
-    out = [(nm, _load_key(nm)) for nm in names]
-    return [(nm, k) for nm, k in out if k]
+    out = []
+    seen = {}
+    for name in names:
+        key = _load_key(name)
+        if not key:
+            continue
+        if key in seen:
+            print(f"[키 설정] ⚠️ {name}은 {seen[key]}과 같은 실제 키 — 중복 제외",
+                  flush=True)
+            continue
+        seen[key] = name
+        out.append((name, key))
+    return out
 
 
 def now():
@@ -221,7 +236,7 @@ def fetch(key, city, routeid):
         with urllib.request.urlopen(f"{BASE}?{q}", timeout=15) as r:
             d = json.loads(r.read().decode())
         obs = now()   # ★ 응답 수신 **직후** = 이 노선의 실제 관측시각.
-        # ⚠️ 사이클 끝 시각 하나를 340노선에 다 찍으면 첫 노선은 최대 ~40s(사이클 길이)
+        # ⚠️ 사이클 끝 시각 하나를 전 노선에 다 찍으면 첫 노선은 최대 한 사이클만큼
         #    늦게 찍힌다 — 통과구간 (t_prev,t]·기점 출발시각·시각표 분석이 그만큼 왜곡된다.
         h = d.get("response", {}).get("header", {})
         code = str(h.get("resultCode", "?"))
