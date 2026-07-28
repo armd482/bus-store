@@ -51,6 +51,20 @@ STATE = {
 LOCK = threading.Lock()
 
 
+def live_snapshot():
+    """SQLite 집계와 무관한 수집기 실시간 상태.
+
+    무거운 dashboard snapshot 캐시가 늦어져도 마지막 관측 시각이 함께 낡지 않도록
+    별도 경량 API에서 사용한다. 중첩 컨테이너는 수집 스레드와 직렬화가 경합하지
+    않게 복사한다.
+    """
+    with LOCK:
+        state = dict(STATE)
+        state["errors"] = dict(STATE["errors"])
+        state["errLog"] = list(STATE.get("errLog", []))
+    return {"now": time.time(), "state": state}
+
+
 AVG_ROW_BYTES = 222  # 슬림 형식 행 평균 (✅ 실측) — 행 수 추정용
 
 DAYS7 = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")  # 버스·지하철 공통 요일 7종
@@ -636,7 +650,8 @@ const pctFine = x => x>0 && x<0.001 ? (x*100).toFixed(3)+'%' : pct(x);
 const num = x => (x||0).toLocaleString();
 function bar(p, cls){ return `<div class=bar><div class="fill ${cls||''}" style="width:${Math.min(100,p*100)}%"></div></div>`; }
 
-let S = null, tab = 'bus', lineTab = '__all__';  // S: 최근 /api · tab: 상단 탭 · lineTab: 지하철 노선 탭
+let S = null, LIVE = null, liveReceivedAt = 0;
+let tab = 'bus', lineTab = '__all__';  // S: 최근 /api · LIVE: 경량 실시간 상태
 window.setTab = (t) => { tab = t; render(); };
 window.setLineTab = (t) => { lineTab = t; render(); };
 
@@ -644,10 +659,29 @@ async function tick(){
   // ⚠️ 요청 완료 후 다음을 예약한다 (setInterval 금지) — /api 가 느릴 때
   //    앞 요청이 끝나기 전에 다음이 겹쳐 서버 스레드가 쌓이는 걸 막는다.
   try {
-    S = await (await fetch('/api')).json();
+    S = await (await fetch('/api', {cache:'no-store'})).json();
+    if(LIVE && LIVE.state) S.state = LIVE.state;
     if(!S.warming) render();
   } catch(e) { /* 일시적 실패는 다음 tick 에 회복 */ }
   setTimeout(tick, 5000);
+}
+
+async function tickLive(){
+  // SQLite를 읽지 않는 메모리 상태만 짧게 폴링한다. 수신 시각을 같이 저장해
+  // 브라우저와 EC2 시계 차이가 있어도 마지막 관측 경과 시간이 정확하게 흐른다.
+  try {
+    LIVE = await (await fetch('/api/live', {cache:'no-store'})).json();
+    liveReceivedAt = Date.now()/1000;
+    if(S && LIVE.state){
+      S.state = LIVE.state;
+      paintObs();
+    }
+  } catch(e) { /* 다음 경량 tick 에 회복 */ }
+  setTimeout(tickLive, 2000);
+}
+
+function dashboardNow(){
+  return LIVE && LIVE.now ? LIVE.now + (Date.now()/1000-liveReceivedAt) : Date.now()/1000;
 }
 
 function render(){
@@ -655,7 +689,7 @@ function render(){
   // 헤더는 **세 수집기 공통** — 어느 하나가 멈추면 탭을 안 열어도 보이게.
   // 경기 전용 규모(노선·구간·목표셀)는 그 탭 안으로 옮겼다. 탭이 셋이 된 뒤로
   // 전역 헤더가 경기 것만 이고 있으면 다른 탭에서 틀린 맥락을 준다.
-  const now = Date.now()/1000;
+  const now = dashboardNow();
   const dot = (ok, label) => `<span class=${ok?'ok':'bad'}>●</span> ${label}`;
   const sub = d.subway || {}, seo = d.seoul || {};
   const parts = [dot(d.state.lastObs && now - d.state.lastObs < 180, '경기')];
@@ -1083,7 +1117,7 @@ function paintObs(){
   const el = document.getElementById('lastobs');
   if(el){
     const s = S.state;
-    const secs = s.lastObs ? Math.round(Date.now()/1000 - s.lastObs) : null;
+    const secs = s.lastObs ? Math.round(dashboardNow() - s.lastObs) : null;
     el.className = 'v ' + (secs != null && secs < 180 ? 'ok' : 'bad');
     el.innerHTML = (secs != null ? secs + '초 전' : '—')
       + (s.fetching ? ' <span class=tag style="background:#3b82f622;color:#3b82f6">데이터 요청 중</span>' : '');
@@ -1092,7 +1126,7 @@ function paintObs(){
   const se = document.getElementById('sublastobs');
   if(se && S.subway){
     const sub = S.subway;
-    const secs = sub.lastObs ? Math.round(Date.now()/1000 - sub.lastObs) : null;
+    const secs = sub.lastObs ? Math.round(dashboardNow() - sub.lastObs) : null;
     const alive = secs != null && secs < 300;
     se.className = 'v ' + (alive ? 'ok' : (sub.inService ? 'bad' : ''));
     se.textContent = secs != null ? secs + '초 전' : '—';
@@ -1101,19 +1135,23 @@ function paintObs(){
   // (버스 180s · 지하철 300s 와 다른 이유. 밴드를 다 찍으면 다음 밴드까지 쉰다).
   const qe = document.getElementById('seoullastobs');
   if(qe && S.seoul && S.seoul.present){
-    const secs = S.seoul.lastObs ? Math.round(Date.now()/1000 - S.seoul.lastObs) : null;
+    const secs = S.seoul.lastObs ? Math.round(dashboardNow() - S.seoul.lastObs) : null;
     qe.className = 'v ' + (secs != null && secs < 600 ? 'ok' : '');
     qe.textContent = secs != null ? secs + '초 전' : '—';
   }
 }
-tick(); setInterval(paintObs, 1000);   // tick 은 스스로 setTimeout 으로 재예약
+tick(); tickLive(); setInterval(paintObs, 1000);  // API tick 은 완료 후 스스로 재예약
 </script>
 """
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/api"):
+        path = self.path.split("?", 1)[0]
+        if path == "/api/live":
+            body = json.dumps(live_snapshot(), ensure_ascii=False).encode()
+            ct = "application/json; charset=utf-8"
+        elif path == "/api":
             with _SNAP_LOCK:                 # 캐시만 즉시 반환 — 계산은 백그라운드
                 body = _SNAP["data"]
             ct = "application/json; charset=utf-8"
@@ -1125,6 +1163,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", ct)
+        if path.startswith("/api"):
+            self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
