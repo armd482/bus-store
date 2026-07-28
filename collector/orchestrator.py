@@ -39,7 +39,9 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import holidays as H   # 공휴일 자동 조회 (대체·임시공휴일 포함) — 목록을 박지 않는다
@@ -63,6 +65,14 @@ CONFIG = os.path.join(HERE, "config.json")
 
 
 _CFG = {"at": None, "v": None}
+
+# 세 수집기는 서로 다른 프로세스로 실행된다. 매일 06시에 동시에 rclone copy를
+# 시작하면 큰 버스 백업이 작은 지하철·서울 백업과 대역폭을 나누다가 종전 180초
+# 제한에 걸릴 수 있다. 프로세스 간 파일 잠금으로 rclone 명령만 직렬화한다.
+RCLONE_TIMEOUT_SEC = 600
+RCLONE_COPY_ATTEMPTS = 3
+RCLONE_RETRY_DELAYS = (15, 60)
+_RCLONE_FALLBACK_LOCK = threading.Lock()
 
 
 def cfg():
@@ -330,15 +340,80 @@ def connect(check_same_thread=True):
     return c
 
 
-def _rclone(args):
-    """rclone 호출 → (성공?, stdout). rclone 이 없거나 실패하면 (False, "")."""
+@contextmanager
+def _rclone_serialized():
+    """세 수집 프로세스의 rclone 실행을 하나씩 통과시킨다.
+
+    POSIX flock은 프로세스 종료 시 커널이 자동 해제한다. Windows도 잠근 1바이트를
+    프로세스 종료 시 해제하므로, lock 디렉터리 방식처럼 크래시 뒤 찌꺼기가 남지
+    않는다. 지원하지 않는 플랫폼에서는 적어도 같은 프로세스의 스레드는 막는다.
+    """
+    os.makedirs(DATA, exist_ok=True)
+    lock_path = os.path.join(DATA, ".rclone-upload.lock")
+    with open(lock_path, "a+b") as lock_file:
+        if os.name == "posix":
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            return
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            while True:
+                lock_file.seek(0)
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.2)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        with _RCLONE_FALLBACK_LOCK:
+            yield
+
+
+def _rclone(args, attempts=1, timeout=RCLONE_TIMEOUT_SEC):
+    """rclone 호출 → (성공?, stdout).
+
+    각 시도만 직렬화하고 백오프 중에는 잠금을 놓는다. 큰 파일 하나가 실패해
+    재시도하는 동안 작은 백업들이 잠금 뒤에서 불필요하게 기다리지 않게 하기 위함이다.
+    """
     import subprocess
-    try:
-        r = subprocess.run(["rclone"] + args, capture_output=True, text=True, timeout=180)
-        return r.returncode == 0, r.stdout
-    except Exception as e:
-        print(f"[rclone] {' '.join(args)} 실패: {e}", flush=True)
-        return False, ""
+    attempts = max(1, int(attempts))
+    last_out = ""
+    for attempt in range(1, attempts + 1):
+        detail = ""
+        try:
+            with _rclone_serialized():
+                r = subprocess.run(
+                    ["rclone"] + args, capture_output=True, text=True, timeout=timeout)
+            last_out = r.stdout or ""
+            if r.returncode == 0:
+                if attempt > 1:
+                    print(f"[rclone] {' '.join(args)} 재시도 {attempt}/{attempts} 성공",
+                          flush=True)
+                return True, last_out
+            detail = (r.stderr or "").strip() or f"exit {r.returncode}"
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}"
+
+        print(f"[rclone] {' '.join(args)} 실패 {attempt}/{attempts}: {detail}",
+              flush=True)
+        if attempt < attempts:
+            delay = RCLONE_RETRY_DELAYS[min(attempt - 1, len(RCLONE_RETRY_DELAYS) - 1)]
+            print(f"[rclone] {delay}초 후 재시도", flush=True)
+            time.sleep(delay)
+    return False, last_out
 
 
 def _backup_verified(name, local_gz, remote):
@@ -354,7 +429,8 @@ def _backup_verified(name, local_gz, remote):
     ok, out = _rclone(["lsf", remote, "--include", name])
     if ok and name in out:
         return True
-    _rclone(["copy", local_gz, remote])            # 없으면 재업로드 시도
+    _rclone(["copy", local_gz, remote],
+            attempts=RCLONE_COPY_ATTEMPTS)         # 없으면 제한적으로 재업로드
     ok, out = _rclone(["lsf", remote, "--include", name])
     return ok and name in out
 
@@ -430,7 +506,8 @@ def rotate_jsonl(prefix):
                 print(f"[백업] ⚠️ {name} 실패 (원본 보존): {e}", flush=True)
                 continue
         if remote:
-            _rclone(["copy", dst, remote])             # 백업 직후 즉시 업로드 시도
+            _rclone(["copy", dst, remote],
+                    attempts=RCLONE_COPY_ATTEMPTS)     # 백업 직후 즉시 업로드 시도
         # ② 삭제는 그저께 이전만 — 어제는 원본 유지(ETA)
         if day >= yest:
             continue
