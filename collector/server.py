@@ -856,6 +856,11 @@ function renderSeoul(d){
   h += '<div class=sub style="margin-top:6px">밴드마다 전 노선을 한 번씩 찍으면 100%. '
      + '⚠️ 이건 <b>관측이 아니라 운영사 예측</b>이라(신분당선 recptnDt 와 같은 성격, §8.1 ⑤ 가) '
      + '정시성 판정엔 쓰지 않는다. CV 는 다음 2대의 현재 위치 기반이라 예측 오염이 상대적으로 작다.</div>';
+  h += '<div class=sub style="margin-top:12px;padding-top:10px;border-top:1px solid #8883">'
+     + '데이터 출처: <a href="https://www.data.go.kr/data/15000314/openapi.do" target="_blank" rel="noreferrer">'
+     + '서울특별시 「서울특별시_버스도착정보조회 서비스」</a> · '
+     + '<a href="https://www.kogl.or.kr/info/license.do" target="_blank" rel="noreferrer">'
+     + '공공누리 제1유형(출처표시)</a> · 제3자 권리 포함</div>';
   return h;
 }
 
