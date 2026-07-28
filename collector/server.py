@@ -14,6 +14,7 @@
 """
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -92,6 +93,72 @@ def load_judged():
             return json.load(f)
     except (OSError, ValueError):
         return {"done": False}
+
+
+def subway_collection_status(now=None):
+    """지하철 핵심 판정 이후의 선택적 '요일별 3회' 수집 상태.
+
+    subway_cell은 trainNo churn 때문에 분모가 계속 생겨 종료 달력으로 쓰기 어렵다.
+    대신 실제 원본 파일의 운행일을 센다. 현재 운행일 파일은 아직 쓰는 중이므로
+    완료일에는 넣지 않고, 다음 04시가 지나야 그 요일 1회로 확정한다.
+    """
+    now = now or datetime.now(O.KST)
+    active_day = O.service_day_of(now).date()
+    target = O.cfg().get("subwayTarget", 3)
+    roots = [O.DATA]
+    export_dir = O.cfg().get("exportDir")
+    if export_dir:
+        roots.append(export_dir)
+
+    observed = set()
+    for root in roots:
+        for pattern in ("subway-*.jsonl", "subway-*.jsonl.gz"):
+            for path in glob.glob(os.path.join(root, pattern)):
+                name = os.path.basename(path)
+                try:
+                    observed.add(datetime.strptime(name[7:17], "%Y-%m-%d").date())
+                except ValueError:
+                    continue
+
+    completed = sorted(day for day in observed if day < active_day)
+    counts = {day: 0 for day in DAYS7}
+    for day in completed:
+        counts[DAYS7[day.weekday()]] += 1
+    capped = {day: min(n, target) for day, n in counts.items()}
+    complete = all(n >= target for n in counts.values())
+    progress = sum(capped.values()) / (len(DAYS7) * target) if target else 1.0
+
+    ready_service_day = None
+    ready_at = None
+    if not complete:
+        projected = dict(counts)
+        cursor = active_day
+        # 수집기가 매일 계속 돈다는 전제로 각 요일의 다음 부족분을 채운다.
+        while not all(n >= target for n in projected.values()):
+            key = DAYS7[cursor.weekday()]
+            projected[key] += 1
+            ready_service_day = cursor
+            cursor += timedelta(days=1)
+        ready_at = datetime.combine(
+            ready_service_day + timedelta(days=1), datetime.min.time(),
+            tzinfo=O.KST).replace(hour=4)
+
+    all_days = sorted(observed)
+    return {
+        "target": target,
+        "dataDayCount": len(all_days),
+        "completedDayCount": len(completed),
+        "firstDay": all_days[0].isoformat() if all_days else None,
+        "lastDay": all_days[-1].isoformat() if all_days else None,
+        "currentServiceDay": active_day.isoformat(),
+        "currentPartial": active_day in observed,
+        "completeDayCounts": counts,
+        "progress": progress,
+        "followupDone": complete,
+        "estimatedReadyServiceDay": (
+            ready_service_day.isoformat() if ready_service_day else None),
+        "estimatedReadyAt": ready_at.isoformat() if ready_at else None,
+    }
 
 
 def _obs_rate_per_day():
@@ -316,6 +383,7 @@ def subway_snapshot():
         "lastObs": last_epoch, "lastStn": last_stn, "lastLine": last_line,
         "judgeTarget": 3,   # §8.1 ④ — 쌍당 3 관측이면 σ 를 잴 수 있다
         "target": tgt,      # 요일 분리 재검토 목표 (셀당 3 관측 = 3주)
+        "collection": subway_collection_status(now),
         # §8 #1 판정 결과 — judge_subway.py 가 공식 시각표 대조로 낸 오프라인 스냅샷
         # (subway_judged.json). 없으면 done=False. '진행 중 목표'로 오인하지 않게 실어 보낸다.
         "judged": load_judged(),
@@ -855,6 +923,44 @@ function renderSubway(d){
       돌리면 여기에 노선별 σ/H 판정이 뜬다 (오프라인 계산 — 시각표 CSV·PDF 필요).</div></div>`;
   }
 
+  // 핵심 판정 완료와 선택적 후속 수집을 한눈에 구분한다. 셀 분모는 trainNo churn으로
+  // 계속 변하므로 종료 날짜는 원본 파일의 '완료된 운행일'을 요일별로 센다.
+  const col = sub.collection || {};
+  if(col.dataDayCount){
+    const cp = col.completeDayCounts || {};
+    const calRate = col.progress || 0;
+    const ready = col.estimatedReadyAt
+      ? new Date(col.estimatedReadyAt).toLocaleString('ko-KR', {
+          timeZone:'Asia/Seoul', year:'numeric', month:'2-digit', day:'2-digit',
+          hour:'2-digit', minute:'2-digit', hour12:false})
+      : null;
+    let dayRows = '';
+    for(const dk of D7){
+      const n = cp[dk] || 0, p = Math.min(1, n/(col.target||3));
+      dayRows += `<tr><td width=36>${KOD[dk]}</td><td class=n width=54><b>${n}/${col.target||3}</b></td>`
+        + `<td>${bar(p,p>=1?'ok':'')}</td></tr>`;
+    }
+    const follow = col.followupDone
+      ? `<b class=ok>✅ 요일별 ${col.target}회도 완료</b> — 요일별 judge_subway 재판정 후 지하철 수집을 종료할 수 있다.`
+      : `<b>선택 후속 목표 진행 중</b> — 요일별 완전한 운행일 ${col.target}회. `
+        + `현재 <b>${pct(calRate)}</b>`
+        + (ready ? ` · 계속 정상 수집하면 <b>${ready}</b> 완료 예상` : '');
+    h += `<div class=card style="margin:12px 0;border-left:3px solid #3b82f6;background:#3b82f611">
+      <div class=k>수집 필요성·종료 기준</div>
+      <div style="margin-top:4px">${jg&&jg.done
+        ? '<b class=ok>✅ 핵심 정시성 판정 완료 — 제품 결론을 위한 추가 수집은 필수 아님</b>'
+        : '<b class=warn>핵심 정시성 판정 전</b>'}</div>
+      <div style="margin-top:5px">${follow}</div>
+      <div class=sub style="margin-top:3px">원본 ${col.firstDay||'—'}~${col.lastDay||'—'} · `
+        + `완료 운행일 ${num(col.completedDayCount)}일`
+        + `${col.currentPartial?' · '+col.currentServiceDay+' 수집 중(아직 완료일 제외)':''}. `
+        + `후속 목표가 끝나면 원본 백업 확인 → 요일별 재판정 → 수집 중단 권장.</div>
+      <table style="margin-top:8px">${dayRows}</table>
+      <div class=sub style="margin-top:4px">종료 판단은 위 캘린더 기준을 쓴다. 아래 B안 셀의 `
+        + `<code>3관측 완료=0</code>은 같은 요일의 세 번째 날짜가 아직 끝나지 않았으면 정상이며, `
+        + `2호선·신분당선은 trainNo 구조상 셀 100% 자체가 의미 없다.</div></div>`;
+  }
+
   h += '<h2>건강 상태</h2><div class=grid>';
   h += `<div class=card><div class=k>마지막 관측</div><div class=v id=sublastobs>—</div>
         <div class=k>${sub.lastLine||''} ${sub.lastStn||'—'}${sub.inService?'':' · 운행 밖'}</div></div>`;
@@ -863,8 +969,12 @@ function renderSubway(d){
   h += `<div class=card><div class=k>노선</div><div class=v>${num(sub.lines.length)}</div>
         <div class=k>관측된 노선 수</div></div>`;
   const wk = (tot.seen ? tot.sumN/tot.seen : 0);   // 셀당 평균 관측 일수 = 대략 몇 주째
-  h += `<div class=card><div class=k>요일 분리 재검토</div><div class="v ${rate>=1?'ok':''}">${pct(rate)}</div>
-        <div class=k>셀당 ${wk.toFixed(1)}/${tgtAll}관측 · ${Math.ceil(Math.max(0,tgtAll-wk))}주 남음</div></div>`;
+  const calRate = col.dataDayCount ? col.progress : rate;
+  h += `<div class=card><div class=k>후속 요일 ${col.target||tgtAll}회</div>`
+      + `<div class="v ${col.followupDone?'ok':''}">${pct(calRate||0)}</div>`
+      + `<div class=k>${col.completedDayCount!=null
+        ? '완료 운행일 '+num(col.completedDayCount)+'일 · 현재 날짜는 완료 후 계상'
+        : '셀당 '+wk.toFixed(1)+'/'+tgtAll+'관측'}</div></div>`;
   const jt = sub.judgeTarget || 3;
   h += '</div>';
 
