@@ -446,20 +446,15 @@ def snapshot():
     goal = sum(eligible.values())
     day_goal = eligible_by_day.get(O.day_type(datetime.now(O.KST)), 0)
 
-    # cell 250만 행은 정확히 한 번만 스캔한다. 이전에는 전체·밴드·요일·ETA용으로
-    # 3~4번 읽어 작은 EC2의 iowait와 WAL 독자 시간을 키웠다.
+    # cell 250만 행은 운영 경로에서 스캔하지 않는다. bump와 같은 트랜잭션으로
+    # 유지되는 7요일×밴드 요약행만 읽어 iowait·WAL reader 기아를 피한다.
     # ★ 완료 = n>=target AND n_days>=minDays (같은 날 완주 방지 — 외부 리뷰)
     md = k.get("minDays", 2)
     with _DB_LOCK:
         cell_rows = c.execute(
-            """SELECT daytype,band,COUNT(*),COALESCE(SUM(n),0),
-                      COALESCE(SUM(n >= ? AND n_days >= ?),0),
-                      COALESCE(SUM(MIN(n,?)),0),
-                      COALESCE(SUM(MIN(n_days,?)),0),
-                      COALESCE(SUM(n >= ?),0),
-                      COALESCE(SUM(n_days >= ?),0)
-               FROM cell GROUP BY daytype,band""",
-            (tgt, md, tgt, md, tgt, md)).fetchall()
+            """SELECT daytype,band,cells,obs,done,fill_n,day_fill_n,
+                      sample_ready,date_ready
+               FROM cell_summary""").fetchall()
     seen = sum(r[2] for r in cell_rows)
     total = sum(r[3] for r in cell_rows)
     done = sum(r[4] for r in cell_rows)

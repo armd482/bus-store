@@ -224,6 +224,22 @@ def connect(check_same_thread=True):
     # 인덱스 하나의 순차 스캔으로 끝낸다.
     c.execute(
         "CREATE INDEX IF NOT EXISTS cell_route_progress ON cell(routeid,n,n_days)")
+    # 대시보드는 250만 cell을 매번 GROUP BY하지 않고 이 7요일×밴드 요약만 읽는다.
+    # 아래 트리거가 bump와 같은 트랜잭션에서 정확히 증분 갱신한다.
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS cell_summary (
+        daytype TEXT NOT NULL, band INTEGER NOT NULL,
+        cells INTEGER NOT NULL, obs INTEGER NOT NULL,
+        done INTEGER NOT NULL, fill_n INTEGER NOT NULL,
+        day_fill_n INTEGER NOT NULL, sample_ready INTEGER NOT NULL,
+        date_ready INTEGER NOT NULL,
+        PRIMARY KEY(daytype,band)
+      )""")
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS cell_summary_meta (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        target INTEGER NOT NULL, min_days INTEGER NOT NULL
+      )""")
     # n_days = 이 셀을 관측한 **서로 다른 운행일 수** (n 은 관측 건수). 매주 같은 요일은
     # 반복 표본이라(중복 아님) 요일 비교엔 '같은 요일 2일+'가 필요한데, n(건수)만으론
     # "한 날 7번"과 "3주 7번"을 못 가린다. 완료조건에 n_days 를 넣어 하루 안 완주를 막는다.
@@ -381,6 +397,91 @@ def connect(check_same_thread=True):
         if col not in have_health:
             c.execute(
                 f"ALTER TABLE collector_health_cycle ADD COLUMN {col} {decl}")
+
+    summary_target = max(1, int(cfg().get("targetSamples", 7)))
+    summary_min_days = max(1, int(cfg().get("minDays", 2)))
+    summary_cfg = c.execute(
+        "SELECT target,min_days FROM cell_summary_meta WHERE id=1").fetchone()
+    if summary_cfg != (summary_target, summary_min_days):
+        # 목표가 바뀌면 완료·충전 기여도가 달라지므로 한 번만 재구축한다. 운영 중
+        # 반복 전수 스캔하는 대신 배포/설정 변경 때의 명시적 일회 비용이다.
+        c.execute("DROP TRIGGER IF EXISTS cell_summary_insert")
+        c.execute("DROP TRIGGER IF EXISTS cell_summary_update")
+        c.execute("DROP TRIGGER IF EXISTS cell_summary_delete")
+        c.execute("DELETE FROM cell_summary")
+        c.execute("""
+          INSERT INTO cell_summary
+            (daytype,band,cells,obs,done,fill_n,day_fill_n,
+             sample_ready,date_ready)
+          SELECT daytype,band,COUNT(*),COALESCE(SUM(n),0),
+                 COALESCE(SUM(n>=? AND n_days>=?),0),
+                 COALESCE(SUM(MIN(n,?)),0),
+                 COALESCE(SUM(MIN(n_days,?)),0),
+                 COALESCE(SUM(n>=?),0),COALESCE(SUM(n_days>=?),0)
+          FROM cell GROUP BY daytype,band
+        """, (summary_target, summary_min_days, summary_target,
+              summary_min_days, summary_target, summary_min_days))
+        c.execute("""
+          INSERT INTO cell_summary_meta(id,target,min_days) VALUES(1,?,?)
+          ON CONFLICT(id) DO UPDATE SET
+            target=excluded.target,min_days=excluded.min_days
+        """, (summary_target, summary_min_days))
+
+    # 상수는 int로 정규화한 뒤 SQL에 넣는다. 트리거는 cell UPSERT와 같은
+    # 트랜잭션이므로 수집기가 죽어도 원본과 요약이 어긋나지 않는다.
+    st, sm = summary_target, summary_min_days
+    c.execute(f"""
+      CREATE TRIGGER IF NOT EXISTS cell_summary_insert AFTER INSERT ON cell
+      BEGIN
+        INSERT INTO cell_summary
+          (daytype,band,cells,obs,done,fill_n,day_fill_n,
+           sample_ready,date_ready)
+        VALUES(
+          NEW.daytype,NEW.band,1,NEW.n,
+          (NEW.n>={st} AND NEW.n_days>={sm}),
+          MIN(NEW.n,{st}),MIN(NEW.n_days,{sm}),
+          (NEW.n>={st}),(NEW.n_days>={sm}))
+        ON CONFLICT(daytype,band) DO UPDATE SET
+          cells=cells+1,obs=obs+NEW.n,
+          done=done+(NEW.n>={st} AND NEW.n_days>={sm}),
+          fill_n=fill_n+MIN(NEW.n,{st}),
+          day_fill_n=day_fill_n+MIN(NEW.n_days,{sm}),
+          sample_ready=sample_ready+(NEW.n>={st}),
+          date_ready=date_ready+(NEW.n_days>={sm});
+      END
+    """)
+    c.execute(f"""
+      CREATE TRIGGER IF NOT EXISTS cell_summary_update
+      AFTER UPDATE OF n,n_days ON cell
+      BEGIN
+        UPDATE cell_summary SET
+          obs=obs+NEW.n-OLD.n,
+          done=done
+            +(NEW.n>={st} AND NEW.n_days>={sm})
+            -(OLD.n>={st} AND OLD.n_days>={sm}),
+          fill_n=fill_n+MIN(NEW.n,{st})-MIN(OLD.n,{st}),
+          day_fill_n=day_fill_n
+            +MIN(NEW.n_days,{sm})-MIN(OLD.n_days,{sm}),
+          sample_ready=sample_ready+(NEW.n>={st})-(OLD.n>={st}),
+          date_ready=date_ready+(NEW.n_days>={sm})-(OLD.n_days>={sm})
+        WHERE daytype=NEW.daytype AND band=NEW.band;
+      END
+    """)
+    c.execute(f"""
+      CREATE TRIGGER IF NOT EXISTS cell_summary_delete AFTER DELETE ON cell
+      BEGIN
+        UPDATE cell_summary SET
+          cells=cells-1,obs=obs-OLD.n,
+          done=done-(OLD.n>={st} AND OLD.n_days>={sm}),
+          fill_n=fill_n-MIN(OLD.n,{st}),
+          day_fill_n=day_fill_n-MIN(OLD.n_days,{sm}),
+          sample_ready=sample_ready-(OLD.n>={st}),
+          date_ready=date_ready-(OLD.n_days>={sm})
+        WHERE daytype=OLD.daytype AND band=OLD.band;
+        DELETE FROM cell_summary
+        WHERE daytype=OLD.daytype AND band=OLD.band AND cells=0;
+      END
+    """)
     c.commit()
     return c
 
