@@ -82,14 +82,15 @@ _SEOUL_LOCK = threading.Lock()
 # 대시보드 집계 한 번 안에서만 공유하는 읽기 전용 연결. /api는 메모리 캐시만
 # 반환하므로 집계가 끝나면 닫아 WAL checkpoint의 끝점을 붙잡지 않게 한다.
 _DB = None
-_DB_LOCK = threading.Lock()
+_DB_LOCK = threading.RLock()
 
 
 def db():
     global _DB
-    if _DB is None:
-        _DB = O.connect_readonly(check_same_thread=False)
-    return _DB
+    with _DB_LOCK:
+        if _DB is None:
+            _DB = O.connect_readonly(check_same_thread=False)
+        return _DB
 
 
 def close_db():
@@ -536,24 +537,26 @@ def snapshot():
         health_rows = c.execute("""SELECT attempted,successful,retried,residual,code99,timeouts,
                                   http429,http5xx,duration,inflight,
                                   latency_avg,latency_p50,latency_p90,
+                                  latency_version,collector_delay_avg,
+                                  collector_delay_p50,collector_delay_p90,
                                   conn_created,conn_reused,conn_closed
                                   FROM collector_health_cycle WHERE day=? ORDER BY duration""",
                                 (qday or "",)).fetchall()
     def hpct(pos):
         return health_rows[min(len(health_rows)-1, int((len(health_rows)-1)*pos))][8] if health_rows else 0
     attempted_total = sum(r[0] for r in health_rows)
-    # 컬럼 추가 전 오늘 행은 latency/connection 기본값이 0이다. 그 행까지 분모에
-    # 넣으면 배포 당일 실제 2~3초 지연이 0.05초처럼 희석된다.
+    # 이전 행의 latency는 dispatcher 수확 지연을 포함해 wire latency와 의미가
+    # 다르다. 새 계측 버전 행만 분모에 넣어 배포 당일 두 의미를 섞지 않는다.
     metric_rows = [
         r for r in health_rows
-        if r[10] > 0 or r[11] > 0 or r[13] > 0 or r[14] > 0]
+        if r[13] == 1]
     metric_attempted = sum(r[0] for r in metric_rows)
     def hweighted(index):
         return (sum(r[index] * r[0] for r in metric_rows) / metric_attempted
                 if metric_attempted else 0)
-    conn_created = sum(r[13] for r in health_rows)
-    conn_reused = sum(r[14] for r in health_rows)
-    conn_closed = sum(r[15] for r in health_rows)
+    conn_created = sum(r[17] for r in health_rows)
+    conn_reused = sum(r[18] for r in health_rows)
+    conn_closed = sum(r[19] for r in health_rows)
     health = {
         "cycles": len(health_rows),
         "attempted": attempted_total, "successful": sum(r[1] for r in health_rows),
@@ -565,6 +568,9 @@ def snapshot():
         "latencyAvg": hweighted(10),
         "latencyP50": hweighted(11),
         "latencyP90": hweighted(12),
+        "collectorDelayAvg": hweighted(14),
+        "collectorDelayP50": hweighted(15),
+        "collectorDelayP90": hweighted(16),
         "connCreated": conn_created,
         "connReused": conn_reused,
         "connClosed": conn_closed,
@@ -808,7 +814,8 @@ function renderBus(d){
       · 재시도 ${num(hh.retried)} · 잔여실패 ${num(hh.residual)}
       · code99 ${num(hh.code99)} · timeout ${num(hh.timeouts)} · 429 ${num(hh.http429)} · 5xx ${num(hh.http5xx)}
       · 사이클 p50/p95/p99 ${hh.p50.toFixed(1)}/${hh.p95.toFixed(1)}/${hh.p99.toFixed(1)}초
-      · 요청지연 avg/p50/p90 ${Number(hh.latencyAvg||0).toFixed(2)}/${Number(hh.latencyP50||0).toFixed(2)}/${Number(hh.latencyP90||0).toFixed(2)}초
+      · API wire avg/p50/p90 ${Number(hh.latencyAvg||0).toFixed(2)}/${Number(hh.latencyP50||0).toFixed(2)}/${Number(hh.latencyP90||0).toFixed(2)}초
+      · 수집기 수확지연 avg/p50/p90 ${Number(hh.collectorDelayAvg||0).toFixed(2)}/${Number(hh.collectorDelayP50||0).toFixed(2)}/${Number(hh.collectorDelayP90||0).toFixed(2)}초
       · 연결재사용 ${pct(hh.connReusePct||0)} (신규 ${num(hh.connCreated)} · 종료 ${num(hh.connClosed)})
       · 최대 in-flight ${num(hh.maxInflight)}</div>`;
   const ss = d.storage || {};

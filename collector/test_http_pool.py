@@ -22,13 +22,16 @@ class FakeResponse:
 
 
 class FakeConnection:
-    def __init__(self, responses):
+    def __init__(self, responses, fail_requests=()):
         self.responses = responses
         self.requests = 0
         self.closed = False
+        self.fail_requests = set(fail_requests)
 
     def request(self, method, path, headers=None):
         self.requests += 1
+        if self.requests in self.fail_requests:
+            raise BrokenPipeError("stale keep-alive")
         self.last = (method, path, headers)
 
     def getresponse(self):
@@ -62,7 +65,8 @@ class HTTPSPoolTests(unittest.TestCase):
         self.assertEqual(made[0].requests, 2)
         self.assertEqual(
             pool.stats(),
-            {"requests": 2, "created": 1, "reused": 1, "closed": 0})
+            {"requests": 2, "created": 1, "reused": 1, "closed": 0,
+             "stale_retries": 0})
 
     def test_server_close_discards_connection(self):
         pool, made = self.make_pool([
@@ -86,3 +90,47 @@ class HTTPSPoolTests(unittest.TestCase):
         pool, _made = self.make_pool([
             FakeResponse(body, encoding="gzip")])
         self.assertEqual(pool.get("K1", "/gzip")[1], b'{"ok":true}')
+
+    def test_stale_reused_socket_reconnects_once_and_reserves_quota(self):
+        made = []
+        reservations = []
+
+        def factory(_host, _timeout):
+            conn = (
+                FakeConnection([FakeResponse(b"one")], fail_requests={2})
+                if not made else
+                FakeConnection([FakeResponse(b"two")]))
+            made.append(conn)
+            return conn
+
+        pool = KeyedHTTPSPool(
+            "example.test", 1, timeout=0.1,
+            connection_factory=factory,
+            retry_reserver=lambda key: reservations.append(key) or True)
+        self.addCleanup(pool.close)
+        self.assertEqual(pool.get("K1", "/one"), (200, b"one"))
+        self.assertEqual(pool.get("K1", "/two"), (200, b"two"))
+        self.assertEqual(len(made), 2)
+        self.assertTrue(made[0].closed)
+        self.assertEqual(reservations, ["K1"])
+        self.assertEqual(pool.stats()["stale_retries"], 1)
+
+    def test_stale_socket_does_not_reconnect_when_quota_is_denied(self):
+        made = []
+
+        def factory(_host, _timeout):
+            conn = FakeConnection(
+                [FakeResponse(b"one")], fail_requests={2})
+            made.append(conn)
+            return conn
+
+        pool = KeyedHTTPSPool(
+            "example.test", 1, timeout=0.1,
+            connection_factory=factory,
+            retry_reserver=lambda _key: False)
+        self.addCleanup(pool.close)
+        self.assertEqual(pool.get("K1", "/one"), (200, b"one"))
+        with self.assertRaises(BrokenPipeError):
+            pool.get("K1", "/two")
+        self.assertEqual(len(made), 1)
+        self.assertEqual(pool.stats()["stale_retries"], 0)

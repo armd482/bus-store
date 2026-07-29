@@ -6,6 +6,16 @@ import queue
 import threading
 
 
+_STALE_CONNECTION_ERRORS = (
+    http.client.RemoteDisconnected,
+    http.client.CannotSendRequest,
+    http.client.ResponseNotReady,
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+)
+
+
 class HTTPSPoolTimeout(TimeoutError):
     """정해진 시간 안에 사용 가능한 연결을 얻지 못했다."""
 
@@ -25,17 +35,20 @@ class KeyedHTTPSPool:
     해당 연결만 폐기하고 다음 요청에서 새로 만든다.
     """
 
-    def __init__(self, host, max_per_key, timeout=15, connection_factory=None):
+    def __init__(self, host, max_per_key, timeout=15, connection_factory=None,
+                 retry_reserver=None):
         self.host = host
         self.max_per_key = max(1, int(max_per_key))
         self.timeout = float(timeout)
         self._factory = connection_factory or (
             lambda host, timeout: http.client.HTTPSConnection(
                 host, timeout=timeout))
+        self._retry_reserver = retry_reserver
         self._buckets = {}
         self._lock = threading.Lock()
         self._stats = {
             "requests": 0, "created": 0, "reused": 0, "closed": 0,
+            "stale_retries": 0,
         }
 
     def _bucket(self, key):
@@ -81,27 +94,43 @@ class KeyedHTTPSPool:
                 self._stats["closed"] += 1
 
     def get(self, key, path, headers=None):
-        bucket, conn, _reused = self._acquire(key)
-        reusable = False
-        try:
-            request_headers = {
-                "Accept": "application/json",
-                "Accept-Encoding": "gzip",
-                "Connection": "keep-alive",
-                "User-Agent": "findpath-collector/1",
-            }
-            request_headers.update(headers or {})
-            conn.request("GET", path, headers=request_headers)
-            response = conn.getresponse()
-            data = response.read()
-            reusable = not response.will_close
-            if response.getheader("Content-Encoding", "").lower() == "gzip":
-                data = gzip.decompress(data)
-            with self._lock:
-                self._stats["requests"] += 1
-            return response.status, data
-        finally:
-            self._release(bucket, conn, reusable)
+        request_headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "Connection": "keep-alive",
+            "User-Agent": "findpath-collector/1",
+        }
+        request_headers.update(headers or {})
+        for attempt in range(2):
+            bucket, conn, reused = self._acquire(key)
+            response_started = False
+            reusable = False
+            try:
+                conn.request("GET", path, headers=request_headers)
+                response = conn.getresponse()
+                response_started = True
+                data = response.read()
+                reusable = not response.will_close
+                if response.getheader("Content-Encoding", "").lower() == "gzip":
+                    data = gzip.decompress(data)
+                with self._lock:
+                    self._stats["requests"] += 1
+                return response.status, data
+            except _STALE_CONNECTION_ERRORS:
+                # 서버가 idle Keep-Alive를 이미 닫은 경우다. GET이고 아직 응답
+                # 첫 바이트도 받지 않았으므로 새 소켓으로 한 번만 즉시 재전송한다.
+                if reused and not response_started and attempt == 0:
+                    # 호출 쿼터 장부도 물리 재전송 1회를 먼저 예약한다. 예약자가
+                    # 상한을 거부하면 원래 transport 오류를 그대로 반환한다.
+                    if (self._retry_reserver is not None
+                            and not self._retry_reserver(key)):
+                        raise
+                    with self._lock:
+                        self._stats["stale_retries"] += 1
+                    continue
+                raise
+            finally:
+                self._release(bucket, conn, reusable)
 
     def stats(self):
         with self._lock:

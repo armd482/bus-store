@@ -41,6 +41,23 @@ class RollingDispatcherTests(unittest.TestCase):
         self.assertGreaterEqual(len(fast), 4)
         self.assertLess(len(slow), len(fast))
 
+    def test_wire_duration_excludes_timeout_hold(self):
+        def fetch(_key, _city, rid):
+            time.sleep(0.02)
+            return rid, [], "TimeoutError", None
+
+        dispatcher = RollingDispatcher(
+            [("K1", "key")], fetch, lambda _kid, _n: True,
+            interval=10, rate=100, workers=1, max_inflight=1,
+            hold=0.12, retry_limit=0)
+        self.addCleanup(dispatcher.close)
+        dispatcher.set_routes([{"routeid": "one", "cityCode": 1}])
+        event = dispatcher.get(timeout=0.5)
+        self.assertIsNotNone(event)
+        self.assertGreaterEqual(event["wire_duration"], 0.015)
+        self.assertLess(event["wire_duration"], 0.08)
+        self.assertGreaterEqual(event["duration"], 0.10)
+
     def test_same_route_never_overlaps(self):
         active = 0
         maximum = 0

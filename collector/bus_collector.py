@@ -426,10 +426,14 @@ def main():
     retry_code99 = bool(k.get("busRetryCode99", False))
     hold = k.get("busZombieHoldSec", 10)
     window = k["serviceWindow"]
+    # stale Keep-Alive의 내부 재전송도 물리 호출이므로 같은 키 장부에서 먼저 예약한다.
+    quota = QuotaReservations(key_cap)
+    key_ids = {key: kid for kid, key in keys}
     _HTTP_POOL = (
         KeyedHTTPSPool(
             BASE_HOST, inflight_max,
-            timeout=float(k.get("busHttpTimeoutSec", 15)))
+            timeout=float(k.get("busHttpTimeoutSec", 15)),
+            retry_reserver=lambda key: quota.reserve(key_ids[key], 1))
         if k.get("busHttpKeepAlive", True) else None)
 
     day = service_day(now())
@@ -453,7 +457,8 @@ def main():
     picker_generation = 0
     pool_stats_prev = (
         _HTTP_POOL.stats() if _HTTP_POOL is not None
-        else {"created": 0, "reused": 0, "closed": 0})
+        else {"created": 0, "reused": 0, "closed": 0,
+              "stale_retries": 0})
     rotated_day = None
 
     # 선예약 블록 — 스케줄러 스레드 전용(단일 스레드라 자체 락 불필요). 요청 1건마다
@@ -462,8 +467,6 @@ def main():
     # 실제 요청은 메모리 잔여만 차감한다 → 파일 쓰기 ~1/RESERVE_BLOCK. 크래시 시
     # 키당 최대 RESERVE_BLOCK-1 콜을 과다계상하지만(48만 중 63) 절대 과소계상하지
     # 않아 실제 쿼터를 넘지 않는다. 자정에는 전날 메모리 잔여를 버리고 새 장부를 쓴다.
-    quota = QuotaReservations(key_cap)
-
     dispatcher = RollingDispatcher(
         keys, fetch, quota.reserve, interval, rate, workers, inflight_max, hold,
         global_inflight=global_initial, code99_cooldown=code99_cooldown,
@@ -480,7 +483,7 @@ def main():
             "attempted": 0, "successful": 0, "retried": 0, "recovered": 0,
             "residual": 0,
             "moving": 0, "rows": 0, "errors": [], "final": {},
-            "durations": [],
+            "durations": [], "collector_delays": [],
             "by_key": {
                 kid: {
                     "attempted": 0, "successful": 0, "retried": 0,
@@ -548,6 +551,12 @@ def main():
             sum(durations) / len(durations) if durations else 0.0)
         latency_p50 = percentile(durations, 0.50)
         latency_p90 = percentile(durations, 0.90)
+        collector_delays = stats["collector_delays"]
+        collector_delay_avg = (
+            sum(collector_delays) / len(collector_delays)
+            if collector_delays else 0.0)
+        collector_delay_p50 = percentile(collector_delays, 0.50)
+        collector_delay_p90 = percentile(collector_delays, 0.90)
         pool_now = (
             _HTTP_POOL.stats() if _HTTP_POOL is not None
             else pool_stats_prev)
@@ -557,6 +566,9 @@ def main():
             0, pool_now.get("reused", 0) - pool_stats_prev.get("reused", 0))
         conn_closed = max(
             0, pool_now.get("closed", 0) - pool_stats_prev.get("closed", 0))
+        stale_retries = max(
+            0, pool_now.get("stale_retries", 0)
+            - pool_stats_prev.get("stale_retries", 0))
         pool_stats_prev.clear()
         pool_stats_prev.update(pool_now)
         health_ts = time.time()
@@ -569,6 +581,7 @@ def main():
             sum(e.startswith("HTTP5") for e in all_errors),
             elapsed, snap["globalLimit"],
             latency_avg, latency_p50, latency_p90,
+            1, collector_delay_avg, collector_delay_p50, collector_delay_p90,
             conn_created, conn_reused, conn_closed, ts=health_ts)
         for kid, _ in keys:
             key_stats = stats["by_key"][kid]
@@ -620,9 +633,13 @@ def main():
             STATE["requestLatencyAvg"] = latency_avg
             STATE["requestLatencyP50"] = latency_p50
             STATE["requestLatencyP90"] = latency_p90
+            STATE["collectorDelayAvg"] = collector_delay_avg
+            STATE["collectorDelayP50"] = collector_delay_p50
+            STATE["collectorDelayP90"] = collector_delay_p90
             STATE["connectionReusePct"] = (
                 conn_reused / (conn_created + conn_reused)
                 if conn_created + conn_reused else 0)
+            STATE["staleConnectionRetries"] = stale_retries
             STATE["rssMB"] = mem
             STATE["inflightLimits"] = dict(snap["limits"])
             STATE["night"] = False
@@ -652,9 +669,14 @@ def main():
                  if stats["retried"] else "")
               + (f" · 지연 {latency_p50:.2f}/{latency_p90:.2f}s"
                  if durations else "")
+              + (f" · 수확지연 "
+                 f"{collector_delay_p50:.2f}/{collector_delay_p90:.2f}s"
+                 if collector_delays else "")
               + (f" · 연결재사용 "
                  f"{conn_reused/(conn_created+conn_reused)*100:.0f}%"
-                 if conn_created + conn_reused else ""), flush=True)
+                 if conn_created + conn_reused else "")
+              + (f" · stale재연결 {stale_retries}"
+                 if stale_retries else ""), flush=True)
         if stats["final"]:
             detail = " ".join(
                 f"{err}×{n}" for err, n in
@@ -872,8 +894,11 @@ def main():
                     stats["attempted"] += 1
                     stats["retried"] += int(event["retried"])
                     stats["errors"] += event["errors"]
-                    if event.get("duration") is not None:
-                        stats["durations"].append(float(event["duration"]))
+                    if event.get("wire_duration") is not None:
+                        wire_duration = float(event["wire_duration"])
+                        stats["durations"].append(wire_duration)
+                        stats["collector_delays"].append(max(
+                            0.0, float(event["duration"]) - wire_duration))
                     if err:
                         key_stats["residual"] += 1
                         stats["residual"] += 1

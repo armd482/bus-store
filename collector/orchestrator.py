@@ -218,10 +218,9 @@ def connect(check_same_thread=True):
         last_day TEXT,
         PRIMARY KEY (routeid, from_ord, to_ord, band, daytype)
       )""")
-    c.execute("CREATE INDEX IF NOT EXISTS cell_route ON cell(routeid)")
-    # route_progress는 routeid별 n/n_days만 읽는다. 기존 cell_route 인덱스는 매 행의
-    # 본문을 다시 찾아 250만 행에서 임의 I/O가 컸다. covering index로 집계를
-    # 인덱스 하나의 순차 스캔으로 끝낸다.
+    # cell_route_progress의 선행 컬럼이 routeid라 기존 cell_route의 모든 조회를
+    # 대체한다. 중복 인덱스는 신규 셀 INSERT·저장공간만 늘리므로 제거한다.
+    c.execute("DROP INDEX IF EXISTS cell_route")
     c.execute(
         "CREATE INDEX IF NOT EXISTS cell_route_progress ON cell(routeid,n,n_days)")
     # 대시보드는 250만 cell을 매번 GROUP BY하지 않고 이 7요일×밴드 요약만 읽는다.
@@ -372,6 +371,10 @@ def connect(check_same_thread=True):
         latency_avg REAL NOT NULL DEFAULT 0,
         latency_p50 REAL NOT NULL DEFAULT 0,
         latency_p90 REAL NOT NULL DEFAULT 0,
+        latency_version INTEGER NOT NULL DEFAULT 0,
+        collector_delay_avg REAL NOT NULL DEFAULT 0,
+        collector_delay_p50 REAL NOT NULL DEFAULT 0,
+        collector_delay_p90 REAL NOT NULL DEFAULT 0,
         conn_created INTEGER NOT NULL DEFAULT 0,
         conn_reused INTEGER NOT NULL DEFAULT 0,
         conn_closed INTEGER NOT NULL DEFAULT 0
@@ -407,6 +410,10 @@ def connect(check_same_thread=True):
             ("latency_avg", "REAL NOT NULL DEFAULT 0"),
             ("latency_p50", "REAL NOT NULL DEFAULT 0"),
             ("latency_p90", "REAL NOT NULL DEFAULT 0"),
+            ("latency_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("collector_delay_avg", "REAL NOT NULL DEFAULT 0"),
+            ("collector_delay_p50", "REAL NOT NULL DEFAULT 0"),
+            ("collector_delay_p90", "REAL NOT NULL DEFAULT 0"),
             ("conn_created", "INTEGER NOT NULL DEFAULT 0"),
             ("conn_reused", "INTEGER NOT NULL DEFAULT 0"),
             ("conn_closed", "INTEGER NOT NULL DEFAULT 0")):
@@ -878,15 +885,20 @@ def mark_included_direct(conn, routeid, from_ord, to_ord, band, daytype, k=1):
 def record_health(conn, day, band, attempted, successful, retried, residual,
                   code99, timeouts, http429, http5xx, duration, inflight,
                   latency_avg=0, latency_p50=0, latency_p90=0,
+                  latency_version=0, collector_delay_avg=0,
+                  collector_delay_p50=0, collector_delay_p90=0,
                   conn_created=0, conn_reused=0, conn_closed=0, ts=None):
     conn.execute("""INSERT INTO collector_health_cycle
       (ts,day,band,attempted,successful,retried,residual,code99,timeouts,http429,
        http5xx,duration,inflight,latency_avg,latency_p50,latency_p90,
+       latency_version,collector_delay_avg,collector_delay_p50,
+       collector_delay_p90,
        conn_created,conn_reused,conn_closed)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
       (ts or time.time(), day, band, attempted, successful, retried, residual,
        code99, timeouts, http429, http5xx, duration, inflight,
-       latency_avg, latency_p50, latency_p90,
+       latency_avg, latency_p50, latency_p90, latency_version,
+       collector_delay_avg, collector_delay_p50, collector_delay_p90,
        conn_created, conn_reused, conn_closed))
     # 일 단위 상세는 30일만 보존한다.
     conn.execute("DELETE FROM collector_health_cycle WHERE ts < ?", (time.time()-30*86400,))
@@ -1183,8 +1195,7 @@ def route_progress(conn, target, nbands):
              (SELECT COUNT(*) FROM route_service rs
               WHERE rs.routeid=r.routeid AND rs.status='eligible')
       FROM route r
-      LEFT JOIN cell AS c INDEXED BY cell_route_progress
-        ON c.routeid = r.routeid
+      LEFT JOIN cell AS c ON c.routeid = r.routeid
       GROUP BY r.routeid
     """, (target, md, target)).fetchall()
     out = []

@@ -232,11 +232,19 @@ class RollingDispatcher:
             (due, self._seq, rid, generation, attempt, origin_due, errors))
 
     def _guarded_fetch(self, key, meta):
-        result = self.fetch(key, meta["cityCode"], meta["routeid"])
+        wire_started = time.monotonic()
+        try:
+            result = self.fetch(key, meta["cityCode"], meta["routeid"])
+        except Exception as exc:
+            result = (
+                meta["routeid"], [], type(exc).__name__, None)
+        wire_duration = time.monotonic() - wire_started
         err = result[2]
         if self.hold and err and ("Timeout" in err or "timed out" in err):
             time.sleep(self.hold)
-        return result
+        # wire_duration은 fetch 호출만 잰다. executor 대기, dispatcher 수확 지연,
+        # timeout 뒤 zombie hold는 포함하지 않는다.
+        return result, wire_duration
 
     def _dispatch_due(self, now):
         if (now < self._global_blocked_until
@@ -294,9 +302,10 @@ class RollingDispatcher:
             if route and route["generation"] == job["generation"]:
                 route["inflight"] = False
             try:
-                result = fut.result()
+                result, wire_duration = fut.result()
             except Exception as exc:
                 result = (rid, [], type(exc).__name__, None)
+                wire_duration = None
             err = result[2]
             errors = job["errors"] + ([err] if err else [])
             is_code99 = bool(err and "code99" in err)
@@ -317,6 +326,8 @@ class RollingDispatcher:
                 "result": result, "keyid": kid,
                 "retried": job["attempt"] > 0,
                 "errors": errors,
+                "wire_duration": wire_duration,
+                # 스케줄러 자체 지연을 별도로 진단할 수 있게 기존 값도 보존한다.
                 "duration": time.monotonic() - job["started"],
             })
             if route and route["generation"] == job["generation"] and route["active"]:
