@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from bus_collector import (
     QuotaReservations, counter_check_due, midnight_inflight, next_inflight,
-    reserve_calls)
+    next_inflight_limits, reserve_calls)
 
 
 class InflightPolicyTests(unittest.TestCase):
@@ -22,6 +22,15 @@ class InflightPolicyTests(unittest.TestCase):
             next_inflight(10, 22, False, attempted=80, minimum_samples=80), 12)
         self.assertEqual(
             next_inflight(12, 22, True, attempted=80, minimum_samples=80), 8)
+
+    def test_code99_retreats_only_the_affected_key(self):
+        self.assertEqual(
+            next_inflight_limits(
+                {"K1": 20, "K2": 20}, 22,
+                {"K1": 50, "K2": 50},
+                {"K1": ["code99:busy"], "K2": []},
+                {"K1": 170, "K2": 170}),
+            {"K1": 12, "K2": 22})
 
     def test_midnight_only_clamps_when_quota_was_blocked(self):
         self.assertEqual(midnight_inflight(22, True), 10)

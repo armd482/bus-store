@@ -37,9 +37,9 @@ class RollingDispatcher:
         self.retry_limit = retry_limit
         self._keys = {kid: key for kid, key in keys}
         self._key_order = [kid for kid, _ in keys]
-        self._limit = max_inflight
         self._states = {
-            kid: {"heap": [], "inflight": 0, "next_submit": 0.0,
+            kid: {"heap": [], "inflight": 0, "limit": max_inflight,
+                  "next_submit": 0.0,
                   "quota_blocked_until": 0.0, "quota_was_blocked": False}
             for kid in self._key_order
         }
@@ -59,22 +59,26 @@ class RollingDispatcher:
         self._thread.start()
 
     @property
-    def inflight_limit(self):
+    def inflight_limits(self):
         with self._lock:
-            return self._limit
+            return {kid: state["limit"] for kid, state in self._states.items()}
 
-    def set_inflight_limit(self, value):
-        """기존 AIMD가 계산한 키별 상한을 적용한다. 실행 중 요청은 취소하지 않는다."""
+    def set_inflight_limit(self, kid, value):
+        """한 키의 AIMD 상한만 바꾼다. 이미 실행 중인 요청은 취소하지 않는다."""
         with self._lock:
-            self._limit = max(1, int(value))
+            self._states[kid]["limit"] = max(1, int(value))
         self._wake.set()
 
     def reset_quota_blocks(self):
         """자정에 차단을 해제하고, 전날 cap 차단 이력이 있던 키 수를 반환한다."""
+        return len(self.reset_quota_blocks_by_key())
+
+    def reset_quota_blocks_by_key(self):
+        """자정에 차단을 해제하고, 전날 cap 차단 이력이 있던 키 ID를 반환한다."""
         with self._lock:
-            blocked = sum(
-                state["quota_was_blocked"]
-                for state in self._states.values())
+            blocked = [
+                kid for kid, state in self._states.items()
+                if state["quota_was_blocked"]]
             for state in self._states.values():
                 state["quota_blocked_until"] = 0.0
                 state["quota_was_blocked"] = False
@@ -171,10 +175,18 @@ class RollingDispatcher:
 
     def snapshot(self):
         with self._lock:
+            limits = {
+                kid: state["limit"] for kid, state in self._states.items()}
+            routes_by_key = {kid: 0 for kid in self._key_order}
+            for route in self._routes.values():
+                if route["active"]:
+                    routes_by_key[route["keyid"]] += 1
             return {
-                "routes": sum(1 for s in self._routes.values() if s["active"]),
+                "routes": sum(routes_by_key.values()),
+                "routesByKey": routes_by_key,
                 "inflight": sum(s["inflight"] for s in self._states.values()),
-                "limit": self._limit,
+                "limits": limits,
+                "limitTotal": sum(limits.values()),
                 "queued": sum(len(s["heap"]) for s in self._states.values()),
                 "quotaBlocked": sum(
                     s["quota_blocked_until"] > time.monotonic()
@@ -202,7 +214,7 @@ class RollingDispatcher:
             # 만료된 차단 표식을 정리해 snapshot이 현재 상태만 보고하게 한다.
             ks["quota_blocked_until"] = 0.0
             while (ks["heap"] and ks["heap"][0][0] <= now
-                   and ks["inflight"] < self._limit
+                   and ks["inflight"] < ks["limit"]
                    and now >= ks["next_submit"]):
                 due, _, rid, generation, attempt, origin_due, errors = heapq.heappop(ks["heap"])
                 route = self._routes.get(rid)
@@ -272,7 +284,7 @@ class RollingDispatcher:
                 # 쿼터 차단 중 — 해제 시각에만 다시 본다. heap을 근거로 깨지 않는다.
                 waits.append(ks["quota_blocked_until"] - now)
                 continue
-            if ks["inflight"] >= self._limit:
+            if ks["inflight"] >= ks["limit"]:
                 # 슬롯 포화 — due가 지나도 지금은 제출 못 한다. in-flight future가
                 # 끝나면 완료 콜백이 _wake를 세우므로, heap을 근거로 10ms마다 깨지 않는다.
                 continue

@@ -91,7 +91,7 @@ class RollingDispatcherTests(unittest.TestCase):
             dispatcher.get(timeout=0.03)
         self.assertEqual(maximum, 1)
 
-    def test_inflight_limit_is_enforced_per_key(self):
+    def test_inflight_limits_can_diverge_per_key(self):
         active = {"key1": 0, "key2": 0}
         maximum = {"key1": 0, "key2": 0}
         lock = __import__("threading").Lock()
@@ -110,14 +110,20 @@ class RollingDispatcherTests(unittest.TestCase):
             lambda _kid, _n: True, interval=0.12, rate=100,
             workers=4, max_inflight=2)
         self.addCleanup(dispatcher.close)
+        dispatcher.set_inflight_limit("K1", 1)
+        dispatcher.set_inflight_limit("K2", 2)
+        self.assertEqual(
+            dispatcher.snapshot()["limits"], {"K1": 1, "K2": 2})
         dispatcher.set_routes([
             {"routeid": f"route-{i}", "cityCode": 1} for i in range(12)
         ])
         deadline = time.monotonic() + 0.28
         while time.monotonic() < deadline:
             dispatcher.get(timeout=0.03)
-        self.assertTrue(all(value <= 2 for value in maximum.values()))
-        self.assertTrue(all(value > 0 for value in maximum.values()))
+        self.assertLessEqual(maximum["key1"], 1)
+        self.assertLessEqual(maximum["key2"], 2)
+        self.assertGreater(maximum["key1"], 0)
+        self.assertGreater(maximum["key2"], 1)
 
     def test_retry_reserves_each_physical_call(self):
         calls = 0
@@ -219,7 +225,7 @@ class RollingDispatcherTests(unittest.TestCase):
         self.assertEqual(dispatcher.snapshot()["quotaBlocked"], 1)
 
         allowed = True
-        self.assertEqual(dispatcher.reset_quota_blocks(), 1)
+        self.assertEqual(dispatcher.reset_quota_blocks_by_key(), ["K1"])
         event = dispatcher.get(timeout=0.5)
         self.assertIsNotNone(event)
         self.assertEqual(event["result"][0], "one")

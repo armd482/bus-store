@@ -101,6 +101,18 @@ def next_inflight(current, maximum, saw99, attempted=1, minimum_samples=1):
     return min(maximum, current + 2)
 
 
+def next_inflight_limits(current, maximum, attempted, errors, routes):
+    """키별 건강 창으로 다음 AIMD 상한을 계산한다."""
+    return {
+        kid: next_inflight(
+            limit, maximum,
+            any("code99" in err for err in errors.get(kid, ())),
+            attempted.get(kid, 0),
+            max(1, routes.get(kid, 0) // 4))
+        for kid, limit in current.items()
+    }
+
+
 def midnight_inflight(current, quota_was_blocked, restart=10):
     """자정 직전 쿼터로 멈췄다면 새 날을 보수적으로 재개하되 값을 올리지는 않는다."""
     return min(current, restart) if quota_was_blocked else current
@@ -298,6 +310,10 @@ def main():
         return {
             "attempted": 0, "successful": 0, "retried": 0, "residual": 0,
             "moving": 0, "rows": 0, "errors": [], "final": {},
+            "by_key": {
+                kid: {"attempted": 0, "errors": []}
+                for kid, _ in keys
+            },
         }
 
     stats = blank_stats()
@@ -323,7 +339,7 @@ def main():
             sum("Timeout" in e or "timed out" in e for e in all_errors),
             sum("HTTP429" in e for e in all_errors),
             sum(e.startswith("HTTP5") for e in all_errors),
-            elapsed, dispatcher.inflight_limit)
+            elapsed, max(snap["limits"].values(), default=0))
         conn.commit()
 
         mem = O.rss_mb()
@@ -338,6 +354,7 @@ def main():
             STATE["errors"] = dict(stats["final"])
             STATE["retried"] = stats["retried"]
             STATE["rssMB"] = mem
+            STATE["inflightLimits"] = dict(snap["limits"])
             STATE["night"] = False
             STATE["fetching"] = snap["inflight"] > 0
             if stats["final"]:
@@ -354,8 +371,9 @@ def main():
               f"{stats['successful']}/{stats['attempted']} · "
               f"운행 {stats['moving']}대 · 통과 +{stats['rows']} "
               f"(누적 {written:,}) · 예약 {snap['queued']} · "
-              f"in-flight 합계 {snap['inflight']}/{snap['limit']*len(keys)}"
-              f"(키당 {snap['limit']})"
+              f"in-flight 합계 {snap['inflight']}/{snap['limitTotal']}"
+              f"(" + " ".join(
+                  f"{kid}={snap['limits'][kid]}" for kid, _ in keys) + ")"
               + (f" · 쿼터차단 {snap['quotaBlocked']}키"
                  if snap["quotaBlocked"] else "")
               + (f" · {mem:.0f}MB" if mem else "")
@@ -374,18 +392,28 @@ def main():
                 for kid, _ in keys)
             print(f"[{report_obs:%H:%M:%S}] 콜 {detail}", flush=True)
 
-        # 빈 창·자정 직후의 짧은 부분 창을 '깨끗한 성공'으로 보아 동시성을 올리지
-        # 않는다. 정상 패널의 1/4 이상 결과가 있어야 AIMD가 판단한다.
-        minimum_samples = max(1, len(picked) // 4)
-        saw99 = any("code99" in err for err in all_errors)
-        old_limit = dispatcher.inflight_limit
-        new_limit = next_inflight(
-            old_limit, inflight_max, saw99, stats["attempted"], minimum_samples)
-        dispatcher.set_inflight_limit(new_limit)
-        if new_limit != old_limit:
+        # AIMD도 키별 세션 풀에 맞춰 독립 적용한다. 한 키의 code99가 다른 세 키의
+        # 정상 처리량까지 ×0.6으로 낮추지 않는다. 회복은 그 키에 배정된 패널의
+        # 1/4 이상 결과가 있는 정상 창에서만 허용한다.
+        changes = []
+        new_limits = next_inflight_limits(
+            snap["limits"], inflight_max,
+            {kid: stats["by_key"][kid]["attempted"] for kid, _ in keys},
+            {kid: stats["by_key"][kid]["errors"] for kid, _ in keys},
+            snap["routesByKey"])
+        for kid, _ in keys:
+            key_stats = stats["by_key"][kid]
+            saw99 = any("code99" in err for err in key_stats["errors"])
+            old_limit = snap["limits"][kid]
+            new_limit = new_limits[kid]
+            if new_limit != old_limit:
+                dispatcher.set_inflight_limit(kid, new_limit)
+                changes.append(
+                    f"{kid} {old_limit}→{new_limit}"
+                    f"({'code99 후퇴' if saw99 else '회복'})")
+        if changes:
             print(f"[{report_obs:%H:%M:%S}] in-flight "
-                  f"{old_limit}→{new_limit} "
-                  f"({'code99 후퇴' if saw99 else '회복'})", flush=True)
+                  + " · ".join(changes), flush=True)
 
         stats = blank_stats()
         report_started = time.monotonic()
@@ -410,15 +438,18 @@ def main():
                     stats_qday, picked_band if picked_band is not None
                     else O.band_of(t, bands),
                     mono - report_started, mono + interval)
-                blocked = dispatcher.reset_quota_blocks()
-                old_limit = dispatcher.inflight_limit
-                new_limit = midnight_inflight(old_limit, blocked > 0)
-                if new_limit != old_limit:
-                    dispatcher.set_inflight_limit(new_limit)
+                blocked = set(dispatcher.reset_quota_blocks_by_key())
+                old_limits = dispatcher.inflight_limits
+                changes = []
+                for kid, old_limit in old_limits.items():
+                    new_limit = midnight_inflight(old_limit, kid in blocked)
+                    if new_limit != old_limit:
+                        dispatcher.set_inflight_limit(kid, new_limit)
+                        changes.append(f"{kid} {old_limit}→{new_limit}")
                 print(f"[{t:%H:%M:%S}] 쿼터 날짜 전환 {stats_qday} → {qday} · "
-                      f"차단 해제 {blocked}키"
-                      + (f" · in-flight {old_limit}→{new_limit}"
-                         if new_limit != old_limit else ""), flush=True)
+                      f"차단 해제 {len(blocked)}키"
+                      + (f" · in-flight {' · '.join(changes)}"
+                         if changes else ""), flush=True)
                 stats_qday = qday
 
             mono = time.monotonic()
@@ -503,6 +534,9 @@ def main():
                 rows, bumps = [], []
                 for event in events:
                     routeid, items, err, obs = event["result"]
+                    key_stats = stats["by_key"][event["keyid"]]
+                    key_stats["attempted"] += 1
+                    key_stats["errors"] += event["errors"]
                     stats["attempted"] += 1
                     stats["retried"] += int(event["retried"])
                     stats["errors"] += event["errors"]
