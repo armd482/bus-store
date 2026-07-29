@@ -6,6 +6,7 @@
 
 import heapq
 import queue
+import random
 import threading
 import time
 import traceback
@@ -28,13 +29,16 @@ class RollingDispatcher:
     """키별 rate/in-flight를 지키면서 각 노선을 독립 주기로 호출한다."""
 
     def __init__(self, keys, fetch, reserve, interval, rate, workers,
-                 max_inflight, hold=0, retry_limit=1):
+                 max_inflight, hold=0, retry_limit=1, global_inflight=None,
+                 code99_cooldown=0, retry_code99=True):
         self.fetch = fetch
         self.reserve = reserve
         self.interval = float(interval)
         self.rate = float(rate)
         self.hold = float(hold)
         self.retry_limit = retry_limit
+        self.retry_code99 = bool(retry_code99)
+        self.code99_cooldown = float(code99_cooldown)
         self._keys = {kid: key for kid, key in keys}
         self._key_order = [kid for kid, _ in keys]
         self._states = {
@@ -51,6 +55,10 @@ class RollingDispatcher:
         self._stop = threading.Event()
         self._seq = 0
         self._fatal = None
+        self._global_inflight = 0
+        self._global_limit = max(
+            1, int(global_inflight or max_inflight * max(1, len(keys))))
+        self._global_blocked_until = 0.0
         # maxInflight는 키별 상한이다. 활성 키를 동시에 담을 수 있게 풀만 넉넉히 둔다.
         self._executor = ThreadPoolExecutor(
             max_workers=max(workers, max_inflight) * max(1, len(keys)))
@@ -67,6 +75,12 @@ class RollingDispatcher:
         """한 키의 AIMD 상한만 바꾼다. 이미 실행 중인 요청은 취소하지 않는다."""
         with self._lock:
             self._states[kid]["limit"] = max(1, int(value))
+        self._wake.set()
+
+    def set_global_inflight_limit(self, value):
+        """EC2 egress 전체의 동시 요청 상한을 바꾼다."""
+        with self._lock:
+            self._global_limit = max(1, int(value))
         self._wake.set()
 
     def reset_quota_blocks(self):
@@ -124,14 +138,18 @@ class RollingDispatcher:
                 loads[kid] += 1
                 assigned[kid].append(p)
 
-            for kid, routes in assigned.items():
+            nkeys = max(1, len(self._key_order))
+            for key_index, (kid, routes) in enumerate(assigned.items()):
                 count = len(routes)
                 for i, p in enumerate(routes):
                     rid = p["routeid"]
                     old = self._routes.get(rid)
                     generation = (old["generation"] + 1) if old else 1
-                    # 신규 패널이 첫 순간에 몰리지 않게 interval 전체에 균등 배치한다.
-                    due = now + (self.interval * i / count if count else 0)
+                    # 키 내부뿐 아니라 키 사이도 교차 배치한다. 네 키가 같은 due로
+                    # 4건씩 제출하는 마이크로버스트를 없애되 키당 rate는 유지한다.
+                    phase = ((i + key_index / nkeys) / count
+                             if count else 0)
+                    due = now + self.interval * phase
                     state = {
                         "meta": p, "keyid": kid, "generation": generation,
                         "active": True, "inflight": False, "next_due": due,
@@ -184,9 +202,12 @@ class RollingDispatcher:
             return {
                 "routes": sum(routes_by_key.values()),
                 "routesByKey": routes_by_key,
-                "inflight": sum(s["inflight"] for s in self._states.values()),
+                "inflight": self._global_inflight,
                 "limits": limits,
-                "limitTotal": sum(limits.values()),
+                "limitTotal": min(sum(limits.values()), self._global_limit),
+                "perKeyLimitTotal": sum(limits.values()),
+                "globalLimit": self._global_limit,
+                "globalBlocked": self._global_blocked_until > time.monotonic(),
                 "queued": sum(len(s["heap"]) for s in self._states.values()),
                 "quotaBlocked": sum(
                     s["quota_blocked_until"] > time.monotonic()
@@ -207,6 +228,10 @@ class RollingDispatcher:
         return result
 
     def _dispatch_due(self, now):
+        if (now < self._global_blocked_until
+                or self._global_inflight >= self._global_limit):
+            return
+        self._global_blocked_until = 0.0
         for kid in self._key_order:
             ks = self._states[kid]
             if now < ks["quota_blocked_until"]:
@@ -215,6 +240,7 @@ class RollingDispatcher:
             ks["quota_blocked_until"] = 0.0
             while (ks["heap"] and ks["heap"][0][0] <= now
                    and ks["inflight"] < ks["limit"]
+                   and self._global_inflight < self._global_limit
                    and now >= ks["next_submit"]):
                 due, _, rid, generation, attempt, origin_due, errors = heapq.heappop(ks["heap"])
                 route = self._routes.get(rid)
@@ -231,6 +257,7 @@ class RollingDispatcher:
                     break
                 route["inflight"] = True
                 ks["inflight"] += 1
+                self._global_inflight += 1
                 ks["next_submit"] = max(ks["next_submit"], now) + 1.0 / self.rate
                 fut = self._executor.submit(
                     self._guarded_fetch, self._keys[kid], route["meta"])
@@ -250,6 +277,7 @@ class RollingDispatcher:
             del self._futures[fut]
             kid, rid = job["kid"], job["rid"]
             self._states[kid]["inflight"] -= 1
+            self._global_inflight -= 1
             route = self._routes.get(rid)
             if route and route["generation"] == job["generation"]:
                 route["inflight"] = False
@@ -259,9 +287,16 @@ class RollingDispatcher:
                 result = (rid, [], type(exc).__name__, None)
             err = result[2]
             errors = job["errors"] + ([err] if err else [])
+            is_code99 = bool(err and "code99" in err)
+            if is_code99 and self.code99_cooldown:
+                self._global_blocked_until = max(
+                    self._global_blocked_until, now + self.code99_cooldown)
 
-            if err and job["attempt"] < self.retry_limit and route is not None:
-                pause = 6.0 if "code99" in err else 2.0
+            retryable = (
+                err and job["attempt"] < self.retry_limit and route is not None
+                and (self.retry_code99 or not is_code99))
+            if retryable:
+                pause = 6.0 if is_code99 else random.uniform(2.0, 5.0)
                 self._push(kid, now + pause, rid, job["generation"],
                            job["attempt"] + 1, job["origin_due"], errors)
                 continue
@@ -278,6 +313,11 @@ class RollingDispatcher:
                 self._push(kid, due, rid, job["generation"], 0, due, [])
 
     def _next_wait(self, now):
+        if now < self._global_blocked_until:
+            return self._global_blocked_until - now
+        if self._global_inflight >= self._global_limit:
+            # 완료 콜백이 wake를 세운다. due heap 때문에 짧게 재기상하지 않는다.
+            return None
         waits = []
         for ks in self._states.values():
             if now < ks["quota_blocked_until"]:

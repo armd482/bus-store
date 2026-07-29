@@ -4,38 +4,32 @@ from datetime import datetime
 from unittest.mock import patch
 
 from bus_collector import (
-    QuotaReservations, counter_check_due, midnight_inflight, next_inflight,
-    next_inflight_limits, quota_panel_target, reserve_calls)
+    QuotaReservations, counter_check_due, next_global_inflight,
+    quota_panel_target, reserve_calls)
 
 
 class InflightPolicyTests(unittest.TestCase):
-    def test_empty_or_tiny_window_does_not_raise_limit(self):
+    def test_code99_retreats_global_limit_to_configured_floor(self):
         self.assertEqual(
-            next_inflight(8, 22, False, attempted=0, minimum_samples=80), 8)
-        self.assertEqual(
-            next_inflight(10, 22, False, attempted=79, minimum_samples=80), 10)
-        self.assertEqual(
-            next_inflight(12, 22, True, attempted=1, minimum_samples=80), 8)
+            next_global_inflight(
+                36, 28, 44, True, 100, 80, 4, 5),
+            (28, 0))
 
-    def test_sufficient_clean_window_recovers_and_code99_retreats(self):
+    def test_global_limit_recovers_one_after_required_clean_windows(self):
         self.assertEqual(
-            next_inflight(10, 22, False, attempted=80, minimum_samples=80), 12)
+            next_global_inflight(
+                30, 28, 44, False, 100, 80, 3, 5),
+            (30, 4))
         self.assertEqual(
-            next_inflight(12, 22, True, attempted=80, minimum_samples=80), 8)
+            next_global_inflight(
+                30, 28, 44, False, 100, 80, 4, 5),
+            (31, 0))
 
-    def test_code99_retreats_only_the_affected_key(self):
+    def test_tiny_window_does_not_count_as_clean(self):
         self.assertEqual(
-            next_inflight_limits(
-                {"K1": 20, "K2": 20}, 22,
-                {"K1": 50, "K2": 50},
-                {"K1": ["code99:busy"], "K2": []},
-                {"K1": 170, "K2": 170}),
-            {"K1": 12, "K2": 22})
-
-    def test_midnight_only_clamps_when_quota_was_blocked(self):
-        self.assertEqual(midnight_inflight(22, True), 10)
-        self.assertEqual(midnight_inflight(8, True), 8)
-        self.assertEqual(midnight_inflight(12, False), 12)
+            next_global_inflight(
+                30, 28, 44, False, 79, 80, 4, 5),
+            (30, 0))
 
     def test_counter_migration_is_gated_by_day_or_safety_interval(self):
         self.assertTrue(counter_check_due("2026-07-27", None, 10, 0))

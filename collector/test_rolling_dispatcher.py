@@ -125,6 +125,54 @@ class RollingDispatcherTests(unittest.TestCase):
         self.assertGreater(maximum["key1"], 0)
         self.assertGreater(maximum["key2"], 1)
 
+    def test_global_inflight_caps_all_keys_together(self):
+        active = 0
+        maximum = 0
+        lock = __import__("threading").Lock()
+
+        def fetch(_key, _city, rid):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.06)
+            with lock:
+                active -= 1
+            return rid, [], None, __import__("datetime").datetime.now()
+
+        dispatcher = RollingDispatcher(
+            [("K1", "key1"), ("K2", "key2")], fetch,
+            lambda _kid, _n: True, interval=0.12, rate=100,
+            workers=4, max_inflight=4, global_inflight=3)
+        self.addCleanup(dispatcher.close)
+        dispatcher.set_routes([
+            {"routeid": f"route-{i}", "cityCode": 1} for i in range(16)
+        ])
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            dispatcher.get(timeout=0.02)
+        self.assertEqual(maximum, 3)
+        self.assertEqual(dispatcher.snapshot()["globalLimit"], 3)
+
+    def test_new_route_phases_interleave_keys(self):
+        dispatcher = RollingDispatcher(
+            [("K1", "key1"), ("K2", "key2")],
+            lambda _key, _city, rid: (
+                rid, [], None, __import__("datetime").datetime.now()),
+            lambda _kid, _n: True,
+            interval=10, rate=100, workers=1, max_inflight=1)
+        self.addCleanup(dispatcher.close)
+        dispatcher.set_routes([
+            {"routeid": f"route-{i}", "cityCode": 1} for i in range(8)
+        ])
+        with dispatcher._lock:
+            due_keys = sorted(
+                (state["next_due"], state["keyid"])
+                for state in dispatcher._routes.values()
+                if state["active"])
+        self.assertEqual(
+            [kid for _due, kid in due_keys[:4]], ["K1", "K2", "K1", "K2"])
+
     def test_retry_reserves_each_physical_call(self):
         calls = 0
         reservations = 0
@@ -152,6 +200,57 @@ class RollingDispatcherTests(unittest.TestCase):
         self.assertEqual(event["errors"], ["code99:busy"])
         self.assertEqual(calls, 2)
         self.assertEqual(reservations, 2)
+
+    def test_code99_can_skip_immediate_retry(self):
+        calls = 0
+        reservations = 0
+
+        def reserve(_kid, n):
+            nonlocal reservations
+            reservations += n
+            return True
+
+        def fetch(_key, _city, rid):
+            nonlocal calls
+            calls += 1
+            return rid, [], "code99:busy", __import__("datetime").datetime.now()
+
+        dispatcher = RollingDispatcher(
+            [("K1", "key")], fetch, reserve,
+            interval=10, rate=100, workers=2, max_inflight=2,
+            retry_code99=False)
+        self.addCleanup(dispatcher.close)
+        dispatcher.set_routes([{"routeid": "one", "cityCode": 1}])
+        event = dispatcher.get(timeout=0.5)
+        self.assertIsNotNone(event)
+        self.assertFalse(event["retried"])
+        self.assertEqual(event["errors"], ["code99:busy"])
+        self.assertEqual(calls, 1)
+        self.assertEqual(reservations, 1)
+
+    def test_code99_cooldown_pauses_all_new_submissions(self):
+        call_times = []
+
+        def fetch(_key, _city, rid):
+            call_times.append(time.monotonic())
+            err = "code99:busy" if len(call_times) == 1 else None
+            return rid, [], err, __import__("datetime").datetime.now()
+
+        dispatcher = RollingDispatcher(
+            [("K1", "key")], fetch, lambda _kid, _n: True,
+            interval=0.02, rate=100, workers=2, max_inflight=1,
+            global_inflight=1, code99_cooldown=0.15,
+            retry_code99=False)
+        self.addCleanup(dispatcher.close)
+        dispatcher.set_routes([
+            {"routeid": "one", "cityCode": 1},
+            {"routeid": "two", "cityCode": 1},
+        ])
+        deadline = time.monotonic() + 0.5
+        while len(call_times) < 2 and time.monotonic() < deadline:
+            dispatcher.get(timeout=0.03)
+        self.assertGreaterEqual(len(call_times), 2)
+        self.assertGreaterEqual(call_times[1] - call_times[0], 0.13)
 
 
     def test_scheduler_exception_surfaces_as_fatal(self):

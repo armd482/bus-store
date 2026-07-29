@@ -93,30 +93,17 @@ def service_day(t):
     return O.service_day_of(t).strftime("%Y-%m-%d")
 
 
-def next_inflight(current, maximum, saw99, attempted=1, minimum_samples=1):
-    """AIMD 한 단계. code99는 즉시 후퇴하고, 회복에만 충분한 표본을 요구한다."""
+def next_global_inflight(current, minimum, maximum, saw99, attempted,
+                         minimum_samples, clean_windows, recovery_windows):
+    """EC2 egress 공통 AIMD 한 단계와 다음 연속 정상창 수를 반환한다."""
     if saw99:
-        return max(8, int(current * 0.6))
+        return max(minimum, int(current * 0.75)), 0
     if attempted < minimum_samples:
-        return current
-    return min(maximum, current + 2)
-
-
-def next_inflight_limits(current, maximum, attempted, errors, routes):
-    """키별 건강 창으로 다음 AIMD 상한을 계산한다."""
-    return {
-        kid: next_inflight(
-            limit, maximum,
-            any("code99" in err for err in errors.get(kid, ())),
-            attempted.get(kid, 0),
-            max(1, routes.get(kid, 0) // 4))
-        for kid, limit in current.items()
-    }
-
-
-def midnight_inflight(current, quota_was_blocked, restart=10):
-    """자정 직전 쿼터로 멈췄다면 새 날을 보수적으로 재개하되 값을 올리지는 않는다."""
-    return min(current, restart) if quota_was_blocked else current
+        return current, 0
+    clean_windows += 1
+    if clean_windows < recovery_windows or current >= maximum:
+        return current, clean_windows
+    return min(maximum, current + 1), 0
 
 
 def counter_check_due(qday, counter_day, monotonic_now, next_check):
@@ -315,6 +302,20 @@ def main():
     effective_maxr = max(1, maxr * len(keys) // max(1, configured_keys))
     workers, rate = k["maxWorkers"], k["dispatchRate"]
     inflight_max = k["maxInflight"]
+    physical_global_max = max(1, inflight_max * len(keys))
+    global_max = min(
+        physical_global_max,
+        max(1, int(k.get("busGlobalMaxInflight", 44))))
+    global_min = min(
+        global_max,
+        max(1, int(k.get("busGlobalMinInflight", 28))))
+    global_initial = min(
+        global_max,
+        max(global_min, int(k.get("busGlobalInitialInflight", 36))))
+    global_recovery_windows = max(
+        1, int(k.get("busGlobalCleanWindows", 5)))
+    code99_cooldown = max(0, float(k.get("busCode99CooldownSec", 3)))
+    retry_code99 = bool(k.get("busRetryCode99", False))
     hold = k.get("busZombieHoldSec", 10)
     window = k["serviceWindow"]
 
@@ -325,6 +326,7 @@ def main():
     picked, written, report_no = [], 0, 0
     panel_target = effective_maxr
     capacity_clean_windows = 0
+    global_clean_windows = 0
     picked_band = None
     next_repick = 0.0
     rotated_day = None
@@ -338,11 +340,14 @@ def main():
     quota = QuotaReservations(key_cap)
 
     dispatcher = RollingDispatcher(
-        keys, fetch, quota.reserve, interval, rate, workers, inflight_max, hold)
+        keys, fetch, quota.reserve, interval, rate, workers, inflight_max, hold,
+        global_inflight=global_initial, code99_cooldown=code99_cooldown,
+        retry_code99=retry_code99)
 
     def blank_stats():
         return {
-            "attempted": 0, "successful": 0, "retried": 0, "residual": 0,
+            "attempted": 0, "successful": 0, "retried": 0, "recovered": 0,
+            "residual": 0,
             "moving": 0, "rows": 0, "errors": [], "final": {},
             "by_key": {
                 kid: {
@@ -364,7 +369,7 @@ def main():
     def report_window(report_day, report_band, elapsed, next_deadline):
         """완료 이벤트를 한 건강 창으로 확정한다. DB 쓰기는 메인 스레드만 한다."""
         nonlocal stats, report_no, report_started, report_at, next_repick
-        nonlocal capacity_clean_windows
+        nonlocal capacity_clean_windows, global_clean_windows
         report_obs = now()
         elapsed = max(0.001, elapsed)
         report_no += 1
@@ -378,7 +383,7 @@ def main():
             sum("Timeout" in e or "timed out" in e for e in all_errors),
             sum("HTTP429" in e for e in all_errors),
             sum(e.startswith("HTTP5") for e in all_errors),
-            elapsed, max(snap["limits"].values(), default=0), ts=health_ts)
+            elapsed, snap["globalLimit"], ts=health_ts)
         for kid, _ in keys:
             key_stats = stats["by_key"][kid]
             key_errors = key_stats["errors"]
@@ -422,6 +427,7 @@ def main():
             STATE["written"] = written
             STATE["errors"] = dict(stats["final"])
             STATE["retried"] = stats["retried"]
+            STATE["globalInflightLimit"] = snap["globalLimit"]
             STATE["rssMB"] = mem
             STATE["inflightLimits"] = dict(snap["limits"])
             STATE["night"] = False
@@ -435,14 +441,14 @@ def main():
                             "picked": stats["attempted"], "detail": detail})
                 del log[:-50]
 
-        recovered = stats["retried"] - stats["residual"]
+        recovered = stats["recovered"]
         print(f"[{report_obs:%H:%M:%S}] {elapsed:.0f}초 창 응답 "
               f"{stats['successful']}/{stats['attempted']} · "
               f"운행 {stats['moving']}대 · 통과 +{stats['rows']} "
               f"(누적 {written:,}) · 예약 {snap['queued']} · "
-              f"in-flight 합계 {snap['inflight']}/{snap['limitTotal']}"
-              f"(" + " ".join(
-                  f"{kid}={snap['limits'][kid]}" for kid, _ in keys) + ")"
+              f"in-flight 합계 {snap['inflight']}/{snap['globalLimit']} · "
+              f"키상한 " + " ".join(
+                  f"{kid}={snap['limits'][kid]}" for kid, _ in keys)
               + (f" · 쿼터차단 {snap['quotaBlocked']}키"
                  if snap["quotaBlocked"] else "")
               + (f" · {mem:.0f}MB" if mem else "")
@@ -461,28 +467,21 @@ def main():
                 for kid, _ in keys)
             print(f"[{report_obs:%H:%M:%S}] 콜 {detail}", flush=True)
 
-        # AIMD도 키별 세션 풀에 맞춰 독립 적용한다. 한 키의 code99가 다른 세 키의
-        # 정상 처리량까지 ×0.6으로 낮추지 않는다. 회복은 그 키에 배정된 패널의
-        # 1/4 이상 결과가 있는 정상 창에서만 허용한다.
-        changes = []
-        new_limits = next_inflight_limits(
-            snap["limits"], inflight_max,
-            {kid: stats["by_key"][kid]["attempted"] for kid, _ in keys},
-            {kid: stats["by_key"][kid]["errors"] for kid, _ in keys},
-            snap["routesByKey"])
-        for kid, _ in keys:
-            key_stats = stats["by_key"][kid]
-            saw99 = any("code99" in err for err in key_stats["errors"])
-            old_limit = snap["limits"][kid]
-            new_limit = new_limits[kid]
-            if new_limit != old_limit:
-                dispatcher.set_inflight_limit(kid, new_limit)
-                changes.append(
-                    f"{kid} {old_limit}→{new_limit}"
-                    f"({'code99 후퇴' if saw99 else '회복'})")
-        if changes:
-            print(f"[{report_obs:%H:%M:%S}] in-flight "
-                  + " · ".join(changes), flush=True)
+        # code99는 키 자체가 아니라 EC2 egress가 공유하는 세션 압력으로 실측됐다.
+        # 어느 키에서든 보이면 전역 상한을 후퇴시키고, 충분한 정상 창 뒤에만 +1한다.
+        saw99 = any("code99" in err for err in all_errors)
+        old_global = snap["globalLimit"]
+        new_global, global_clean_windows = next_global_inflight(
+            old_global, global_min, global_max, saw99, stats["attempted"],
+            max(1, snap["routes"] // 4), global_clean_windows,
+            global_recovery_windows)
+        if new_global != old_global:
+            dispatcher.set_global_inflight_limit(new_global)
+            print(
+                f"[{report_obs:%H:%M:%S}] 전역 in-flight "
+                f"{old_global}→{new_global}"
+                f"({'code99 후퇴' if saw99 else '정상창 회복'})",
+                flush=True)
 
         stats = blank_stats()
         report_started = time.monotonic()
@@ -491,6 +490,7 @@ def main():
     print(f"[{now():%H:%M:%S}] 연속 수집 시작 · 노선별 {interval}초 · 목표 {target}샘플 · "
           f"밴드 {nb}개 · 최대 {effective_maxr}노선 · "
           f"키 {len(keys)}개({', '.join(nm for nm, _ in keys)}) · "
+          f"전역 in-flight {global_initial}({global_min}~{global_max}) · "
           f"키당 계획 {planned_calls:,} / 상한 {key_cap:,} "
           f"(오늘 합계 {read_calls(quota_day(now())):,} 사용)", flush=True)
 
@@ -509,17 +509,8 @@ def main():
                     else O.band_of(t, bands),
                     mono - report_started, mono + interval)
                 blocked = set(dispatcher.reset_quota_blocks_by_key())
-                old_limits = dispatcher.inflight_limits
-                changes = []
-                for kid, old_limit in old_limits.items():
-                    new_limit = midnight_inflight(old_limit, kid in blocked)
-                    if new_limit != old_limit:
-                        dispatcher.set_inflight_limit(kid, new_limit)
-                        changes.append(f"{kid} {old_limit}→{new_limit}")
                 print(f"[{t:%H:%M:%S}] 쿼터 날짜 전환 {stats_qday} → {qday} · "
-                      f"차단 해제 {len(blocked)}키"
-                      + (f" · in-flight {' · '.join(changes)}"
-                         if changes else ""), flush=True)
+                      f"차단 해제 {len(blocked)}키", flush=True)
                 stats_qday = qday
 
             mono = time.monotonic()
@@ -634,6 +625,8 @@ def main():
                         continue
                     key_stats["successful"] += 1
                     stats["successful"] += 1
+                    if event["retried"]:
+                        stats["recovered"] += 1
                     band = O.band_of(obs, bands)
                     dtype = O.day_type(obs)
                     hol = O.is_holiday(obs)
