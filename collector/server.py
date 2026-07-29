@@ -542,9 +542,15 @@ def snapshot():
     def hpct(pos):
         return health_rows[min(len(health_rows)-1, int((len(health_rows)-1)*pos))][8] if health_rows else 0
     attempted_total = sum(r[0] for r in health_rows)
+    # 컬럼 추가 전 오늘 행은 latency/connection 기본값이 0이다. 그 행까지 분모에
+    # 넣으면 배포 당일 실제 2~3초 지연이 0.05초처럼 희석된다.
+    metric_rows = [
+        r for r in health_rows
+        if r[10] > 0 or r[11] > 0 or r[13] > 0 or r[14] > 0]
+    metric_attempted = sum(r[0] for r in metric_rows)
     def hweighted(index):
-        return (sum(r[index] * r[0] for r in health_rows) / attempted_total
-                if attempted_total else 0)
+        return (sum(r[index] * r[0] for r in metric_rows) / metric_attempted
+                if metric_attempted else 0)
     conn_created = sum(r[13] for r in health_rows)
     conn_reused = sum(r[14] for r in health_rows)
     conn_closed = sum(r[15] for r in health_rows)

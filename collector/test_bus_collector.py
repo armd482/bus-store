@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 import threading
 from datetime import datetime
@@ -5,8 +7,8 @@ from unittest.mock import Mock, patch
 
 from bus_collector import (
     QuotaReservations, counter_check_due, next_global_inflight,
-    percentile, pick_routes_readonly, quota_panel_target, quota_rate_targets,
-    reserve_calls)
+    load_cached_panel, percentile, pick_routes_readonly, quota_panel_target,
+    quota_rate_targets, reserve_calls, save_cached_panel)
 
 
 class PickerAndMetricsTests(unittest.TestCase):
@@ -25,6 +27,21 @@ class PickerAndMetricsTests(unittest.TestCase):
                 pick_routes_readonly(10, 7, 7, when),
                 [{"routeid": "R"}])
         conn.close.assert_called_once_with()
+
+    def test_panel_cache_round_trip_filters_and_limits_routes(self):
+        routes = [
+            {"routeid": "R1", "cityCode": "31", "fill": 0.2},
+            {"routeid": "R2", "cityCode": "32", "fill": 0.1},
+            {"routeid": "", "cityCode": "33"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("bus_collector.O.DATA", tmp):
+            save_cached_panel(routes)
+            self.assertEqual(
+                [r["routeid"] for r in load_cached_panel(1)], ["R1"])
+            self.assertFalse(any(
+                name.startswith(".bus-panel.json.tmp-")
+                for name in os.listdir(tmp)))
 
 
 class InflightPolicyTests(unittest.TestCase):

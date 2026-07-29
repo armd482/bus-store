@@ -201,6 +201,44 @@ def pick_routes_readonly(n, target, nbands, t):
         conn.close()
 
 
+def panel_cache_path():
+    return os.path.join(O.DATA, ".bus-panel.json")
+
+
+def load_cached_panel(limit):
+    """재시작 직후 쓸 직전 패널. 새 비동기 선정이 끝나면 즉시 교체된다."""
+    try:
+        with open(panel_cache_path(), encoding="utf-8") as f:
+            routes = json.load(f).get("routes", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    valid = [
+        route for route in routes
+        if isinstance(route, dict)
+        and route.get("routeid") and route.get("cityCode") is not None
+    ]
+    return valid[:max(0, int(limit))]
+
+
+def save_cached_panel(routes):
+    """선정 결과를 원자 교체해 중간 종료에도 이전 캐시를 보존한다."""
+    path = panel_cache_path()
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(
+                {"savedAt": time.time(), "routes": routes},
+                f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        print(f"[패널 캐시] ⚠️ 저장 실패: {exc}", flush=True)
+
+
 # ── 일 호출수는 디스크에 (KeepAlive 재시작해도 상한을 넘지 않게) ────────
 # ⚠️ 키는 운행일(04시 경계)이 아니라 **달력일**이다 — data.go.kr 쿼터가 자정에 리셋된다.
 #    운행일로 세면 04시에 카운터만 0이 되는데 API 는 00-04시 콜(~3.7만)을 이미 새 날로
@@ -398,7 +436,7 @@ def main():
     last = {}  # (routeid, vehicleno) -> (nodeord, 관측시각, nodeid, route_version)
     route_versions = dict(conn.execute(
         "SELECT routeid,currentVersion FROM route WHERE currentVersion IS NOT NULL"))
-    picked, written, report_no = [], 0, 0
+    picked, written, report_no = load_cached_panel(effective_maxr), 0, 0
     panel_target = effective_maxr
     capacity_clean_windows = 0
     global_clean_windows = 0
@@ -430,6 +468,12 @@ def main():
         keys, fetch, quota.reserve, interval, rate, workers, inflight_max, hold,
         global_inflight=global_initial, code99_cooldown=code99_cooldown,
         retry_code99=retry_code99)
+    if picked:
+        dispatcher.set_routes(picked)
+        print(
+            f"[{now():%H:%M:%S}] 직전 패널 {len(picked)}개 즉시 복원 "
+            f"(새 선정은 백그라운드 계산)",
+            flush=True)
 
     def blank_stats():
         return {
@@ -741,6 +785,7 @@ def main():
                             flush=True)
                     else:
                         picked = selected
+                        save_cached_panel(picked)
                         panel_target = req["panel"]
                         picked_band = cur_band
                         next_repick = mono + REPICK_EVERY * interval
