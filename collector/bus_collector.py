@@ -16,13 +16,14 @@
 """
 
 import json
+import math
 import os
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import orchestrator as O
 import env_config as E
@@ -121,6 +122,35 @@ def midnight_inflight(current, quota_was_blocked, restart=10):
 def counter_check_due(qday, counter_day, monotonic_now, next_check):
     """호출 장부 migration을 시작·날짜 전환·안전망 주기에만 실행한다."""
     return qday != counter_day or monotonic_now >= next_check
+
+
+def quota_panel_target(t, calls, base_panel, interval, dispatch_rate,
+                       planned_per_key, can_expand):
+    """남은 달력일의 계획 호출량을 패널 수로 환산한다.
+
+    이 함수는 기존 패널을 줄이지 않고, 기존 패널을 실제로 소화한 최근 창이 있을
+    때만 확장한다. 확장 상한도 ``dispatch_rate × interval``이라 제출 rate나
+    in-flight를 올리지 않는다. 심야처럼 운행 후보가 적으면 pick_routes가 이 목표보다
+    적은 실제 후보만 반환하므로 빈 노선을 만들어 쿼터를 태우지 않는다.
+    """
+    if not calls:
+        return max(1, int(base_panel))
+    tomorrow = (t + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    seconds_left = max(1.0, (tomorrow - t).total_seconds())
+    required_rates = [
+        max(0, planned_per_key - used) / seconds_left
+        for used in calls.values()
+    ]
+    desired = math.ceil(sum(required_rates) * interval)
+    per_key_capacity = max(1, math.floor(dispatch_rate * interval))
+    capacity = per_key_capacity * len(calls)
+    wanted = max(int(base_panel), min(desired, capacity))
+    if wanted > base_panel and not can_expand:
+        return int(base_panel)
+    # 키별 라우팅이 균등하므로 키 수의 배수로 올려 한 키만 한 슬롯 더 받지 않게 한다.
+    nkeys = len(calls)
+    return min(capacity, int(math.ceil(wanted / nkeys) * nkeys))
 
 
 # ── 일 호출수는 디스크에 (KeepAlive 재시작해도 상한을 넘지 않게) ────────
@@ -276,6 +306,8 @@ def main():
 
     k = O.cfg()
     key_cap = k.get("busKeyDailyCap", 480000)
+    planned_calls = min(
+        key_cap, k.get("busPlannedCallsPerKey", key_cap - 5000))
     conn = O.connect()
     bands, target, nb = k["timebands"], k["targetSamples"], len(k["timebands"])
     interval, maxr = k["intervalSec"], k["maxRoutes"]
@@ -291,6 +323,8 @@ def main():
     route_versions = dict(conn.execute(
         "SELECT routeid,currentVersion FROM route WHERE currentVersion IS NOT NULL"))
     picked, written, report_no = [], 0, 0
+    panel_target = effective_maxr
+    capacity_clean_windows = 0
     picked_band = None
     next_repick = 0.0
     rotated_day = None
@@ -311,7 +345,10 @@ def main():
             "attempted": 0, "successful": 0, "retried": 0, "residual": 0,
             "moving": 0, "rows": 0, "errors": [], "final": {},
             "by_key": {
-                kid: {"attempted": 0, "errors": []}
+                kid: {
+                    "attempted": 0, "successful": 0, "retried": 0,
+                    "residual": 0, "errors": [],
+                }
                 for kid, _ in keys
             },
         }
@@ -327,11 +364,13 @@ def main():
     def report_window(report_day, report_band, elapsed, next_deadline):
         """완료 이벤트를 한 건강 창으로 확정한다. DB 쓰기는 메인 스레드만 한다."""
         nonlocal stats, report_no, report_started, report_at
+        nonlocal capacity_clean_windows
         report_obs = now()
         elapsed = max(0.001, elapsed)
         report_no += 1
         snap = dispatcher.snapshot()
         all_errors = stats["errors"]
+        health_ts = time.time()
         O.record_health(
             conn, report_day, report_band, stats["attempted"], stats["successful"],
             stats["retried"], stats["residual"],
@@ -339,8 +378,32 @@ def main():
             sum("Timeout" in e or "timed out" in e for e in all_errors),
             sum("HTTP429" in e for e in all_errors),
             sum(e.startswith("HTTP5") for e in all_errors),
-            elapsed, max(snap["limits"].values(), default=0))
+            elapsed, max(snap["limits"].values(), default=0), ts=health_ts)
+        for kid, _ in keys:
+            key_stats = stats["by_key"][kid]
+            key_errors = key_stats["errors"]
+            O.record_key_health(
+                conn, health_ts, report_day, report_band, kid,
+                key_stats["attempted"], key_stats["successful"],
+                key_stats["retried"], key_stats["residual"],
+                sum("code99" in e for e in key_errors),
+                sum("Timeout" in e or "timed out" in e for e in key_errors),
+                sum("HTTP429" in e for e in key_errors),
+                sum(e.startswith("HTTP5") for e in key_errors),
+                elapsed, snap["limits"][kid], snap["routesByKey"][kid],
+                panel_target)
         conn.commit()
+
+        # 패널을 늘려도 호출량이 늘 조건인지 먼저 확인한다. 현재 활성 패널의 90%를
+        # 3개 연속 창에서 완료한 뒤에만 쿼터 기반 확장을 허용한다. 대기열이 밀린
+        # 상태에서는 노선만 더 넣어 실효 주기를 악화시키지 않는다. 심야의 작은
+        # 운행 후보 풀을 100% 소화한 것은 주간 기본 패널의 처리능력 증거가 아니므로
+        # 기본 패널의 90% 이상이 실제 활성인 창만 센다.
+        cadence_ok = (
+            snap["routes"] >= math.ceil(effective_maxr * 0.9)
+            and stats["attempted"] >= math.ceil(snap["routes"] * 0.9))
+        capacity_clean_windows = (
+            capacity_clean_windows + 1 if cadence_ok else 0)
 
         mem = O.rss_mb()
         with LOCK:
@@ -349,6 +412,7 @@ def main():
                 STATE["lastObs"] = time.time()
             STATE["lastCycleSec"] = elapsed
             STATE["picked"] = len(picked)
+            STATE["panelTarget"] = panel_target
             STATE["moving"] = stats["moving"]
             STATE["written"] = written
             STATE["errors"] = dict(stats["final"])
@@ -422,7 +486,8 @@ def main():
     print(f"[{now():%H:%M:%S}] 연속 수집 시작 · 노선별 {interval}초 · 목표 {target}샘플 · "
           f"밴드 {nb}개 · 최대 {effective_maxr}노선 · "
           f"키 {len(keys)}개({', '.join(nm for nm, _ in keys)}) · "
-          f"키당 상한 {key_cap:,} (오늘 합계 {read_calls(quota_day(now())):,} 사용)", flush=True)
+          f"키당 계획 {planned_calls:,} / 상한 {key_cap:,} "
+          f"(오늘 합계 {read_calls(quota_day(now())):,} 사용)", flush=True)
 
     try:
         while True:
@@ -498,7 +563,23 @@ def main():
             # 기존 REPICK_EVERY(40창≈21분)를 시간 기준으로 보존한다.
             # 독립 스케줄러에는 전역 사이클 번호가 없으므로 벽시계가 더 정확하다.
             if not picked or band_changed or mono >= next_repick:
-                picked = O.pick_routes(conn, effective_maxr, target, nb, t=t)
+                calls = {
+                    kid: read_calls(qday, kid)
+                    for kid, _ in keys
+                }
+                new_panel_target = quota_panel_target(
+                    t, calls, effective_maxr, interval, rate, planned_calls,
+                    capacity_clean_windows >= 3)
+                if new_panel_target != panel_target:
+                    print(
+                        f"[{t:%H:%M:%S}] 쿼터 패널 {panel_target}→"
+                        f"{new_panel_target} · 최근 소화 연속창 "
+                        f"{capacity_clean_windows} · "
+                        + " ".join(
+                            f"{kid}={calls[kid]:,}" for kid, _ in keys),
+                        flush=True)
+                panel_target = new_panel_target
+                picked = O.pick_routes(conn, panel_target, target, nb, t=t)
                 picked_band = cur_band
                 next_repick = mono + REPICK_EVERY * interval
                 dispatcher.set_routes(picked)
@@ -536,14 +617,17 @@ def main():
                     routeid, items, err, obs = event["result"]
                     key_stats = stats["by_key"][event["keyid"]]
                     key_stats["attempted"] += 1
+                    key_stats["retried"] += int(event["retried"])
                     key_stats["errors"] += event["errors"]
                     stats["attempted"] += 1
                     stats["retried"] += int(event["retried"])
                     stats["errors"] += event["errors"]
                     if err:
+                        key_stats["residual"] += 1
                         stats["residual"] += 1
                         stats["final"][err] = stats["final"].get(err, 0) + 1
                         continue
+                    key_stats["successful"] += 1
                     stats["successful"] += 1
                     band = O.band_of(obs, bands)
                     dtype = O.day_type(obs)

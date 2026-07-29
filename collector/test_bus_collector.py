@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from bus_collector import (
     QuotaReservations, counter_check_due, midnight_inflight, next_inflight,
-    next_inflight_limits, reserve_calls)
+    next_inflight_limits, quota_panel_target, reserve_calls)
 
 
 class InflightPolicyTests(unittest.TestCase):
@@ -42,6 +42,32 @@ class InflightPolicyTests(unittest.TestCase):
         self.assertFalse(counter_check_due("2026-07-27", "2026-07-27", 20, 30))
         self.assertTrue(counter_check_due("2026-07-28", "2026-07-27", 20, 30))
         self.assertTrue(counter_check_due("2026-07-27", "2026-07-27", 30, 30))
+
+
+class QuotaPanelTests(unittest.TestCase):
+    def test_does_not_expand_while_existing_panel_is_backlogged(self):
+        t = datetime(2026, 7, 29, 12, 0)
+        self.assertEqual(
+            quota_panel_target(
+                t, {"K1": 100000, "K2": 100000}, 340, 31, 6, 475000,
+                can_expand=False),
+            340)
+
+    def test_expands_only_to_existing_rate_capacity(self):
+        t = datetime(2026, 7, 29, 23, 0)
+        self.assertEqual(
+            quota_panel_target(
+                t, {"K1": 100000, "K2": 100000}, 340, 31, 6, 475000,
+                can_expand=True),
+            372)
+
+    def test_never_reduces_base_panel_when_quota_is_ahead(self):
+        t = datetime(2026, 7, 29, 12, 0)
+        self.assertEqual(
+            quota_panel_target(
+                t, {"K1": 400000, "K2": 400000}, 340, 31, 6, 475000,
+                can_expand=True),
+            340)
 
 
 class QuotaReservationsTests(unittest.TestCase):

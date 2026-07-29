@@ -327,6 +327,21 @@ def connect(check_same_thread=True):
         duration REAL NOT NULL, inflight INTEGER NOT NULL
       )""")
     c.execute("CREATE INDEX IF NOT EXISTS health_day ON collector_health_cycle(day)")
+    # 집계 행만으로는 code99가 특정 키의 동시성 때문인지, 여러 키에 동시에 발생한
+    # 공급자 측 압력인지 구분할 수 없다. 같은 ts의 키별 창을 함께 보존해 AIMD 상한과
+    # 오류 발생을 직접 대조한다.
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS collector_health_key (
+        ts REAL NOT NULL, day TEXT NOT NULL, band INTEGER, keyid TEXT NOT NULL,
+        attempted INTEGER NOT NULL, successful INTEGER NOT NULL,
+        retried INTEGER NOT NULL, residual INTEGER NOT NULL,
+        code99 INTEGER NOT NULL, timeouts INTEGER NOT NULL,
+        http429 INTEGER NOT NULL, http5xx INTEGER NOT NULL,
+        duration REAL NOT NULL, inflight INTEGER NOT NULL,
+        routes INTEGER NOT NULL, panel INTEGER NOT NULL,
+        PRIMARY KEY(ts,keyid)
+      )""")
+    c.execute("CREATE INDEX IF NOT EXISTS health_key_day ON collector_health_key(day,keyid)")
 
     # 기존 DB 마이그레이션 — CREATE TABLE IF NOT EXISTS 는 이미 있는 테이블에 컬럼을 안 붙인다.
     # ⚠️ 이걸 빠뜨려 배포본에만 손으로 ALTER 했다가, 새 기계에서 'no such column: startvt' 로 죽었다.
@@ -602,6 +617,20 @@ def record_health(conn, day, band, attempted, successful, retried, residual,
        code99, timeouts, http429, http5xx, duration, inflight))
     # 일 단위 상세는 30일만 보존한다.
     conn.execute("DELETE FROM collector_health_cycle WHERE ts < ?", (time.time()-30*86400,))
+
+
+def record_key_health(conn, ts, day, band, keyid, attempted, successful,
+                      retried, residual, code99, timeouts, http429, http5xx,
+                      duration, inflight, routes, panel):
+    """한 건강 창의 키별 물리 오류와 동시성 상한을 보존한다."""
+    conn.execute("""INSERT INTO collector_health_key
+      (ts,day,band,keyid,attempted,successful,retried,residual,code99,timeouts,
+       http429,http5xx,duration,inflight,routes,panel)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+      (ts, day, band, keyid, attempted, successful, retried, residual,
+       code99, timeouts, http429, http5xx, duration, inflight, routes, panel))
+    conn.execute("DELETE FROM collector_health_key WHERE ts < ?",
+                 (time.time()-30*86400,))
 
 
 # ── 지하철 관제 시각 (§8.1) ────────────────────────────────────────
