@@ -79,11 +79,8 @@ _SUB_LOCK = threading.Lock()
 _SEOUL_TAIL = {}
 _SEOUL_LOCK = threading.Lock()
 
-# 대시보드용 sqlite 연결 하나를 공유한다 — /api(5초)마다 connect() 하면 매번
-# CREATE TABLE·PRAGMA 가 돌고 연결이 닫히지 않은 채 GC 로 넘어간다.
-# ThreadingHTTPServer 는 요청마다 새 스레드라 thread-local 로는 재사용이 안 되므로,
-# check_same_thread=False 로 하나를 만들고 _DB_LOCK 으로 직렬화한다.
-# 읽기 전용이고 WAL 이라 수집기의 쓰기를 막지 않는다.
+# 대시보드 집계 한 번 안에서만 공유하는 읽기 전용 연결. /api는 메모리 캐시만
+# 반환하므로 집계가 끝나면 닫아 WAL checkpoint의 끝점을 붙잡지 않게 한다.
 _DB = None
 _DB_LOCK = threading.Lock()
 
@@ -91,8 +88,16 @@ _DB_LOCK = threading.Lock()
 def db():
     global _DB
     if _DB is None:
-        _DB = O.connect(check_same_thread=False)
+        _DB = O.connect_readonly(check_same_thread=False)
     return _DB
+
+
+def close_db():
+    global _DB
+    with _DB_LOCK:
+        if _DB is not None:
+            _DB.close()
+            _DB = None
 
 
 def load_judged():
@@ -441,27 +446,38 @@ def snapshot():
     goal = sum(eligible.values())
     day_goal = eligible_by_day.get(O.day_type(datetime.now(O.KST)), 0)
 
-    # 한 번의 스캔으로 — 백그라운드 캐시가 계산하므로 셀 수백만이어도 괜찮다.
+    # cell 250만 행은 정확히 한 번만 스캔한다. 이전에는 전체·밴드·요일·ETA용으로
+    # 3~4번 읽어 작은 EC2의 iowait와 WAL 독자 시간을 키웠다.
     # ★ 완료 = n>=target AND n_days>=minDays (같은 날 완주 방지 — 외부 리뷰)
     md = k.get("minDays", 2)
     with _DB_LOCK:
-        seen, total, done = c.execute(
-            "SELECT COUNT(*), COALESCE(SUM(n),0), COALESCE(SUM(n >= ? AND n_days >= ?),0) FROM cell",
-            (tgt, md)).fetchone()
+        cell_rows = c.execute(
+            """SELECT daytype,band,COUNT(*),COALESCE(SUM(n),0),
+                      COALESCE(SUM(n >= ? AND n_days >= ?),0),
+                      COALESCE(SUM(MIN(n,?)),0),
+                      COALESCE(SUM(MIN(n_days,?)),0),
+                      COALESCE(SUM(n >= ?),0),
+                      COALESCE(SUM(n_days >= ?),0)
+               FROM cell GROUP BY daytype,band""",
+            (tgt, md, tgt, md, tgt, md)).fetchall()
+    seen = sum(r[2] for r in cell_rows)
+    total = sum(r[3] for r in cell_rows)
+    done = sum(r[4] for r in cell_rows)
+    capped = sum(r[5] for r in cell_rows)
 
     # 밴드별 — 오늘(운행일 기준) 요일만 본다. 자정~04시엔 전날 요일이 '오늘'이다
     # (01:30 관측은 전날 막차 — day_type 이 운행일 경계로 처리한다).
     now = datetime.now(O.KST)
     today = O.day_type(now)
     nowband = O.band_of(now, bands)
-    with _DB_LOCK:
-        # ⚠️ 진행률 분자는 **셀별로 target 까지만 센 SUM(MIN(n,target))** — 한 셀의 초과
-        #    관측이 다른 미관측 셀을 보상해 허위/초과 100% 가 되는 것을 막는다. 원시 SUM(n)
-        #    은 표시용으로만(obs) 남긴다.
-        byband = {b: (n, cells, filled) for b, n, cells, filled in c.execute(
-            "SELECT band, SUM(n), COUNT(*), COALESCE(SUM(MIN(n,?)),0) "
-            "FROM cell WHERE daytype=? GROUP BY band",
-            (tgt, today)).fetchall()}
+    # ⚠️ 진행률 분자는 **셀별로 target 까지만 센 SUM(MIN(n,target))** — 한 셀의 초과
+    # 관측이 다른 미관측 셀을 보상하지 못하게 한다.
+    byband = {
+        band: (raw_n, cells, fill_n)
+        for daytype, band, cells, raw_n, _full, fill_n,
+            _day_fill, _sample_ready, _date_ready in cell_rows
+        if daytype == today
+    }
     band_rows = []
     for i, (a, b) in enumerate(bands):
         n, cells, filled = byband.get(i, (0, 0, 0))
@@ -477,16 +493,15 @@ def snapshot():
     # 요일별 — 분모는 요일 하나 기준(day_goal). 단일 GROUP BY 로 한 번에
     # (요일마다 별도 COUNT 쿼리를 치면 스캔 7회 — 셀이 커지면 /api 가 느려진다).
     byday = {}
-    with _DB_LOCK:
-        day_rows = c.execute(
-            """SELECT daytype, SUM(n), COUNT(*),
-                      SUM(n >= ? AND n_days >= ?),
-                      COALESCE(SUM(MIN(n,?)),0),
-                      COALESCE(SUM(MIN(n_days,?)),0),
-                      COALESCE(SUM(n >= ?),0),
-                      COALESCE(SUM(n_days >= ?),0)
-               FROM cell GROUP BY daytype""",
-            (tgt, md, tgt, md, tgt, md)).fetchall()
+    day_agg = {}
+    for daytype, _band, cells, raw_n, full, fill_n, day_fill_n, \
+            sample_ready, date_ready in cell_rows:
+        a = day_agg.setdefault(daytype, [0] * 7)
+        for i, value in enumerate((
+                raw_n, cells, full, fill_n, day_fill_n,
+                sample_ready, date_ready)):
+            a[i] += value
+    day_rows = [(daytype, *values) for daytype, values in day_agg.items()]
     for d, n, cells, full, fill_n, day_fill_n, sample_ready, date_ready in day_rows:
         dgoal = eligible_by_day.get(d, 0)
         byday[d] = {
@@ -523,19 +538,37 @@ def snapshot():
         calls = sum(x["calls"] for x in bus_key_calls)
     with _DB_LOCK:
         health_rows = c.execute("""SELECT attempted,successful,retried,residual,code99,timeouts,
-                                  http429,http5xx,duration,inflight
+                                  http429,http5xx,duration,inflight,
+                                  latency_avg,latency_p50,latency_p90,
+                                  conn_created,conn_reused,conn_closed
                                   FROM collector_health_cycle WHERE day=? ORDER BY duration""",
                                 (qday or "",)).fetchall()
     def hpct(pos):
         return health_rows[min(len(health_rows)-1, int((len(health_rows)-1)*pos))][8] if health_rows else 0
+    attempted_total = sum(r[0] for r in health_rows)
+    def hweighted(index):
+        return (sum(r[index] * r[0] for r in health_rows) / attempted_total
+                if attempted_total else 0)
+    conn_created = sum(r[13] for r in health_rows)
+    conn_reused = sum(r[14] for r in health_rows)
+    conn_closed = sum(r[15] for r in health_rows)
     health = {
         "cycles": len(health_rows),
-        "attempted": sum(r[0] for r in health_rows), "successful": sum(r[1] for r in health_rows),
+        "attempted": attempted_total, "successful": sum(r[1] for r in health_rows),
         "retried": sum(r[2] for r in health_rows), "residual": sum(r[3] for r in health_rows),
         "code99": sum(r[4] for r in health_rows), "timeouts": sum(r[5] for r in health_rows),
         "http429": sum(r[6] for r in health_rows), "http5xx": sum(r[7] for r in health_rows),
         "p50": hpct(.50), "p95": hpct(.95), "p99": hpct(.99),
         "maxInflight": max((r[9] for r in health_rows), default=0),
+        "latencyAvg": hweighted(10),
+        "latencyP50": hweighted(11),
+        "latencyP90": hweighted(12),
+        "connCreated": conn_created,
+        "connReused": conn_reused,
+        "connClosed": conn_closed,
+        "connReusePct": (
+            conn_reused / (conn_created + conn_reused)
+            if conn_created + conn_reused else 0),
     }
 
     with LOCK:
@@ -556,8 +589,6 @@ def snapshot():
     if per_day and win_days < 1.0:
         eta_measuring = True                     # 표본은 있으나 창이 얇다
     elif per_day and goal:
-        with _DB_LOCK:
-            capped = c.execute("SELECT COALESCE(SUM(MIN(n,?)),0) FROM cell", (tgt,)).fetchone()[0]
         remaining = max(0, goal * tgt - capped)
         eta = remaining / per_day
         eta_hi = eta
@@ -775,6 +806,8 @@ function renderBus(d){
       · 재시도 ${num(hh.retried)} · 잔여실패 ${num(hh.residual)}
       · code99 ${num(hh.code99)} · timeout ${num(hh.timeouts)} · 429 ${num(hh.http429)} · 5xx ${num(hh.http5xx)}
       · 사이클 p50/p95/p99 ${hh.p50.toFixed(1)}/${hh.p95.toFixed(1)}/${hh.p99.toFixed(1)}초
+      · 요청지연 avg/p50/p90 ${Number(hh.latencyAvg||0).toFixed(2)}/${Number(hh.latencyP50||0).toFixed(2)}/${Number(hh.latencyP90||0).toFixed(2)}초
+      · 연결재사용 ${pct(hh.connReusePct||0)} (신규 ${num(hh.connCreated)} · 종료 ${num(hh.connClosed)})
       · 최대 in-flight ${num(hh.maxInflight)}</div>`;
   const ss = d.storage || {};
   h += `<div class=sub>자원: 수집기 RSS ${ss.rssMB!=null?ss.rssMB.toFixed(0)+'MB':'—'}
@@ -1209,18 +1242,28 @@ _SNAP = {"data": b'{"warming":true}', "at": 0.0}
 _SNAP_LOCK = threading.Lock()
 
 
-def _snapshot_loop(period=15):
+def _snapshot_loop(period=None):
     """주기적으로 snapshot() 을 계산해 직렬화된 바이트로 캐시한다 (단일 스레드)."""
+    if period is None:
+        period = max(15, int(O.cfg().get("dashboardSnapshotSec", 120)))
     while True:
         t0 = time.time()
+        succeeded = False
         try:
             body = json.dumps(snapshot(), ensure_ascii=False).encode()
             with _SNAP_LOCK:
                 _SNAP["data"], _SNAP["at"] = body, time.time()
+            succeeded = True
         except Exception as e:
             print(f"⚠️ 스냅샷 계산 실패: {type(e).__name__}: {e}", flush=True)
+        finally:
+            # SELECT cursor가 모두 소진됐더라도 연결까지 닫아 reader mark를 확실히
+            # 해제한다. 다음 집계는 schema write 없는 mode=ro 연결을 새로 연다.
+            close_db()
         # 계산이 오래 걸려도 다음 주기까지는 쉰다 (최소 3초는 양보)
-        time.sleep(max(3.0, period - (time.time() - t0)))
+        time.sleep(
+            max(3.0, period - (time.time() - t0))
+            if succeeded else 5.0)
 
 
 def main():

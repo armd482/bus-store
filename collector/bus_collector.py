@@ -23,13 +23,17 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import orchestrator as O
 import env_config as E
+from http_pool import KeyedHTTPSPool
 from rolling_dispatcher import RollingDispatcher
 
 BASE = "https://apis.data.go.kr/1613000/BusLcInfoInqireService/getRouteAcctoBusLcList"
+BASE_HOST = "apis.data.go.kr"
+BASE_PATH = "/1613000/BusLcInfoInqireService/getRouteAcctoBusLcList"
 RESERVE_BLOCK = 64  # 쿼터 선예약 블록(reserve 참조). 파일 교체를 ~1/64로 줄이고
                     # 크래시 시 키당 최대 63콜 과다계상(과소계상 없음).
 COUNTER_CHECK_SEC = 600  # 구버전 합계 장부 migration 안전망. 시작·자정 외 10분마다.
@@ -41,6 +45,7 @@ REPICK_EVERY = 40  # 40×interval마다 정기 재선정 (~21분). 밴드 변경
 STATE = {"errors": {}}
 LOCK = __import__("threading").Lock()
 _CALL_LOCK = __import__("threading").Lock()
+_HTTP_POOL = None
 
 
 def _load_key(envname):
@@ -177,6 +182,25 @@ def quota_rate_targets(t, calls, planned_per_key, max_rates, routes_by_key,
     return targets
 
 
+def percentile(values, fraction):
+    """외부 의존성 없는 nearest-rank 백분위수."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1,
+                       math.ceil(len(ordered) * fraction) - 1))
+    return float(ordered[index])
+
+
+def pick_routes_readonly(n, target, nbands, t):
+    """노선 전수 집계를 수집 DB writer와 다른 짧은 수명 읽기 연결에서 수행한다."""
+    conn = O.connect_readonly()
+    try:
+        return O.pick_routes(conn, n, target, nbands, t=t)
+    finally:
+        conn.close()
+
+
 # ── 일 호출수는 디스크에 (KeepAlive 재시작해도 상한을 넘지 않게) ────────
 # ⚠️ 키는 운행일(04시 경계)이 아니라 **달력일**이다 — data.go.kr 쿼터가 자정에 리셋된다.
 #    운행일로 세면 04시에 카운터만 0이 되는데 API 는 00-04시 콜(~3.7만)을 이미 새 날로
@@ -299,8 +323,14 @@ def fetch(key, city, routeid):
     q = urllib.parse.urlencode({"serviceKey": key, "_type": "json", "cityCode": city,
                                 "routeId": routeid, "numOfRows": 200})
     try:
-        with urllib.request.urlopen(f"{BASE}?{q}", timeout=15) as r:
-            d = json.loads(r.read().decode())
+        if _HTTP_POOL is not None:
+            status, raw = _HTTP_POOL.get(key, f"{BASE_PATH}?{q}")
+            if status >= 400:
+                return routeid, [], f"HTTP{status}", now()
+            d = json.loads(raw.decode())
+        else:
+            with urllib.request.urlopen(f"{BASE}?{q}", timeout=15) as r:
+                d = json.loads(r.read().decode())
         obs = now()   # ★ 응답 수신 **직후** = 이 노선의 실제 관측시각.
         # ⚠️ 사이클 끝 시각 하나를 전 노선에 다 찍으면 첫 노선은 최대 한 사이클만큼
         #    늦게 찍힌다 — 통과구간 (t_prev,t]·기점 출발시각·시각표 분석이 그만큼 왜곡된다.
@@ -324,6 +354,7 @@ def fetch(key, city, routeid):
 
 
 def main():
+    global _HTTP_POOL
     keys = load_keys()
     if not keys:
         sys.exit("GBIS_BUS_KEY 없음")
@@ -357,6 +388,11 @@ def main():
     retry_code99 = bool(k.get("busRetryCode99", False))
     hold = k.get("busZombieHoldSec", 10)
     window = k["serviceWindow"]
+    _HTTP_POOL = (
+        KeyedHTTPSPool(
+            BASE_HOST, inflight_max,
+            timeout=float(k.get("busHttpTimeoutSec", 15)))
+        if k.get("busHttpKeepAlive", True) else None)
 
     day = service_day(now())
     last = {}  # (routeid, vehicleno) -> (nodeord, 관측시각, nodeid, route_version)
@@ -372,6 +408,14 @@ def main():
     rate_targets = {kid: float(rate) for kid, _ in keys}
     picked_band = None
     next_repick = 0.0
+    picker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="route-picker")
+    pick_future = None
+    pick_request = None
+    pick_retry_at = 0.0
+    picker_generation = 0
+    pool_stats_prev = (
+        _HTTP_POOL.stats() if _HTTP_POOL is not None
+        else {"created": 0, "reused": 0, "closed": 0})
     rotated_day = None
 
     # 선예약 블록 — 스케줄러 스레드 전용(단일 스레드라 자체 락 불필요). 요청 1건마다
@@ -392,6 +436,7 @@ def main():
             "attempted": 0, "successful": 0, "retried": 0, "recovered": 0,
             "residual": 0,
             "moving": 0, "rows": 0, "errors": [], "final": {},
+            "durations": [],
             "by_key": {
                 kid: {
                     "attempted": 0, "successful": 0, "retried": 0,
@@ -414,6 +459,7 @@ def main():
         nonlocal stats, report_no, report_started, report_at, next_repick
         nonlocal capacity_clean_windows, global_clean_windows
         nonlocal global_pressure_windows
+        nonlocal picker_generation
         report_obs = now()
         elapsed = max(0.001, elapsed)
         report_no += 1
@@ -453,6 +499,22 @@ def main():
         rate_targets.clear()
         rate_targets.update(new_rates)
         snap = dispatcher.snapshot()
+        durations = stats["durations"]
+        latency_avg = (
+            sum(durations) / len(durations) if durations else 0.0)
+        latency_p50 = percentile(durations, 0.50)
+        latency_p90 = percentile(durations, 0.90)
+        pool_now = (
+            _HTTP_POOL.stats() if _HTTP_POOL is not None
+            else pool_stats_prev)
+        conn_created = max(
+            0, pool_now.get("created", 0) - pool_stats_prev.get("created", 0))
+        conn_reused = max(
+            0, pool_now.get("reused", 0) - pool_stats_prev.get("reused", 0))
+        conn_closed = max(
+            0, pool_now.get("closed", 0) - pool_stats_prev.get("closed", 0))
+        pool_stats_prev.clear()
+        pool_stats_prev.update(pool_now)
         health_ts = time.time()
         O.record_health(
             conn, report_day, report_band, stats["attempted"], stats["successful"],
@@ -461,7 +523,9 @@ def main():
             sum("Timeout" in e or "timed out" in e for e in all_errors),
             sum("HTTP429" in e for e in all_errors),
             sum(e.startswith("HTTP5") for e in all_errors),
-            elapsed, snap["globalLimit"], ts=health_ts)
+            elapsed, snap["globalLimit"],
+            latency_avg, latency_p50, latency_p90,
+            conn_created, conn_reused, conn_closed, ts=health_ts)
         for kid, _ in keys:
             key_stats = stats["by_key"][kid]
             key_errors = key_stats["errors"]
@@ -492,6 +556,8 @@ def main():
             # 확장 뒤 처리 지연이나 code99가 보이면 정기 재선정(~21분)을 기다리지
             # 않고 다음 메인 반복에서 기본 패널로 즉시 복귀한다.
             next_repick = 0.0
+            # 이미 확장 패널을 계산 중이면 그 결과도 폐기하고 축소 기준으로 다시 고른다.
+            picker_generation += 1
 
         mem = O.rss_mb()
         with LOCK:
@@ -507,6 +573,12 @@ def main():
             STATE["retried"] = stats["retried"]
             STATE["globalInflightLimit"] = snap["globalLimit"]
             STATE["dispatchRates"] = dict(snap["rates"])
+            STATE["requestLatencyAvg"] = latency_avg
+            STATE["requestLatencyP50"] = latency_p50
+            STATE["requestLatencyP90"] = latency_p90
+            STATE["connectionReusePct"] = (
+                conn_reused / (conn_created + conn_reused)
+                if conn_created + conn_reused else 0)
             STATE["rssMB"] = mem
             STATE["inflightLimits"] = dict(snap["limits"])
             STATE["night"] = False
@@ -533,7 +605,12 @@ def main():
                  if snap["quotaBlocked"] else "")
               + (f" · {mem:.0f}MB" if mem else "")
               + (f" · 재시도 {stats['retried']}→회복 {recovered}"
-                 if stats["retried"] else ""), flush=True)
+                 if stats["retried"] else "")
+              + (f" · 지연 {latency_p50:.2f}/{latency_p90:.2f}s"
+                 if durations else "")
+              + (f" · 연결재사용 "
+                 f"{conn_reused/(conn_created+conn_reused)*100:.0f}%"
+                 if conn_created + conn_reused else ""), flush=True)
         if stats["final"]:
             detail = " ".join(
                 f"{err}×{n}" for err, n in
@@ -607,8 +684,9 @@ def main():
                 # 04시는 데이터 운행일만 바뀐다. data.go.kr 쿼터와 AIMD는 자정
                 # 기준이므로 여기서 선예약·in-flight를 초기화하지 않는다.
                 print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d}", flush=True)
-                day, last, written, picked = d, {}, 0, []
+                day, last, written = d, {}, 0
                 next_repick = 0
+                picker_generation += 1
                 conn.execute("UPDATE route SET emptyStreak = 0")
                 conn.commit()
                 with LOCK:
@@ -624,6 +702,7 @@ def main():
                 if picked:
                     picked = []
                     dispatcher.set_routes([])
+                    picker_generation += 1
                 report_waiting = True
                 with LOCK:
                     STATE["night"] = True
@@ -639,11 +718,60 @@ def main():
                 report_waiting = False
 
             cur_band = O.band_of(t, bands)
-            band_changed = picked and cur_band != picked_band
             mono = time.monotonic()
+            if pick_future is not None and pick_future.done():
+                req = pick_request
+                try:
+                    selected = pick_future.result()
+                except Exception as exc:
+                    print(
+                        f"[{t:%H:%M:%S}] ⚠️ 노선 재선정 실패: "
+                        f"{type(exc).__name__}: {exc} · 5초 뒤 재시도",
+                        flush=True)
+                    pick_retry_at = mono + 5
+                else:
+                    stale = (
+                        req["generation"] != picker_generation
+                        or req["day"] != d
+                        or req["band"] != cur_band)
+                    if stale:
+                        print(
+                            f"[{t:%H:%M:%S}] 노선 재선정 결과 폐기 "
+                            f"(계산 중 운행일/밴드/패널 변경)",
+                            flush=True)
+                    else:
+                        picked = selected
+                        panel_target = req["panel"]
+                        picked_band = cur_band
+                        next_repick = mono + REPICK_EVERY * interval
+                        dispatcher.set_routes(picked)
+                        if not picked:
+                            report_waiting = True
+                            pool = conn.execute(
+                                "SELECT COUNT(*) FROM route").fetchone()[0]
+                            msg = (
+                                "❌ 노선 풀이 비어 있다 — 먼저 "
+                                "`python3 fetch_routes.py`"
+                                if pool == 0
+                                else f"폴링할 노선 없음 (풀 {pool:,})")
+                            print(f"[{t:%H:%M:%S}] {msg}", flush=True)
+                            pick_retry_at = mono + 10
+                        else:
+                            print(
+                                f"[{t:%H:%M:%S}] 노선 재선정: "
+                                f"{len(picked)}개 "
+                                f"(충전율 {picked[0]['fill']*100:.1f}% ~ "
+                                f"{picked[-1]['fill']*100:.1f}%) · "
+                                f"{interval}초에 균등 배치",
+                                flush=True)
+                pick_future = None
+                pick_request = None
+
+            band_changed = bool(picked) and cur_band != picked_band
             # 기존 REPICK_EVERY(40창≈21분)를 시간 기준으로 보존한다.
-            # 독립 스케줄러에는 전역 사이클 번호가 없으므로 벽시계가 더 정확하다.
-            if not picked or band_changed or mono >= next_repick:
+            # 집계가 오래 걸려도 기존 패널·HTTP 스케줄러·DB writer는 계속 돈다.
+            if ((not picked or band_changed or mono >= next_repick)
+                    and pick_future is None and mono >= pick_retry_at):
                 calls = {
                     kid: read_calls(qday, kid)
                     for kid, _ in keys
@@ -660,23 +788,18 @@ def main():
                         + " ".join(
                             f"{kid}={calls[kid]:,}" for kid, _ in keys),
                         flush=True)
-                panel_target = new_panel_target
-                picked = O.pick_routes(conn, panel_target, target, nb, t=t)
-                picked_band = cur_band
-                next_repick = mono + REPICK_EVERY * interval
-                dispatcher.set_routes(picked)
-                if not picked:
-                    report_waiting = True
-                    pool = conn.execute("SELECT COUNT(*) FROM route").fetchone()[0]
-                    msg = ("❌ 노선 풀이 비어 있다 — 먼저 `python3 fetch_routes.py`"
-                           if pool == 0 else f"폴링할 노선 없음 (풀 {pool:,})")
-                    print(f"[{t:%H:%M:%S}] {msg}", flush=True)
-                    time.sleep(10)
-                    continue
-                print(f"[{t:%H:%M:%S}] 노선 재선정: {len(picked)}개 "
-                      f"(충전율 {picked[0]['fill']*100:.1f}% ~ "
-                      f"{picked[-1]['fill']*100:.1f}%) · "
-                      f"{interval}초에 균등 배치", flush=True)
+                pick_request = {
+                    "generation": picker_generation,
+                    "day": d,
+                    "band": cur_band,
+                    "panel": new_panel_target,
+                }
+                pick_future = picker.submit(
+                    pick_routes_readonly, new_panel_target, target, nb, t)
+                print(
+                    f"[{t:%H:%M:%S}] 노선 재선정 계산 시작 "
+                    f"(기존 {len(picked)}개 패널 계속 수집)",
+                    flush=True)
 
             first = dispatcher.get(timeout=0.5)
             events = dispatcher.drain(first)
@@ -704,6 +827,8 @@ def main():
                     stats["attempted"] += 1
                     stats["retried"] += int(event["retried"])
                     stats["errors"] += event["errors"]
+                    if event.get("duration") is not None:
+                        stats["durations"].append(float(event["duration"]))
                     if err:
                         key_stats["residual"] += 1
                         stats["residual"] += 1
@@ -789,6 +914,7 @@ def main():
                 max(report_at + interval, mono + 0.1))
     finally:
         dispatcher.close()
+        picker.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":

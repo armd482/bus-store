@@ -1,11 +1,30 @@
 import unittest
 import threading
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from bus_collector import (
     QuotaReservations, counter_check_due, next_global_inflight,
-    quota_panel_target, quota_rate_targets, reserve_calls)
+    percentile, pick_routes_readonly, quota_panel_target, quota_rate_targets,
+    reserve_calls)
+
+
+class PickerAndMetricsTests(unittest.TestCase):
+    def test_nearest_rank_percentiles(self):
+        values = [4.0, 1.0, 3.0, 2.0]
+        self.assertEqual(percentile(values, 0.50), 2.0)
+        self.assertEqual(percentile(values, 0.90), 4.0)
+        self.assertEqual(percentile([], 0.90), 0.0)
+
+    def test_readonly_picker_always_closes_its_snapshot(self):
+        conn = Mock()
+        when = datetime(2026, 7, 29, 12, 0)
+        with patch("bus_collector.O.connect_readonly", return_value=conn), \
+                patch("bus_collector.O.pick_routes", return_value=[{"routeid": "R"}]):
+            self.assertEqual(
+                pick_routes_readonly(10, 7, 7, when),
+                [{"routeid": "R"}])
+        conn.close.assert_called_once_with()
 
 
 class InflightPolicyTests(unittest.TestCase):

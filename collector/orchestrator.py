@@ -193,6 +193,13 @@ def connect(check_same_thread=True):
     # 여러 systemd 유닛이 동시에 처음 뜰 때 journal_mode 변경부터 경합할 수 있다.
     c.execute("PRAGMA busy_timeout=30000")
     c.execute("PRAGMA journal_mode=WAL")  # 수집기가 쓰는 중에도 status 가 읽히도록
+    # WAL+NORMAL은 프로세스/OS 장애 뒤에도 DB 일관성을 보존하면서 매 0.5초 배치의
+    # fsync를 피한다. 전원 손실 때 마지막 커밋 일부가 롤백될 수는 있으나 수집
+    # 원본은 JSONL에도 남고 다음 관측으로 복구된다.
+    c.execute("PRAGMA synchronous=NORMAL")
+    # 오래 열린 독자가 사라진 뒤 checkpoint가 WAL을 재사용할 때, 한때 커졌던
+    # 파일이 GB 단위로 계속 남지 않도록 다음 reset 시 64MB까지 줄인다.
+    c.execute("PRAGMA journal_size_limit=67108864")
     # 버스·지하철·서울 서비스가 부팅 때 거의 동시에 connect() 한다. 신규 컬럼을
     # 추가하는 배포에서 둘이 함께 "컬럼 없음"을 본 뒤 ALTER 하면 duplicate column /
     # database locked 로 한쪽이 죽을 수 있다. 스키마 확인·마이그레이션 전체를 하나의
@@ -212,6 +219,11 @@ def connect(check_same_thread=True):
         PRIMARY KEY (routeid, from_ord, to_ord, band, daytype)
       )""")
     c.execute("CREATE INDEX IF NOT EXISTS cell_route ON cell(routeid)")
+    # route_progress는 routeid별 n/n_days만 읽는다. 기존 cell_route 인덱스는 매 행의
+    # 본문을 다시 찾아 250만 행에서 임의 I/O가 컸다. covering index로 집계를
+    # 인덱스 하나의 순차 스캔으로 끝낸다.
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS cell_route_progress ON cell(routeid,n,n_days)")
     # n_days = 이 셀을 관측한 **서로 다른 운행일 수** (n 은 관측 건수). 매주 같은 요일은
     # 반복 표본이라(중복 아님) 요일 비교엔 '같은 요일 2일+'가 필요한데, n(건수)만으론
     # "한 날 7번"과 "3주 7번"을 못 가린다. 완료조건에 n_days 를 넣어 하루 안 완주를 막는다.
@@ -324,7 +336,13 @@ def connect(check_same_thread=True):
         retried INTEGER NOT NULL, residual INTEGER NOT NULL,
         code99 INTEGER NOT NULL, timeouts INTEGER NOT NULL,
         http429 INTEGER NOT NULL, http5xx INTEGER NOT NULL,
-        duration REAL NOT NULL, inflight INTEGER NOT NULL
+        duration REAL NOT NULL, inflight INTEGER NOT NULL,
+        latency_avg REAL NOT NULL DEFAULT 0,
+        latency_p50 REAL NOT NULL DEFAULT 0,
+        latency_p90 REAL NOT NULL DEFAULT 0,
+        conn_created INTEGER NOT NULL DEFAULT 0,
+        conn_reused INTEGER NOT NULL DEFAULT 0,
+        conn_closed INTEGER NOT NULL DEFAULT 0
       )""")
     c.execute("CREATE INDEX IF NOT EXISTS health_day ON collector_health_cycle(day)")
     # 집계 행만으로는 code99가 특정 키의 동시성 때문인지, 여러 키에 동시에 발생한
@@ -351,7 +369,33 @@ def connect(check_same_thread=True):
                       ("currentVersion", "TEXT")):
         if col not in have:
             c.execute(f"ALTER TABLE route ADD COLUMN {col} {decl}")
+    have_health = {
+        r[1] for r in c.execute("PRAGMA table_info(collector_health_cycle)")}
+    for col, decl in (
+            ("latency_avg", "REAL NOT NULL DEFAULT 0"),
+            ("latency_p50", "REAL NOT NULL DEFAULT 0"),
+            ("latency_p90", "REAL NOT NULL DEFAULT 0"),
+            ("conn_created", "INTEGER NOT NULL DEFAULT 0"),
+            ("conn_reused", "INTEGER NOT NULL DEFAULT 0"),
+            ("conn_closed", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in have_health:
+            c.execute(
+                f"ALTER TABLE collector_health_cycle ADD COLUMN {col} {decl}")
     c.commit()
+    return c
+
+
+def connect_readonly(check_same_thread=True):
+    """스키마 쓰기 없이 WAL 스냅샷만 읽는 짧은 수명 연결.
+
+    대시보드·백그라운드 노선 선정은 이 연결을 계산이 끝나는 즉시 닫는다. 장수명
+    읽기 트랜잭션이 WAL checkpoint의 끝점을 붙잡지 않게 하기 위함이다.
+    """
+    c = sqlite3.connect(
+        f"file:{DB}?mode=ro", uri=True, timeout=30,
+        check_same_thread=check_same_thread)
+    c.execute("PRAGMA busy_timeout=30000")
+    c.execute("PRAGMA query_only=ON")
     return c
 
 
@@ -609,12 +653,18 @@ def mark_included_direct(conn, routeid, from_ord, to_ord, band, daytype, k=1):
 
 
 def record_health(conn, day, band, attempted, successful, retried, residual,
-                  code99, timeouts, http429, http5xx, duration, inflight, ts=None):
+                  code99, timeouts, http429, http5xx, duration, inflight,
+                  latency_avg=0, latency_p50=0, latency_p90=0,
+                  conn_created=0, conn_reused=0, conn_closed=0, ts=None):
     conn.execute("""INSERT INTO collector_health_cycle
-      (ts,day,band,attempted,successful,retried,residual,code99,timeouts,http429,http5xx,duration,inflight)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+      (ts,day,band,attempted,successful,retried,residual,code99,timeouts,http429,
+       http5xx,duration,inflight,latency_avg,latency_p50,latency_p90,
+       conn_created,conn_reused,conn_closed)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
       (ts or time.time(), day, band, attempted, successful, retried, residual,
-       code99, timeouts, http429, http5xx, duration, inflight))
+       code99, timeouts, http429, http5xx, duration, inflight,
+       latency_avg, latency_p50, latency_p90,
+       conn_created, conn_reused, conn_closed))
     # 일 단위 상세는 30일만 보존한다.
     conn.execute("DELETE FROM collector_health_cycle WHERE ts < ?", (time.time()-30*86400,))
 
@@ -909,7 +959,9 @@ def route_progress(conn, target, nbands):
              COALESCE(SUM(MIN(c.n, ?)), 0),
              (SELECT COUNT(*) FROM route_service rs
               WHERE rs.routeid=r.routeid AND rs.status='eligible')
-      FROM route r LEFT JOIN cell c ON c.routeid = r.routeid
+      FROM route r
+      LEFT JOIN cell AS c INDEXED BY cell_route_progress
+        ON c.routeid = r.routeid
       GROUP BY r.routeid
     """, (target, md, target)).fetchall()
     out = []
