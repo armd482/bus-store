@@ -36,13 +36,12 @@ class KeyedHTTPSPool:
     """
 
     def __init__(self, host, max_per_key, timeout=15, connection_factory=None,
-                 retry_reserver=None):
+                 retry_reserver=None, source_addresses=None):
         self.host = host
         self.max_per_key = max(1, int(max_per_key))
         self.timeout = float(timeout)
-        self._factory = connection_factory or (
-            lambda host, timeout: http.client.HTTPSConnection(
-                host, timeout=timeout))
+        self._factory = connection_factory
+        self._source_addresses = dict(source_addresses or {})
         self._retry_reserver = retry_reserver
         self._buckets = {}
         self._lock = threading.Lock()
@@ -65,7 +64,13 @@ class KeyedHTTPSPool:
                     bucket.created += 1
                     self._stats["created"] += 1
                     try:
-                        conn = self._factory(self.host, self.timeout)
+                        if self._factory is not None:
+                            conn = self._factory(self.host, self.timeout)
+                        else:
+                            source = self._source_addresses.get(key)
+                            conn = http.client.HTTPSConnection(
+                                self.host, timeout=self.timeout,
+                                source_address=((source, 0) if source else None))
                     except Exception:
                         bucket.created -= 1
                         self._stats["closed"] += 1

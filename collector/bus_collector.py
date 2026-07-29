@@ -16,8 +16,10 @@
 """
 
 import json
+import ipaddress
 import math
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -88,6 +90,58 @@ def load_keys():
         seen[key] = name
         out.append((name, key))
     return out
+
+
+def load_egress_sources(keys, config):
+    """활성 키의 소스 사설 IP와 디스패처 egress 그룹을 읽고 검증한다.
+
+    환경변수가 하나도 없으면 개발 환경의 기존 단일 경로를 유지한다. 하나라도
+    설정했다면 활성 키 모두에 대응하는 값이 있어야 하며, 로컬 bind까지 성공해야
+    한다. 일부 키만 기본 경로로 빠져 두 EIP 실험이 오염되는 것을 막는다.
+    """
+    env_by_key = config.get("busEgressSourceEnvByKey") or {}
+    configured = {
+        kid: (env_by_key.get(kid), E.get(env_by_key.get(kid)))
+        for kid, _key in keys
+        if env_by_key.get(kid)
+    }
+    if not any(value for _env, value in configured.values()):
+        return {}, {}
+
+    resolved = []
+    for kid, actual_key in keys:
+        envname = env_by_key.get(kid)
+        source = E.get(envname) if envname else None
+        if not envname or not source:
+            raise RuntimeError(
+                f"{kid}의 egress 소스 IP 환경변수가 없습니다")
+        resolved.append((kid, actual_key, envname, source))
+
+    source_by_actual_key = {}
+    group_by_key_id = {}
+    checked = set()
+    for kid, actual_key, envname, source in resolved:
+        try:
+            parsed = ipaddress.ip_address(source)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{envname}이 올바른 IP 주소가 아닙니다") from exc
+        if parsed.version != 4:
+            raise RuntimeError(f"{envname}은 IPv4 주소여야 합니다")
+        if source not in checked:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind((source, 0))
+            except OSError as exc:
+                raise RuntimeError(
+                    f"{envname}={source}를 이 호스트에 bind할 수 없습니다") from exc
+            finally:
+                probe.close()
+            checked.add(source)
+        source_by_actual_key[actual_key] = source
+        # 대시보드·로그에는 실제 인증키 대신 환경변수 이름만 노출한다.
+        group_by_key_id[kid] = envname
+    return source_by_actual_key, group_by_key_id
 
 
 def now():
@@ -452,6 +506,9 @@ def main():
         1, int(k.get("busGlobalCleanWindows", 5)))
     code99_cooldown = max(0, float(k.get("busCode99CooldownSec", 3)))
     retry_code99 = bool(k.get("busRetryCode99", False))
+    source_addresses, key_groups = load_egress_sources(keys, k)
+    source_max_inflight = max(
+        1, int(k.get("busEgressMaxInflight", global_max)))
     hold = k.get("busZombieHoldSec", 10)
     window = k["serviceWindow"]
     # stale Keep-Alive의 내부 재전송도 물리 호출이므로 같은 키 장부에서 먼저 예약한다.
@@ -461,7 +518,8 @@ def main():
         KeyedHTTPSPool(
             BASE_HOST, inflight_max,
             timeout=float(k.get("busHttpTimeoutSec", 15)),
-            retry_reserver=lambda key: quota.reserve(key_ids[key], 1))
+            retry_reserver=lambda key: quota.reserve(key_ids[key], 1),
+            source_addresses=source_addresses)
         if k.get("busHttpKeepAlive", True) else None)
 
     day = service_day(now())
@@ -498,7 +556,17 @@ def main():
     dispatcher = RollingDispatcher(
         keys, fetch, quota.reserve, interval, rate, workers, inflight_max, hold,
         global_inflight=global_initial, code99_cooldown=code99_cooldown,
-        retry_code99=retry_code99)
+        retry_code99=retry_code99, key_groups=key_groups,
+        group_max_inflight=(
+            source_max_inflight if key_groups else None))
+    if key_groups:
+        source_summary = " ".join(
+            f"{kid}→{key_groups[kid]}({source_addresses[key]})"
+            for kid, key in keys)
+        print(
+            f"[egress] {source_summary} · IP별 in-flight "
+            f"{source_max_inflight}",
+            flush=True)
     def retune_poll_interval(active_routes, when):
         """패널 크기가 바뀔 때만 폴링 주기를 다시 잡는다.
 
@@ -688,6 +756,8 @@ def main():
             STATE["staleConnectionRetries"] = stale_retries
             STATE["rssMB"] = mem
             STATE["inflightLimits"] = dict(snap["limits"])
+            STATE["egressInflight"] = dict(snap["inflightBySource"])
+            STATE["egressLimits"] = dict(snap["sourceLimits"])
             STATE["night"] = False
             STATE["fetching"] = snap["inflight"] > 0
             if stats["final"]:
@@ -700,12 +770,19 @@ def main():
                 del log[:-50]
 
         recovered = stats["recovered"]
+        egress_detail = (
+            "egress " + " ".join(
+                f"{group}={snap['inflightBySource'][group]}/"
+                f"{snap['sourceLimits'][group]}"
+                for group in snap["inflightBySource"]) + " · "
+            if key_groups else "")
         print(f"[{report_obs:%H:%M:%S}] {elapsed:.0f}초 창 응답 "
               f"{stats['successful']}/{stats['attempted']} · "
               f"운행 {stats['moving']}대 · 통과 +{stats['rows']} "
               f"(누적 {written:,}) · 예약 {snap['queued']} · "
               f"in-flight 합계 {snap['inflight']}/{snap['globalLimit']} · "
-              f"rate합계 {sum(snap['rates'].values()):.1f}/s · "
+              + egress_detail
+              + f"rate합계 {sum(snap['rates'].values()):.1f}/s · "
               f"키상한 " + " ".join(
                   f"{kid}={snap['limits'][kid]}" for kid, _ in keys)
               + (f" · 쿼터차단 {snap['quotaBlocked']}키"

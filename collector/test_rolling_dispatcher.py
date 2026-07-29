@@ -209,6 +209,86 @@ class RollingDispatcherTests(unittest.TestCase):
         self.assertEqual(maximum, 3)
         self.assertEqual(dispatcher.snapshot()["globalLimit"], 3)
 
+    def test_default_group_does_not_block_global_aimd_recovery(self):
+        dispatcher = RollingDispatcher(
+            [("K1", "key1"), ("K2", "key2")],
+            lambda _key, _city, rid: (
+                rid, [], None, __import__("datetime").datetime.now()),
+            lambda _kid, _n: True, interval=1, rate=100,
+            workers=2, max_inflight=4, global_inflight=3)
+        self.addCleanup(dispatcher.close)
+        dispatcher.set_global_inflight_limit(6)
+        snap = dispatcher.snapshot()
+        self.assertEqual(snap["globalLimit"], 6)
+        self.assertEqual(snap["sourceLimits"], {"default": 8})
+
+    def test_egress_inflight_caps_keys_sharing_source(self):
+        active = {"A": 0, "B": 0}
+        maximum = {"A": 0, "B": 0}
+        total = 0
+        total_maximum = 0
+        key_group = {
+            "key1": "A", "key2": "A", "key3": "B", "key4": "B"}
+        lock = __import__("threading").Lock()
+
+        def fetch(key, _city, rid):
+            nonlocal total, total_maximum
+            group = key_group[key]
+            with lock:
+                active[group] += 1
+                maximum[group] = max(maximum[group], active[group])
+                total += 1
+                total_maximum = max(total_maximum, total)
+            time.sleep(0.06)
+            with lock:
+                active[group] -= 1
+                total -= 1
+            return rid, [], None, __import__("datetime").datetime.now()
+
+        keys = [(f"K{i}", f"key{i}") for i in range(1, 5)]
+        dispatcher = RollingDispatcher(
+            keys, fetch, lambda _kid, _n: True,
+            interval=0.12, rate=100, workers=4, max_inflight=4,
+            global_inflight=3,
+            key_groups={"K1": "A", "K2": "A", "K3": "B", "K4": "B"},
+            group_max_inflight=2)
+        self.addCleanup(dispatcher.close)
+        dispatcher.set_routes([
+            {"routeid": f"route-{i}", "cityCode": 1} for i in range(24)
+        ])
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline:
+            dispatcher.get(timeout=0.02)
+        self.assertLessEqual(maximum["A"], 2)
+        self.assertLessEqual(maximum["B"], 2)
+        self.assertEqual(total_maximum, 3)
+        self.assertEqual(
+            dispatcher.snapshot()["sourceLimits"], {"A": 2, "B": 2})
+
+    def test_code99_cooldown_only_blocks_its_egress(self):
+        def fetch(key, _city, rid):
+            error = "code99:busy" if key == "key1" else None
+            return rid, [], error, __import__("datetime").datetime.now()
+
+        dispatcher = RollingDispatcher(
+            [("K1", "key1"), ("K2", "key2")],
+            fetch, lambda _kid, _n: True,
+            interval=0.2, rate=100, workers=2, max_inflight=1,
+            global_inflight=2, code99_cooldown=0.3,
+            retry_code99=False, key_groups={"K1": "A", "K2": "B"},
+            group_max_inflight=1)
+        self.addCleanup(dispatcher.close)
+        dispatcher.set_routes([
+            {"routeid": "one", "cityCode": 1},
+            {"routeid": "two", "cityCode": 1},
+        ])
+        event = dispatcher.get(timeout=0.5)
+        self.assertIsNotNone(event)
+        self.assertIn("code99", " ".join(event["errors"]))
+        blocked = dispatcher.snapshot()["sourceBlocked"]
+        self.assertTrue(blocked["A"])
+        self.assertFalse(blocked["B"])
+
     def test_new_route_phases_interleave_keys(self):
         dispatcher = RollingDispatcher(
             [("K1", "key1"), ("K2", "key2")],

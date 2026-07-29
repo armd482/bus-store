@@ -1,5 +1,6 @@
 import gzip
 import unittest
+from unittest.mock import patch
 
 from http_pool import KeyedHTTPSPool
 
@@ -84,6 +85,31 @@ class HTTPSPoolTests(unittest.TestCase):
         pool.get("K1", "/one")
         pool.get("K2", "/two")
         self.assertEqual(len(made), 2)
+
+    def test_default_connections_bind_to_each_keys_source_address(self):
+        made = [
+            FakeConnection([FakeResponse(b"one")]),
+            FakeConnection([FakeResponse(b"two")]),
+        ]
+        with patch(
+            "http_pool.http.client.HTTPSConnection",
+            side_effect=made,
+        ) as connection:
+            pool = KeyedHTTPSPool(
+                "example.test", 1, timeout=0.1,
+                source_addresses={
+                    "actual-key-1": "172.31.5.134",
+                    "actual-key-2": "172.31.1.218",
+                })
+            self.addCleanup(pool.close)
+            pool.get("actual-key-1", "/one")
+            pool.get("actual-key-2", "/two")
+        self.assertEqual(
+            connection.call_args_list[0].kwargs["source_address"],
+            ("172.31.5.134", 0))
+        self.assertEqual(
+            connection.call_args_list[1].kwargs["source_address"],
+            ("172.31.1.218", 0))
 
     def test_gzip_response_is_decoded(self):
         body = gzip.compress(b'{"ok":true}')

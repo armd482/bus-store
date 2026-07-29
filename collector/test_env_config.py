@@ -1,7 +1,7 @@
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from collector import env_config
 import bus_collector
@@ -87,6 +87,61 @@ class EnvConfigTests(unittest.TestCase):
                 bus_collector.load_keys(),
                 [("GBIS_BUS_KEY", "first"), ("GBIS_BUS_KEY3", "third")],
             )
+
+    def test_egress_sources_disabled_when_all_values_are_empty(self):
+        config = {
+            "busEgressSourceEnvByKey": {
+                "GBIS_BUS_KEY": "SOURCE_A",
+                "GBIS_BUS_KEY2": "SOURCE_B",
+            }}
+        with patch.object(bus_collector.E, "get", return_value=None):
+            self.assertEqual(
+                bus_collector.load_egress_sources(
+                    [("GBIS_BUS_KEY", "key1"),
+                     ("GBIS_BUS_KEY2", "key2")], config),
+                ({}, {}))
+
+    def test_partial_egress_source_configuration_fails_fast(self):
+        config = {
+            "busEgressSourceEnvByKey": {
+                "GBIS_BUS_KEY": "SOURCE_A",
+                "GBIS_BUS_KEY2": "SOURCE_B",
+            }}
+        values = {"SOURCE_A": "172.31.5.134"}
+        with patch.object(
+                bus_collector.E, "get", side_effect=values.get):
+            with self.assertRaisesRegex(RuntimeError, "GBIS_BUS_KEY2"):
+                bus_collector.load_egress_sources(
+                    [("GBIS_BUS_KEY", "key1"),
+                     ("GBIS_BUS_KEY2", "key2")], config)
+
+    def test_egress_sources_are_bound_and_grouped_by_env_name(self):
+        config = {
+            "busEgressSourceEnvByKey": {
+                "GBIS_BUS_KEY": "SOURCE_A",
+                "GBIS_BUS_KEY2": "SOURCE_B",
+            }}
+        values = {
+            "SOURCE_A": "172.31.5.134",
+            "SOURCE_B": "172.31.1.218",
+        }
+        sock = Mock()
+        with patch.object(
+                bus_collector.E, "get", side_effect=values.get
+        ), patch.object(
+                bus_collector.socket, "socket", return_value=sock):
+            sources, groups = bus_collector.load_egress_sources(
+                [("GBIS_BUS_KEY", "key1"),
+                 ("GBIS_BUS_KEY2", "key2")], config)
+        self.assertEqual(
+            sources,
+            {"key1": "172.31.5.134", "key2": "172.31.1.218"})
+        self.assertEqual(
+            groups,
+            {"GBIS_BUS_KEY": "SOURCE_A", "GBIS_BUS_KEY2": "SOURCE_B"})
+        self.assertEqual(
+            [call.args[0] for call in sock.bind.call_args_list],
+            [("172.31.5.134", 0), ("172.31.1.218", 0)])
 
 
 if __name__ == "__main__":

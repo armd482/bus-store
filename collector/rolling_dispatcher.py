@@ -30,7 +30,8 @@ class RollingDispatcher:
 
     def __init__(self, keys, fetch, reserve, interval, rate, workers,
                  max_inflight, hold=0, retry_limit=1, global_inflight=None,
-                 code99_cooldown=0, retry_code99=True):
+                 code99_cooldown=0, retry_code99=True, key_groups=None,
+                 group_max_inflight=None):
         self.fetch = fetch
         self.reserve = reserve
         self.interval = float(interval)
@@ -58,7 +59,22 @@ class RollingDispatcher:
         self._global_inflight = 0
         self._global_limit = max(
             1, int(global_inflight or max_inflight * max(1, len(keys))))
-        self._global_blocked_until = 0.0
+        key_groups = dict(key_groups or {})
+        self._key_groups = {
+            kid: key_groups.get(kid, "default")
+            for kid in self._key_order
+        }
+        group_limit = (
+            max(1, int(group_max_inflight))
+            if group_max_inflight is not None
+            # 그룹 기능을 쓰지 않는 기존 단일 경로에서는 별도 상한을 만들지 않는다.
+            # 전역 AIMD가 시작값보다 올라가도 이 기본 그룹이 막아서는 안 된다.
+            else max_inflight * max(1, len(keys)))
+        self._groups = {}
+        for group in self._key_groups.values():
+            self._groups.setdefault(
+                group, {"inflight": 0, "limit": group_limit,
+                        "blocked_until": 0.0})
         # maxInflight는 키별 상한이다. 활성 키를 동시에 담을 수 있게 풀만 넉넉히 둔다.
         self._executor = ThreadPoolExecutor(
             max_workers=max(workers, max_inflight) * max(1, len(keys)))
@@ -230,7 +246,18 @@ class RollingDispatcher:
                 "limitTotal": min(sum(limits.values()), self._global_limit),
                 "perKeyLimitTotal": sum(limits.values()),
                 "globalLimit": self._global_limit,
-                "globalBlocked": self._global_blocked_until > time.monotonic(),
+                "globalBlocked": any(
+                    group["blocked_until"] > time.monotonic()
+                    for group in self._groups.values()),
+                "inflightBySource": {
+                    group: state["inflight"]
+                    for group, state in self._groups.items()},
+                "sourceLimits": {
+                    group: state["limit"]
+                    for group, state in self._groups.items()},
+                "sourceBlocked": {
+                    group: state["blocked_until"] > time.monotonic()
+                    for group, state in self._groups.items()},
                 "queued": sum(len(s["heap"]) for s in self._states.values()),
                 "quotaBlocked": sum(
                     s["quota_blocked_until"] > time.monotonic()
@@ -259,18 +286,22 @@ class RollingDispatcher:
         return result, wire_duration
 
     def _dispatch_due(self, now):
-        if (now < self._global_blocked_until
-                or self._global_inflight >= self._global_limit):
+        if self._global_inflight >= self._global_limit:
             return
-        self._global_blocked_until = 0.0
         for kid in self._key_order:
             ks = self._states[kid]
+            group = self._groups[self._key_groups[kid]]
+            if (now < group["blocked_until"]
+                    or group["inflight"] >= group["limit"]):
+                continue
+            group["blocked_until"] = 0.0
             if now < ks["quota_blocked_until"]:
                 continue
             # 만료된 차단 표식을 정리해 snapshot이 현재 상태만 보고하게 한다.
             ks["quota_blocked_until"] = 0.0
             while (ks["heap"] and ks["heap"][0][0] <= now
                    and ks["inflight"] < ks["limit"]
+                   and group["inflight"] < group["limit"]
                    and self._global_inflight < self._global_limit
                    and now >= ks["next_submit"]):
                 due, _, rid, generation, attempt, origin_due, errors = heapq.heappop(ks["heap"])
@@ -288,6 +319,7 @@ class RollingDispatcher:
                     break
                 route["inflight"] = True
                 ks["inflight"] += 1
+                group["inflight"] += 1
                 self._global_inflight += 1
                 ks["next_submit"] = (
                     max(ks["next_submit"], now) + 1.0 / ks["rate"])
@@ -309,6 +341,8 @@ class RollingDispatcher:
             del self._futures[fut]
             kid, rid = job["kid"], job["rid"]
             self._states[kid]["inflight"] -= 1
+            group = self._groups[self._key_groups[kid]]
+            group["inflight"] -= 1
             self._global_inflight -= 1
             route = self._routes.get(rid)
             if route and route["generation"] == job["generation"]:
@@ -322,8 +356,8 @@ class RollingDispatcher:
             errors = job["errors"] + ([err] if err else [])
             is_code99 = bool(err and "code99" in err)
             if is_code99 and self.code99_cooldown:
-                self._global_blocked_until = max(
-                    self._global_blocked_until, now + self.code99_cooldown)
+                group["blocked_until"] = max(
+                    group["blocked_until"], now + self.code99_cooldown)
 
             retryable = (
                 err and job["attempt"] < self.retry_limit and route is not None
@@ -348,13 +382,18 @@ class RollingDispatcher:
                 self._push(kid, due, rid, job["generation"], 0, due, [])
 
     def _next_wait(self, now):
-        if now < self._global_blocked_until:
-            return self._global_blocked_until - now
         if self._global_inflight >= self._global_limit:
             # 완료 콜백이 wake를 세운다. due heap 때문에 짧게 재기상하지 않는다.
             return None
         waits = []
-        for ks in self._states.values():
+        for kid, ks in self._states.items():
+            group = self._groups[self._key_groups[kid]]
+            if now < group["blocked_until"]:
+                waits.append(group["blocked_until"] - now)
+                continue
+            if group["inflight"] >= group["limit"]:
+                # 같은 egress의 future 완료 콜백이 wake를 세운다.
+                continue
             if now < ks["quota_blocked_until"]:
                 # 쿼터 차단 중 — 해제 시각에만 다시 본다. heap을 근거로 깨지 않는다.
                 waits.append(ks["quota_blocked_until"] - now)
