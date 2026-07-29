@@ -164,6 +164,27 @@ def quota_panel_target(t, calls, base_panel, interval, dispatch_rate,
     return min(capacity, int(math.ceil(wanted / nkeys) * nkeys))
 
 
+def poll_interval_for(active_routes, configured, safe_total_rate, minimum):
+    """운행 후보가 적은 시간대에만 노선 폴링 주기를 줄인다 — **처리능력 기준**.
+
+    노선 수를 안전 총 rate 로 나눠 "이 풀을 한 바퀴 도는 데 필요한 최소 시간"을
+    구하고 [minimum, configured] 로 자른다. 주간(680노선)은 680/14 = 48.6s 로
+    configured(31s)보다 크므로 **그대로**이고, 심야에만 짧아진다.
+
+    ⚠️ 단순 비례(심야면 무조건 12초)로 하면 안 된다: 01시 326노선을 12초로 돌면
+    수요가 27 req/s 인데 ✅ 실측 안정 처리량은 14~15 req/s 다. 큐만 쌓이고 실효
+    주기는 오히려 나빠진다 (주간이 이미 그 상태 — 설정 31s, 실효 p50 45s).
+    그래서 하한을 두되 **처리능력이 상한을 정한다.**
+
+    ✅ 실측 후보 수(2026-07-29) 기준: 03시 95→12s · 02시 159→12s ·
+    04시 230→16.4s · 01시 326→23.3s · 그 외 680→31s(무변).
+    """
+    if active_routes <= 0:
+        return float(configured)
+    needed = active_routes / float(safe_total_rate)
+    return float(min(configured, max(minimum, needed)))
+
+
 def quota_rate_targets(t, calls, planned_per_key, max_rates, routes_by_key,
                        interval, base_panel):
     """남은 쿼터를 주간에 보충하되 작은 심야 운행 풀은 과다 폴링하지 않는다."""
@@ -404,6 +425,13 @@ def main():
     conn = O.connect()
     bands, target, nb = k["timebands"], k["targetSamples"], len(k["timebands"])
     interval, maxr = k["intervalSec"], k["maxRoutes"]
+    # ⚠️ 건강 창과 폴링 주기를 분리한다. 심야 동적 주기가 12초까지 내려가는데
+    #    보고·AIMD 판정 창까지 12초가 되면, 표본이 얇은 창으로 code99 비율을
+    #    판정해 전역 상한이 잡음에 흔들린다. 창은 항상 config intervalSec 고정.
+    health_window = interval
+    night_min = max(1.0, float(k.get("busNightMinIntervalSec", 12)))
+    safe_total_rate = max(0.1, float(k.get("busSafeTotalRate", 14)))
+    poll_interval = float(interval)
     configured_keys = len(k.get("busKeys") or ["GBIS_BUS_KEY"])
     effective_maxr = max(1, maxr * len(keys) // max(1, configured_keys))
     workers, rate = k["maxWorkers"], k["dispatchRate"]
@@ -471,8 +499,26 @@ def main():
         keys, fetch, quota.reserve, interval, rate, workers, inflight_max, hold,
         global_inflight=global_initial, code99_cooldown=code99_cooldown,
         retry_code99=retry_code99)
+    def retune_poll_interval(active_routes, when):
+        """패널 크기가 바뀔 때만 폴링 주기를 다시 잡는다.
+
+        ⚠️ 이미 예약된 due 는 건드리지 않는다 — 각 노선이 자기 완료 시점에 새
+        주기로 옮겨가므로 주기를 줄여도 따라잡기 버스트가 생기지 않는다.
+        """
+        nonlocal poll_interval
+        wanted = poll_interval_for(
+            active_routes, interval, safe_total_rate, night_min)
+        if abs(wanted - poll_interval) < 0.5:
+            return
+        old, poll_interval = poll_interval, wanted
+        dispatcher.set_interval(poll_interval)
+        print(f"[{when:%H:%M:%S}] 폴링 주기 {old:.0f}→{poll_interval:.0f}초 "
+              f"(운행 후보 {active_routes}개 · 안전 총 rate {safe_total_rate:g}/s)",
+              flush=True)
+
     if picked:
         dispatcher.set_routes(picked)
+        retune_poll_interval(len(picked), now())
         print(
             f"[{now():%H:%M:%S}] 직전 패널 {len(picked)}개 즉시 복원 "
             f"(새 선정은 백그라운드 계산)",
@@ -496,7 +542,7 @@ def main():
     stats = blank_stats()
     stats_qday = quota_day(now())
     report_started = time.monotonic()
-    report_at = report_started + interval
+    report_at = report_started + health_window
     report_waiting = False
     counter_day = None
     next_counter_check = 0.0
@@ -531,7 +577,7 @@ def main():
                     rate_clean_windows[kid] = 0
         new_rates = quota_rate_targets(
             report_obs, calls_now, planned_calls, rate_caps,
-            snap["routesByKey"], interval, effective_maxr)
+            snap["routesByKey"], poll_interval, effective_maxr)
         rate_changes = [
             f"{kid}={snap['rates'][kid]:.2f}→{new_rates[kid]:.2f}"
             for kid, _ in keys
@@ -714,7 +760,9 @@ def main():
         report_started = time.monotonic()
         report_at = next_deadline
 
-    print(f"[{now():%H:%M:%S}] 연속 수집 시작 · 노선별 {interval}초 · 목표 {target}샘플 · "
+    print(f"[{now():%H:%M:%S}] 연속 수집 시작 · 노선별 {interval}초"
+          f"(심야 최소 {night_min:.0f}초·안전 {safe_total_rate:g}/s) · "
+          f"건강창 {health_window}초 · 목표 {target}샘플 · "
           f"밴드 {nb}개 · 최대 {effective_maxr}노선 · "
           f"키 {len(keys)}개({', '.join(nm for nm, _ in keys)}) · "
           f"전역 in-flight {global_initial}({global_min}~{global_max}) · "
@@ -735,7 +783,7 @@ def main():
                 report_window(
                     stats_qday, picked_band if picked_band is not None
                     else O.band_of(t, bands),
-                    mono - report_started, mono + interval)
+                    mono - report_started, mono + health_window)
                 blocked = set(dispatcher.reset_quota_blocks_by_key())
                 print(f"[{t:%H:%M:%S}] 쿼터 날짜 전환 {stats_qday} → {qday} · "
                       f"차단 해제 {len(blocked)}키", flush=True)
@@ -780,7 +828,7 @@ def main():
                 # 부분 통계도 새 정상 창과 섞지 않는다.
                 stats = blank_stats()
                 report_started = time.monotonic()
-                report_at = report_started + interval
+                report_at = report_started + health_window
                 report_waiting = False
 
             cur_band = O.band_of(t, bands)
@@ -810,8 +858,9 @@ def main():
                         save_cached_panel(picked)
                         panel_target = req["panel"]
                         picked_band = cur_band
-                        next_repick = mono + REPICK_EVERY * interval
+                        next_repick = mono + REPICK_EVERY * health_window
                         dispatcher.set_routes(picked)
+                        retune_poll_interval(len(picked), t)
                         if not picked:
                             report_waiting = True
                             pool = conn.execute(
@@ -844,7 +893,7 @@ def main():
                     for kid, _ in keys
                 }
                 new_panel_target = quota_panel_target(
-                    t, calls, effective_maxr, interval, rate_targets,
+                    t, calls, effective_maxr, poll_interval, rate_targets,
                     planned_calls,
                     capacity_clean_windows >= 3)
                 if new_panel_target != panel_target:
@@ -981,7 +1030,7 @@ def main():
             mono = time.monotonic()
             report_window(
                 stats_qday, cur_band, mono - report_started,
-                max(report_at + interval, mono + 0.1))
+                max(report_at + health_window, mono + 0.1))
     finally:
         dispatcher.close()
         picker.shutdown(wait=False, cancel_futures=True)

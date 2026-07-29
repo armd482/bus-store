@@ -83,6 +83,18 @@ class RollingDispatcher:
             self._global_limit = max(1, int(value))
         self._wake.set()
 
+    def set_interval(self, value):
+        """노선 폴링 주기를 바꾼다 (심야 동적 주기).
+
+        이미 heap 에 예약된 due 는 손대지 않는다. 각 노선은 자기 요청이 끝날 때
+        next_slot 으로 다음 슬롯을 새 주기로 계산하므로, 주기를 줄여도 밀린
+        슬롯을 한꺼번에 당기는 따라잡기 버스트가 생기지 않고 한 바퀴에 걸쳐
+        자연히 옮겨간다.
+        """
+        with self._lock:
+            self.interval = max(1.0, float(value))
+        self._wake.set()
+
     def set_rates(self, rates):
         """키별 제출 rate를 바꾼다. 이미 제출된 요청에는 영향을 주지 않는다."""
         with self._lock:

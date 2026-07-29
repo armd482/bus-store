@@ -7,8 +7,8 @@ from unittest.mock import Mock, patch
 
 from bus_collector import (
     QuotaReservations, counter_check_due, next_global_inflight,
-    load_cached_panel, percentile, pick_routes_readonly, quota_panel_target,
-    quota_rate_targets, reserve_calls, save_cached_panel)
+    load_cached_panel, percentile, pick_routes_readonly, poll_interval_for,
+    quota_panel_target, quota_rate_targets, reserve_calls, save_cached_panel)
 
 
 class PickerAndMetricsTests(unittest.TestCase):
@@ -105,6 +105,31 @@ class InflightPolicyTests(unittest.TestCase):
         self.assertFalse(counter_check_due("2026-07-27", "2026-07-27", 20, 30))
         self.assertTrue(counter_check_due("2026-07-28", "2026-07-27", 20, 30))
         self.assertTrue(counter_check_due("2026-07-27", "2026-07-27", 30, 30))
+
+
+class NightPollIntervalTests(unittest.TestCase):
+    """실측 후보 수(2026-07-29)로 심야 동적 주기를 고정한다."""
+
+    def test_daytime_panel_keeps_configured_interval(self):
+        # 680/14 = 48.6s > 31s 이므로 주간은 손대지 않는다.
+        self.assertEqual(poll_interval_for(680, 31, 14, 12), 31)
+
+    def test_sparse_pool_is_capped_by_throughput_not_by_floor(self):
+        # 01시 326노선. 12초로 박으면 27 req/s 를 요구해 처리능력을 넘는다.
+        self.assertAlmostEqual(poll_interval_for(326, 31, 14, 12), 326 / 14)
+        self.assertLessEqual(326 / poll_interval_for(326, 31, 14, 12), 14)
+
+    def test_very_sparse_pool_clamps_at_minimum(self):
+        # 03시 95노선 → 6.8s 지만 TAGO 갱신주기(10~20초) 아래로는 안 내려간다.
+        self.assertEqual(poll_interval_for(95, 31, 14, 12), 12)
+        self.assertEqual(poll_interval_for(159, 31, 14, 12), 12)
+
+    def test_empty_panel_falls_back_to_configured(self):
+        self.assertEqual(poll_interval_for(0, 31, 14, 12), 31)
+
+    def test_never_exceeds_configured_interval(self):
+        for n in (0, 1, 95, 326, 680, 5000):
+            self.assertLessEqual(poll_interval_for(n, 31, 14, 12), 31)
 
 
 class QuotaPanelTests(unittest.TestCase):

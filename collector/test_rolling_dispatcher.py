@@ -142,6 +142,32 @@ class RollingDispatcherTests(unittest.TestCase):
         self.assertGreater(maximum["key1"], 0)
         self.assertGreater(maximum["key2"], 1)
 
+    def test_interval_change_does_not_burst_pending_slots(self):
+        # 심야 동적 주기: 주기를 줄여도 이미 예약된 due 를 한꺼번에 당기면 안 된다.
+        calls = []
+
+        def fetch(_key, _city, rid):
+            calls.append(time.monotonic())
+            return rid, [], None, __import__("datetime").datetime.now()
+
+        dispatcher = RollingDispatcher(
+            [("K1", "key")], fetch, lambda _kid, _n: True,
+            interval=30, rate=100, workers=2, max_inflight=2)
+        self.addCleanup(dispatcher.close)
+        dispatcher.set_routes([
+            {"routeid": f"r{i}", "cityCode": 1} for i in range(6)
+        ])
+        deadline = time.monotonic() + 0.5
+        while not calls and time.monotonic() < deadline:
+            dispatcher.get(timeout=0.02)
+        first_round = len(calls)
+        self.assertGreater(first_round, 0)
+        dispatcher.set_interval(1)
+        # 구현이 허용하는 최저 1초까지 30배 줄여도 기존 due는 그대로라 즉시
+        # 쏟아지지 않는다. 각 노선이 기존 슬롯에서 한 번 완료된 뒤 새 주기로 간다.
+        time.sleep(0.2)
+        self.assertEqual(len(calls), first_round)
+
     def test_dispatch_rates_can_change_per_key(self):
         dispatcher = RollingDispatcher(
             [("K1", "key1"), ("K2", "key2")],
