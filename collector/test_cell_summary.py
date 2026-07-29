@@ -43,6 +43,43 @@ class CellSummaryTests(unittest.TestCase):
                     self.assertIsNone(conn.execute(
                         """SELECT 1 FROM cell_summary
                            WHERE daytype='wed' AND band=3""").fetchone())
+
+                    O.bump_span(
+                        conn, "R1", 1, 4, 3, "wed", "2026-07-29",
+                        "censored", 12, k=2)
+                    O.bump_span(
+                        conn, "R1", 1, 4, 3, "wed", "2026-07-29",
+                        "censored", 20)
+                    self.assertEqual(
+                        conn.execute(
+                            """SELECT events,included_segments,max_gap
+                               FROM span_summary
+                               WHERE reason='censored'""").fetchone(),
+                        (3, 9, 20.0))
+                    self.assertEqual(
+                        conn.execute(
+                            """SELECT cells,direct_cells
+                               FROM included_summary WHERE id=1""").fetchone(),
+                        (3, 0))
+
+                    O.mark_included_direct(
+                        conn, "R1", 1, 2, 3, "wed")
+                    self.assertEqual(
+                        conn.execute(
+                            """SELECT cells,direct_cells
+                               FROM included_summary WHERE id=1""").fetchone(),
+                        (3, 1))
+
+                    conn.execute("DELETE FROM span")
+                    self.assertIsNone(conn.execute(
+                        """SELECT 1 FROM span_summary
+                           WHERE reason='censored'""").fetchone())
+                    conn.execute("DELETE FROM included_cell")
+                    self.assertEqual(
+                        conn.execute(
+                            """SELECT cells,direct_cells
+                               FROM included_summary WHERE id=1""").fetchone(),
+                        (0, 0))
                 finally:
                     conn.close()
 

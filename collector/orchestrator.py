@@ -275,11 +275,25 @@ def connect(check_same_thread=True):
     if "max_gap" not in span_cols:
         c.execute("ALTER TABLE span ADD COLUMN max_gap REAL NOT NULL DEFAULT 0")
     c.execute("""
+      CREATE TABLE IF NOT EXISTS span_summary (
+        reason TEXT PRIMARY KEY, events INTEGER NOT NULL,
+        included_segments INTEGER NOT NULL, max_gap REAL NOT NULL
+      )""")
+    c.execute("""
       CREATE TABLE IF NOT EXISTS included_cell (
         routeid TEXT NOT NULL, from_ord INTEGER NOT NULL, to_ord INTEGER NOT NULL,
         band INTEGER NOT NULL, daytype TEXT NOT NULL,
         direct_n INTEGER NOT NULL DEFAULT 0, censored_n INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(routeid,from_ord,to_ord,band,daytype)
+      )""")
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS included_summary (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        cells INTEGER NOT NULL, direct_cells INTEGER NOT NULL
+      )""")
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS aggregate_summary_meta (
+        name TEXT PRIMARY KEY, version INTEGER NOT NULL
       )""")
     # 실제 차량이 한 번이라도 관측된 노선×요일×밴드. 이 마스크만 도달 가능 셀의
     # 분모로 사용한다. 이론상 모든 조합 분모는 별도 지표로 계속 제공한다.
@@ -313,6 +327,8 @@ def connect(check_same_thread=True):
         PRIMARY KEY (line, trainNo, statnId, daytype)
       )""")
     c.execute("CREATE INDEX IF NOT EXISTS subway_cell_line ON subway_cell(line)")
+    c.execute("""CREATE INDEX IF NOT EXISTS subway_dashboard
+                 ON subway_cell(line,daytype,trainNo,statnId,n)""")
     # 기존 DB 마이그레이션 — last_day 는 "이 셀을 마지막으로 센 운행일"이고,
     # 하루 1회 제약을 메모리가 아니라 **디스크**에 두기 위한 것이다 (bump_subway 참조).
     if "last_day" not in {r[1] for r in c.execute("PRAGMA table_info(subway_cell)")}:
@@ -480,6 +496,112 @@ def connect(check_same_thread=True):
         WHERE daytype=OLD.daytype AND band=OLD.band;
         DELETE FROM cell_summary
         WHERE daytype=OLD.daytype AND band=OLD.band AND cells=0;
+      END
+    """)
+
+    if c.execute(
+            """SELECT version FROM aggregate_summary_meta
+               WHERE name='span'""").fetchone() != (1,):
+        c.execute("DROP TRIGGER IF EXISTS span_summary_insert")
+        c.execute("DROP TRIGGER IF EXISTS span_summary_update")
+        c.execute("DROP TRIGGER IF EXISTS span_summary_delete")
+        c.execute("DELETE FROM span_summary")
+        c.execute("""
+          INSERT INTO span_summary(reason,events,included_segments,max_gap)
+          SELECT reason,COALESCE(SUM(n),0),
+                 COALESCE(SUM((to_ord-from_ord)*n),0),
+                 COALESCE(MAX(max_gap),0)
+          FROM span GROUP BY reason
+        """)
+        c.execute("""
+          INSERT INTO aggregate_summary_meta(name,version) VALUES('span',1)
+          ON CONFLICT(name) DO UPDATE SET version=excluded.version
+        """)
+    c.execute("""
+      CREATE TRIGGER IF NOT EXISTS span_summary_insert AFTER INSERT ON span
+      BEGIN
+        INSERT INTO span_summary(reason,events,included_segments,max_gap)
+        VALUES(NEW.reason,NEW.n,(NEW.to_ord-NEW.from_ord)*NEW.n,NEW.max_gap)
+        ON CONFLICT(reason) DO UPDATE SET
+          events=events+NEW.n,
+          included_segments=included_segments
+            +(NEW.to_ord-NEW.from_ord)*NEW.n,
+          max_gap=MAX(max_gap,NEW.max_gap);
+      END
+    """)
+    c.execute("""
+      CREATE TRIGGER IF NOT EXISTS span_summary_update
+      AFTER UPDATE OF n,max_gap ON span
+      BEGIN
+        UPDATE span_summary SET
+          events=events+NEW.n-OLD.n,
+          included_segments=included_segments
+            +(NEW.to_ord-NEW.from_ord)*(NEW.n-OLD.n),
+          max_gap=MAX(max_gap,NEW.max_gap)
+        WHERE reason=NEW.reason;
+      END
+    """)
+    c.execute("""
+      CREATE TRIGGER IF NOT EXISTS span_summary_delete AFTER DELETE ON span
+      BEGIN
+        UPDATE span_summary SET
+          events=events-OLD.n,
+          included_segments=included_segments
+            -(OLD.to_ord-OLD.from_ord)*OLD.n,
+          max_gap=CASE WHEN max_gap=OLD.max_gap THEN
+            COALESCE((SELECT MAX(max_gap) FROM span
+                      WHERE reason=OLD.reason),0)
+            ELSE max_gap END
+        WHERE reason=OLD.reason;
+        DELETE FROM span_summary
+        WHERE reason=OLD.reason AND events=0;
+      END
+    """)
+
+    if c.execute(
+            """SELECT version FROM aggregate_summary_meta
+               WHERE name='included'""").fetchone() != (1,):
+        c.execute("DROP TRIGGER IF EXISTS included_summary_insert")
+        c.execute("DROP TRIGGER IF EXISTS included_summary_update")
+        c.execute("DROP TRIGGER IF EXISTS included_summary_delete")
+        c.execute("DELETE FROM included_summary")
+        c.execute("""
+          INSERT INTO included_summary(id,cells,direct_cells)
+          SELECT 1,COUNT(*),COALESCE(SUM(direct_n>0),0)
+          FROM included_cell
+        """)
+        c.execute("""
+          INSERT INTO aggregate_summary_meta(name,version)
+          VALUES('included',1)
+          ON CONFLICT(name) DO UPDATE SET version=excluded.version
+        """)
+    c.execute("""
+      CREATE TRIGGER IF NOT EXISTS included_summary_insert
+      AFTER INSERT ON included_cell
+      BEGIN
+        INSERT INTO included_summary(id,cells,direct_cells)
+        VALUES(1,1,(NEW.direct_n>0))
+        ON CONFLICT(id) DO UPDATE SET
+          cells=cells+1,direct_cells=direct_cells+(NEW.direct_n>0);
+      END
+    """)
+    c.execute("""
+      CREATE TRIGGER IF NOT EXISTS included_summary_update
+      AFTER UPDATE OF direct_n ON included_cell
+      BEGIN
+        UPDATE included_summary SET
+          direct_cells=direct_cells
+            +(NEW.direct_n>0)-(OLD.direct_n>0)
+        WHERE id=1;
+      END
+    """)
+    c.execute("""
+      CREATE TRIGGER IF NOT EXISTS included_summary_delete
+      AFTER DELETE ON included_cell
+      BEGIN
+        UPDATE included_summary SET
+          cells=cells-1,direct_cells=direct_cells-(OLD.direct_n>0)
+        WHERE id=1;
       END
     """)
     c.commit()

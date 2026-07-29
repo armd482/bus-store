@@ -436,11 +436,12 @@ def snapshot():
           GROUP BY rs.daytype,rs.band""").fetchall()
         availability = dict(c.execute(
             "SELECT status,COUNT(*) FROM route_service GROUP BY status").fetchall())
-        span_rows = c.execute("""SELECT reason,COALESCE(SUM(n),0),
-                                COALESCE(SUM((to_ord-from_ord)*n),0),COALESCE(MAX(max_gap),0)
-                                FROM span GROUP BY reason""").fetchall()
+        span_rows = c.execute(
+            """SELECT reason,events,included_segments,max_gap
+               FROM span_summary""").fetchall()
         included_seen, direct_seen = c.execute(
-            "SELECT COUNT(*),COALESCE(SUM(direct_n>0),0) FROM included_cell").fetchone()
+            """SELECT cells,direct_cells FROM included_summary
+               WHERE id=1""").fetchone()
     eligible = {(d, b): n for d, b, n in eligible_rows}
     eligible_by_day = {d: sum(n for (dd, _), n in eligible.items() if dd == d) for d in DAYS7}
     goal = sum(eligible.values())
