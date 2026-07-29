@@ -9,47 +9,53 @@ from bus_collector import (
 
 
 class InflightPolicyTests(unittest.TestCase):
-    def test_isolated_code99_only_resets_recovery_counter(self):
+    def test_sparse_code99_only_resets_recovery_counter(self):
         self.assertEqual(
             next_global_inflight(
-                44, 32, 72, 1, 100, 44, 2, 3),
-            (44, 0))
+                44, 40, 64, 1, 200, 44, 2, 3, []),
+            (44, 0, [False]))
 
-    def test_code99_rate_or_count_retreats_global_limit(self):
+    def test_five_percent_code99_retreats_immediately_by_four(self):
         self.assertEqual(
             next_global_inflight(
-                44, 32, 72, 2, 100, 44, 2, 3),
-            (37, 0))
-        self.assertEqual(
-            next_global_inflight(
-                44, 32, 72, 3, 1000, 44, 2, 3),
-            (37, 0))
-        self.assertEqual(
-            next_global_inflight(
-                36, 32, 72, 3, 1000, 36, 2, 3),
-            (32, 0))
+                44, 40, 64, 5, 100, 44, 2, 3, []),
+            (40, 0, []))
 
-    def test_two_sparse_code99_events_do_not_retreat(self):
+    def test_two_pressure_windows_out_of_three_retreat(self):
         self.assertEqual(
             next_global_inflight(
-                44, 32, 72, 2, 1000, 44, 2, 3),
-            (44, 0))
+                44, 40, 64, 2, 100, 44, 2, 3, []),
+            (44, 0, [True]))
+        self.assertEqual(
+            next_global_inflight(
+                44, 40, 64, 0, 100, 44, 0, 3, [True]),
+            (44, 1, [True, False]))
+        self.assertEqual(
+            next_global_inflight(
+                44, 40, 64, 2, 100, 44, 1, 3, [True, False]),
+            (40, 0, []))
+
+    def test_retreat_never_crosses_floor(self):
+        self.assertEqual(
+            next_global_inflight(
+                42, 40, 64, 5, 100, 42, 2, 3, []),
+            (40, 0, []))
 
     def test_global_limit_recovers_two_after_required_clean_windows(self):
         self.assertEqual(
             next_global_inflight(
-                44, 32, 72, 0, 100, 44, 1, 3),
-            (44, 2))
+                44, 40, 64, 0, 100, 44, 1, 3, []),
+            (44, 2, [False]))
         self.assertEqual(
             next_global_inflight(
-                44, 32, 72, 0, 100, 44, 2, 3),
-            (46, 0))
+                44, 40, 64, 0, 100, 44, 2, 3, [False]),
+            (46, 0, [False, False]))
 
     def test_tiny_window_does_not_count_as_clean(self):
         self.assertEqual(
             next_global_inflight(
-                44, 32, 72, 0, 43, 44, 2, 3),
-            (44, 0))
+                44, 40, 64, 0, 43, 44, 2, 3, []),
+            (44, 0, [False]))
 
     def test_counter_migration_is_gated_by_day_or_safety_interval(self):
         self.assertTrue(counter_check_due("2026-07-27", None, 10, 0))

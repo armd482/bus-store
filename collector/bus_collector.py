@@ -94,24 +94,25 @@ def service_day(t):
 
 
 def next_global_inflight(current, minimum, maximum, code99_count, attempted,
-                         minimum_samples, clean_windows, recovery_windows):
-    """EC2 egress 공통 AIMD 한 단계와 다음 연속 정상창 수를 반환한다.
+                         minimum_samples, clean_windows, recovery_windows,
+                         pressure_windows):
+    """EC2 egress 공통 AIMD와 다음 정상창·압력창 상태를 반환한다.
 
-    단발성 code99는 공급자 측 순간 오류일 수도 있으므로 쿨다운만 적용한다.
-    한 창에 3건 이상이거나, 2건 이상이면서 1% 이상일 때만 과부하로 본다.
+    code99는 동시성이 낮을 때도 군집 발생하므로 단일 창의 소수 오류로 후퇴하지
+    않는다. 한 창에서 5% 이상이거나 최근 3창 중 2창이 1% 이상일 때만 압력으로
+    확정하고, 후퇴 뒤 이력을 비워 같은 군집으로 연속 하락하지 않게 한다.
     """
-    overloaded = (
-        code99_count >= 3
-        or (code99_count >= 2
-            and code99_count / max(1, attempted) >= 0.01))
+    code99_rate = code99_count / max(1, attempted)
+    pressure_windows = (list(pressure_windows) + [code99_rate >= 0.01])[-3:]
+    overloaded = code99_rate >= 0.05 or sum(pressure_windows) >= 2
     if overloaded:
-        return max(minimum, int(current * 0.85)), 0
+        return max(minimum, current - 4), 0, []
     if code99_count or attempted < minimum_samples:
-        return current, 0
+        return current, 0, pressure_windows
     clean_windows += 1
     if clean_windows < recovery_windows or current >= maximum:
-        return current, clean_windows
-    return min(maximum, current + 2), 0
+        return current, clean_windows, pressure_windows
+    return min(maximum, current + 2), 0, pressure_windows
 
 
 def counter_check_due(qday, counter_day, monotonic_now, next_check):
@@ -335,6 +336,7 @@ def main():
     panel_target = effective_maxr
     capacity_clean_windows = 0
     global_clean_windows = 0
+    global_pressure_windows = []
     picked_band = None
     next_repick = 0.0
     rotated_day = None
@@ -378,6 +380,7 @@ def main():
         """완료 이벤트를 한 건강 창으로 확정한다. DB 쓰기는 메인 스레드만 한다."""
         nonlocal stats, report_no, report_started, report_at, next_repick
         nonlocal capacity_clean_windows, global_clean_windows
+        nonlocal global_pressure_windows
         report_obs = now()
         elapsed = max(0.001, elapsed)
         report_no += 1
@@ -479,10 +482,11 @@ def main():
         # 어느 키에서든 보이면 전역 상한을 후퇴시키고, 충분한 정상 창 뒤에만 +1한다.
         code99_count = sum("code99" in err for err in all_errors)
         old_global = snap["globalLimit"]
-        new_global, global_clean_windows = next_global_inflight(
+        new_global, global_clean_windows, global_pressure_windows = (
+            next_global_inflight(
             old_global, global_min, global_max, code99_count, stats["attempted"],
             old_global, global_clean_windows,
-            global_recovery_windows)
+            global_recovery_windows, global_pressure_windows))
         if new_global != old_global:
             dispatcher.set_global_inflight_limit(new_global)
             print(
