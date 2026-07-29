@@ -473,7 +473,7 @@ def main():
         old_global = snap["globalLimit"]
         new_global, global_clean_windows = next_global_inflight(
             old_global, global_min, global_max, saw99, stats["attempted"],
-            max(1, snap["routes"] // 4), global_clean_windows,
+            old_global, global_clean_windows,
             global_recovery_windows)
         if new_global != old_global:
             dispatcher.set_global_inflight_limit(new_global)
