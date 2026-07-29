@@ -363,7 +363,7 @@ def main():
 
     def report_window(report_day, report_band, elapsed, next_deadline):
         """완료 이벤트를 한 건강 창으로 확정한다. DB 쓰기는 메인 스레드만 한다."""
-        nonlocal stats, report_no, report_started, report_at
+        nonlocal stats, report_no, report_started, report_at, next_repick
         nonlocal capacity_clean_windows
         report_obs = now()
         elapsed = max(0.001, elapsed)
@@ -401,9 +401,14 @@ def main():
         # 기본 패널의 90% 이상이 실제 활성인 창만 센다.
         cadence_ok = (
             snap["routes"] >= math.ceil(effective_maxr * 0.9)
-            and stats["attempted"] >= math.ceil(snap["routes"] * 0.9))
+            and stats["attempted"] >= math.ceil(snap["routes"] * 0.9)
+            and not any("code99" in err for err in all_errors))
         capacity_clean_windows = (
             capacity_clean_windows + 1 if cadence_ok else 0)
+        if not cadence_ok and panel_target > effective_maxr:
+            # 확장 뒤 처리 지연이나 code99가 보이면 정기 재선정(~21분)을 기다리지
+            # 않고 다음 메인 반복에서 기본 패널로 즉시 복귀한다.
+            next_repick = 0.0
 
         mem = O.rss_mb()
         with LOCK:
