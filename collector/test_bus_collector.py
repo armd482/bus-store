@@ -9,27 +9,47 @@ from bus_collector import (
 
 
 class InflightPolicyTests(unittest.TestCase):
-    def test_code99_retreats_global_limit_to_configured_floor(self):
+    def test_isolated_code99_only_resets_recovery_counter(self):
         self.assertEqual(
             next_global_inflight(
-                36, 28, 44, True, 100, 80, 4, 5),
-            (28, 0))
+                44, 32, 72, 1, 100, 44, 2, 3),
+            (44, 0))
 
-    def test_global_limit_recovers_one_after_required_clean_windows(self):
+    def test_code99_rate_or_count_retreats_global_limit(self):
         self.assertEqual(
             next_global_inflight(
-                30, 28, 44, False, 100, 80, 3, 5),
-            (30, 4))
+                44, 32, 72, 2, 100, 44, 2, 3),
+            (37, 0))
         self.assertEqual(
             next_global_inflight(
-                30, 28, 44, False, 100, 80, 4, 5),
-            (31, 0))
+                44, 32, 72, 3, 1000, 44, 2, 3),
+            (37, 0))
+        self.assertEqual(
+            next_global_inflight(
+                36, 32, 72, 3, 1000, 36, 2, 3),
+            (32, 0))
+
+    def test_two_sparse_code99_events_do_not_retreat(self):
+        self.assertEqual(
+            next_global_inflight(
+                44, 32, 72, 2, 1000, 44, 2, 3),
+            (44, 0))
+
+    def test_global_limit_recovers_two_after_required_clean_windows(self):
+        self.assertEqual(
+            next_global_inflight(
+                44, 32, 72, 0, 100, 44, 1, 3),
+            (44, 2))
+        self.assertEqual(
+            next_global_inflight(
+                44, 32, 72, 0, 100, 44, 2, 3),
+            (46, 0))
 
     def test_tiny_window_does_not_count_as_clean(self):
         self.assertEqual(
             next_global_inflight(
-                30, 28, 44, False, 79, 80, 4, 5),
-            (30, 0))
+                44, 32, 72, 0, 43, 44, 2, 3),
+            (44, 0))
 
     def test_counter_migration_is_gated_by_day_or_safety_interval(self):
         self.assertTrue(counter_check_due("2026-07-27", None, 10, 0))

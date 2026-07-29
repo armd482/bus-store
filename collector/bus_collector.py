@@ -93,17 +93,25 @@ def service_day(t):
     return O.service_day_of(t).strftime("%Y-%m-%d")
 
 
-def next_global_inflight(current, minimum, maximum, saw99, attempted,
+def next_global_inflight(current, minimum, maximum, code99_count, attempted,
                          minimum_samples, clean_windows, recovery_windows):
-    """EC2 egress 공통 AIMD 한 단계와 다음 연속 정상창 수를 반환한다."""
-    if saw99:
-        return max(minimum, int(current * 0.75)), 0
-    if attempted < minimum_samples:
+    """EC2 egress 공통 AIMD 한 단계와 다음 연속 정상창 수를 반환한다.
+
+    단발성 code99는 공급자 측 순간 오류일 수도 있으므로 쿨다운만 적용한다.
+    한 창에 3건 이상이거나, 2건 이상이면서 1% 이상일 때만 과부하로 본다.
+    """
+    overloaded = (
+        code99_count >= 3
+        or (code99_count >= 2
+            and code99_count / max(1, attempted) >= 0.01))
+    if overloaded:
+        return max(minimum, int(current * 0.85)), 0
+    if code99_count or attempted < minimum_samples:
         return current, 0
     clean_windows += 1
     if clean_windows < recovery_windows or current >= maximum:
         return current, clean_windows
-    return min(maximum, current + 1), 0
+    return min(maximum, current + 2), 0
 
 
 def counter_check_due(qday, counter_day, monotonic_now, next_check):
@@ -469,10 +477,10 @@ def main():
 
         # code99는 키 자체가 아니라 EC2 egress가 공유하는 세션 압력으로 실측됐다.
         # 어느 키에서든 보이면 전역 상한을 후퇴시키고, 충분한 정상 창 뒤에만 +1한다.
-        saw99 = any("code99" in err for err in all_errors)
+        code99_count = sum("code99" in err for err in all_errors)
         old_global = snap["globalLimit"]
         new_global, global_clean_windows = next_global_inflight(
-            old_global, global_min, global_max, saw99, stats["attempted"],
+            old_global, global_min, global_max, code99_count, stats["attempted"],
             old_global, global_clean_windows,
             global_recovery_windows)
         if new_global != old_global:
@@ -480,7 +488,7 @@ def main():
             print(
                 f"[{report_obs:%H:%M:%S}] 전역 in-flight "
                 f"{old_global}→{new_global}"
-                f"({'code99 후퇴' if saw99 else '정상창 회복'})",
+                f"({'code99 과부하 후퇴' if new_global < old_global else '정상창 회복'})",
                 flush=True)
 
         stats = blank_stats()
