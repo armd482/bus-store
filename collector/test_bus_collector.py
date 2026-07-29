@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from bus_collector import (
     QuotaReservations, counter_check_due, next_global_inflight,
-    quota_panel_target, reserve_calls)
+    quota_panel_target, quota_rate_targets, reserve_calls)
 
 
 class InflightPolicyTests(unittest.TestCase):
@@ -51,6 +51,13 @@ class InflightPolicyTests(unittest.TestCase):
                 44, 40, 64, 0, 100, 44, 2, 3, [False]),
             (46, 0, [False, False]))
 
+    def test_quota_catchup_recovers_global_limit_by_four(self):
+        self.assertEqual(
+            next_global_inflight(
+                44, 40, 88, 0, 100, 44, 2, 3, [False],
+                recovery_step=4),
+            (48, 0, [False, False]))
+
     def test_tiny_window_does_not_count_as_clean(self):
         self.assertEqual(
             next_global_inflight(
@@ -81,6 +88,14 @@ class QuotaPanelTests(unittest.TestCase):
                 can_expand=True),
             372)
 
+    def test_dynamic_key_rates_raise_panel_capacity(self):
+        t = datetime(2026, 7, 29, 12, 0)
+        self.assertEqual(
+            quota_panel_target(
+                t, {"K1": 100000, "K2": 100000}, 340, 31,
+                {"K1": 8.5, "K2": 8.0}, 475000, can_expand=True),
+            510)
+
     def test_never_reduces_base_panel_when_quota_is_ahead(self):
         t = datetime(2026, 7, 29, 12, 0)
         self.assertEqual(
@@ -88,6 +103,31 @@ class QuotaPanelTests(unittest.TestCase):
                 t, {"K1": 400000, "K2": 400000}, 340, 31, 6, 475000,
                 can_expand=True),
             340)
+
+    def test_sparse_dynamic_rate_does_not_shrink_base_panel(self):
+        t = datetime(2026, 7, 29, 2, 0)
+        self.assertEqual(
+            quota_panel_target(
+                t, {"K1": 10000, "K2": 10000}, 340, 31,
+                {"K1": 0.5, "K2": 0.5}, 475000, can_expand=True),
+            340)
+
+
+class QuotaRateTests(unittest.TestCase):
+    def test_daytime_uses_remaining_quota_rate_up_to_cap(self):
+        t = datetime(2026, 7, 29, 12, 0)
+        rates = quota_rate_targets(
+            t, {"K1": 100000}, 475000, {"K1": 9},
+            {"K1": 170}, 31, 170)
+        self.assertAlmostEqual(rates["K1"], 375000 / 43200)
+
+    def test_sparse_night_pool_caps_rate_to_route_demand(self):
+        t = datetime(2026, 7, 29, 2, 0)
+        rates = quota_rate_targets(
+            t, {"K1": 10000, "K2": 10000}, 475000,
+            {"K1": 9, "K2": 9}, {"K1": 20, "K2": 18}, 31, 340)
+        self.assertAlmostEqual(rates["K1"], 20 / 31)
+        self.assertAlmostEqual(rates["K2"], 18 / 31)
 
 
 class QuotaReservationsTests(unittest.TestCase):

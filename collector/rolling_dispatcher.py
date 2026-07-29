@@ -34,7 +34,6 @@ class RollingDispatcher:
         self.fetch = fetch
         self.reserve = reserve
         self.interval = float(interval)
-        self.rate = float(rate)
         self.hold = float(hold)
         self.retry_limit = retry_limit
         self.retry_code99 = bool(retry_code99)
@@ -43,6 +42,7 @@ class RollingDispatcher:
         self._key_order = [kid for kid, _ in keys]
         self._states = {
             kid: {"heap": [], "inflight": 0, "limit": max_inflight,
+                  "rate": max(0.1, float(rate)),
                   "next_submit": 0.0,
                   "quota_blocked_until": 0.0, "quota_was_blocked": False}
             for kid in self._key_order
@@ -81,6 +81,14 @@ class RollingDispatcher:
         """EC2 egress 전체의 동시 요청 상한을 바꾼다."""
         with self._lock:
             self._global_limit = max(1, int(value))
+        self._wake.set()
+
+    def set_rates(self, rates):
+        """키별 제출 rate를 바꾼다. 이미 제출된 요청에는 영향을 주지 않는다."""
+        with self._lock:
+            for kid, value in rates.items():
+                if kid in self._states:
+                    self._states[kid]["rate"] = max(0.1, float(value))
         self._wake.set()
 
     def reset_quota_blocks(self):
@@ -204,6 +212,9 @@ class RollingDispatcher:
                 "routesByKey": routes_by_key,
                 "inflight": self._global_inflight,
                 "limits": limits,
+                "rates": {
+                    kid: state["rate"]
+                    for kid, state in self._states.items()},
                 "limitTotal": min(sum(limits.values()), self._global_limit),
                 "perKeyLimitTotal": sum(limits.values()),
                 "globalLimit": self._global_limit,
@@ -258,7 +269,8 @@ class RollingDispatcher:
                 route["inflight"] = True
                 ks["inflight"] += 1
                 self._global_inflight += 1
-                ks["next_submit"] = max(ks["next_submit"], now) + 1.0 / self.rate
+                ks["next_submit"] = (
+                    max(ks["next_submit"], now) + 1.0 / ks["rate"])
                 fut = self._executor.submit(
                     self._guarded_fetch, self._keys[kid], route["meta"])
                 # 완료를 200ms 폴링까지 기다리지 않고 즉시 회수해 다음 슬롯을 계산한다.

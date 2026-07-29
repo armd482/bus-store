@@ -95,7 +95,7 @@ def service_day(t):
 
 def next_global_inflight(current, minimum, maximum, code99_count, attempted,
                          minimum_samples, clean_windows, recovery_windows,
-                         pressure_windows):
+                         pressure_windows, recovery_step=2):
     """EC2 egress 공통 AIMD와 다음 정상창·압력창 상태를 반환한다.
 
     code99는 동시성이 낮을 때도 군집 발생하므로 단일 창의 소수 오류로 후퇴하지
@@ -112,7 +112,7 @@ def next_global_inflight(current, minimum, maximum, code99_count, attempted,
     clean_windows += 1
     if clean_windows < recovery_windows or current >= maximum:
         return current, clean_windows, pressure_windows
-    return min(maximum, current + 2), 0, pressure_windows
+    return min(maximum, current + max(1, int(recovery_step))), 0, pressure_windows
 
 
 def counter_check_due(qday, counter_day, monotonic_now, next_check):
@@ -139,14 +139,42 @@ def quota_panel_target(t, calls, base_panel, interval, dispatch_rate,
         for used in calls.values()
     ]
     desired = math.ceil(sum(required_rates) * interval)
-    per_key_capacity = max(1, math.floor(dispatch_rate * interval))
-    capacity = per_key_capacity * len(calls)
+    if isinstance(dispatch_rate, dict):
+        capacity = sum(
+            max(1, math.floor(dispatch_rate.get(kid, 0.1) * interval))
+            for kid in calls)
+    else:
+        per_key_capacity = max(1, math.floor(dispatch_rate * interval))
+        capacity = per_key_capacity * len(calls)
+    nkeys = len(calls)
+    capacity = max(nkeys, capacity - capacity % nkeys)
+    # 심야에 rate가 운행 노선 수만큼 낮아져도 목표 패널 자체를 줄이지 않는다.
+    # 그래야 아침 재선정에서 새로 운행을 시작한 노선을 다시 최대 base_panel까지
+    # 발견할 수 있다. 실제 심야 선택 수는 pick_routes의 운행시간 필터가 줄인다.
+    capacity = max(int(base_panel), capacity)
     wanted = max(int(base_panel), min(desired, capacity))
     if wanted > base_panel and not can_expand:
         return int(base_panel)
     # 키별 라우팅이 균등하므로 키 수의 배수로 올려 한 키만 한 슬롯 더 받지 않게 한다.
-    nkeys = len(calls)
     return min(capacity, int(math.ceil(wanted / nkeys) * nkeys))
+
+
+def quota_rate_targets(t, calls, planned_per_key, max_rates, routes_by_key,
+                       interval, base_panel):
+    """남은 쿼터를 주간에 보충하되 작은 심야 운행 풀은 과다 폴링하지 않는다."""
+    tomorrow = (t + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    seconds_left = max(1.0, (tomorrow - t).total_seconds())
+    sparse_pool = sum(routes_by_key.values()) < math.ceil(base_panel * 0.9)
+    targets = {}
+    for kid, used in calls.items():
+        required = max(0.0, planned_per_key - used) / seconds_left
+        target = min(max_rates[kid], max(0.1, required))
+        if sparse_pool:
+            route_demand = routes_by_key.get(kid, 0) / max(1.0, interval)
+            target = min(target, max(0.1, route_demand))
+        targets[kid] = target
+    return targets
 
 
 # ── 일 호출수는 디스크에 (KeepAlive 재시작해도 상한을 넘지 않게) ────────
@@ -310,6 +338,8 @@ def main():
     configured_keys = len(k.get("busKeys") or ["GBIS_BUS_KEY"])
     effective_maxr = max(1, maxr * len(keys) // max(1, configured_keys))
     workers, rate = k["maxWorkers"], k["dispatchRate"]
+    quota_max_rate = max(
+        float(rate), float(k.get("busQuotaMaxRatePerKey", rate)))
     inflight_max = k["maxInflight"]
     physical_global_max = max(1, inflight_max * len(keys))
     global_max = min(
@@ -337,6 +367,9 @@ def main():
     capacity_clean_windows = 0
     global_clean_windows = 0
     global_pressure_windows = []
+    rate_caps = {kid: quota_max_rate for kid, _ in keys}
+    rate_clean_windows = {kid: 0 for kid, _ in keys}
+    rate_targets = {kid: float(rate) for kid, _ in keys}
     picked_band = None
     next_repick = 0.0
     rotated_day = None
@@ -386,6 +419,40 @@ def main():
         report_no += 1
         snap = dispatcher.snapshot()
         all_errors = stats["errors"]
+        calls_now = {
+            kid: read_calls(report_day, kid)
+            for kid, _ in keys
+        }
+        for kid, _ in keys:
+            key_errors = stats["by_key"][kid]["errors"]
+            if any("HTTP429" in err for err in key_errors):
+                rate_caps[kid] = max(
+                    0.5, min(rate_caps[kid], snap["rates"][kid] * 0.7))
+                rate_clean_windows[kid] = 0
+            else:
+                rate_clean_windows[kid] += 1
+                if (rate_clean_windows[kid] >= 5
+                        and rate_caps[kid] < quota_max_rate):
+                    rate_caps[kid] = min(
+                        quota_max_rate, rate_caps[kid] + 0.5)
+                    rate_clean_windows[kid] = 0
+        new_rates = quota_rate_targets(
+            report_obs, calls_now, planned_calls, rate_caps,
+            snap["routesByKey"], interval, effective_maxr)
+        rate_changes = [
+            f"{kid}={snap['rates'][kid]:.2f}→{new_rates[kid]:.2f}"
+            for kid, _ in keys
+            if abs(snap["rates"][kid] - new_rates[kid]) >= 0.05
+        ]
+        if rate_changes:
+            dispatcher.set_rates(new_rates)
+            print(
+                f"[{report_obs:%H:%M:%S}] 쿼터 rate "
+                + " ".join(rate_changes),
+                flush=True)
+        rate_targets.clear()
+        rate_targets.update(new_rates)
+        snap = dispatcher.snapshot()
         health_ts = time.time()
         O.record_health(
             conn, report_day, report_band, stats["attempted"], stats["successful"],
@@ -439,6 +506,7 @@ def main():
             STATE["errors"] = dict(stats["final"])
             STATE["retried"] = stats["retried"]
             STATE["globalInflightLimit"] = snap["globalLimit"]
+            STATE["dispatchRates"] = dict(snap["rates"])
             STATE["rssMB"] = mem
             STATE["inflightLimits"] = dict(snap["limits"])
             STATE["night"] = False
@@ -458,6 +526,7 @@ def main():
               f"운행 {stats['moving']}대 · 통과 +{stats['rows']} "
               f"(누적 {written:,}) · 예약 {snap['queued']} · "
               f"in-flight 합계 {snap['inflight']}/{snap['globalLimit']} · "
+              f"rate합계 {sum(snap['rates'].values()):.1f}/s · "
               f"키상한 " + " ".join(
                   f"{kid}={snap['limits'][kid]}" for kid, _ in keys)
               + (f" · 쿼터차단 {snap['quotaBlocked']}키"
@@ -486,7 +555,10 @@ def main():
             next_global_inflight(
             old_global, global_min, global_max, code99_count, stats["attempted"],
             old_global, global_clean_windows,
-            global_recovery_windows, global_pressure_windows))
+            global_recovery_windows, global_pressure_windows,
+            recovery_step=(
+                4 if any(v > float(rate) + 0.05
+                         for v in rate_targets.values()) else 2)))
         if new_global != old_global:
             dispatcher.set_global_inflight_limit(new_global)
             print(
@@ -503,6 +575,7 @@ def main():
           f"밴드 {nb}개 · 최대 {effective_maxr}노선 · "
           f"키 {len(keys)}개({', '.join(nm for nm, _ in keys)}) · "
           f"전역 in-flight {global_initial}({global_min}~{global_max}) · "
+          f"키당 rate {rate}~{quota_max_rate:g}/s · "
           f"키당 계획 {planned_calls:,} / 상한 {key_cap:,} "
           f"(오늘 합계 {read_calls(quota_day(now())):,} 사용)", flush=True)
 
@@ -576,7 +649,8 @@ def main():
                     for kid, _ in keys
                 }
                 new_panel_target = quota_panel_target(
-                    t, calls, effective_maxr, interval, rate, planned_calls,
+                    t, calls, effective_maxr, interval, rate_targets,
+                    planned_calls,
                     capacity_clean_windows >= 3)
                 if new_panel_target != panel_target:
                     print(

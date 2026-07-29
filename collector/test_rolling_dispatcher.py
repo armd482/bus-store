@@ -125,6 +125,18 @@ class RollingDispatcherTests(unittest.TestCase):
         self.assertGreater(maximum["key1"], 0)
         self.assertGreater(maximum["key2"], 1)
 
+    def test_dispatch_rates_can_change_per_key(self):
+        dispatcher = RollingDispatcher(
+            [("K1", "key1"), ("K2", "key2")],
+            lambda _key, _city, rid: (
+                rid, [], None, __import__("datetime").datetime.now()),
+            lambda _kid, _n: True, interval=1, rate=2,
+            workers=2, max_inflight=1)
+        self.addCleanup(dispatcher.close)
+        dispatcher.set_rates({"K1": 3.5, "K2": 0.5})
+        self.assertEqual(
+            dispatcher.snapshot()["rates"], {"K1": 3.5, "K2": 0.5})
+
     def test_global_inflight_caps_all_keys_together(self):
         active = 0
         maximum = 0
