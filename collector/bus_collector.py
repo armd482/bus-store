@@ -366,6 +366,31 @@ def reserve_calls(day, wanted, cap, keyid):
         return grant
 
 
+def sync_quota_db(day, keys, cap):
+    """파일 카운터의 현재 누계를 DB 이력(quota_daily)에 반영. 실패해도 무시된다."""
+    for kid, _ in keys:
+        O.record_quota(day, "bus", kid, read_calls(day, kid), cap)
+
+
+def cleanup_calls_files(day):
+    """당일 카운터만 남긴다 — 과거 추이는 quota_daily(DB)가 갖는다.
+
+    파일은 쿼터 방어(호출 전 예약)의 실시간 경로일 뿐이라 당일 것만 있으면 된다.
+    서울 수집기의 cleanup_state_files 와 같은 정책 (세 수집기 통일).
+    """
+    import glob as _glob
+    keep = os.path.abspath(calls_path(day))
+    keeps = {keep} | {os.path.abspath(calls_path(day, k))
+                      for k in (O.cfg().get("busKeys") or [])}
+    for p in _glob.glob(os.path.join(O.DATA, ".buscalls*")):
+        if os.path.abspath(p) in keeps or p.endswith(".tmp"):
+            continue
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def ensure_key_counters(keys, day):
     """구버전 합계 장부의 아직 미배분된 호출을 키별 장부로 마이그레이션.
 
@@ -869,6 +894,10 @@ def main():
             mono = time.monotonic()
             if counter_check_due(qday, counter_day, mono, next_counter_check):
                 ensure_key_counters(keys, qday)
+                # 현재 누계를 DB 이력에 반영하고, 지난 날짜 카운터 파일은 정리한다
+                # (파일=당일 방어 · DB=과거 추이). 둘 다 실패해도 수집은 계속된다.
+                sync_quota_db(qday, keys, k.get("busKeyDailyCap", 480000))
+                cleanup_calls_files(qday)
                 counter_day = qday
                 next_counter_check = mono + COUNTER_CHECK_SEC
             if d != day:

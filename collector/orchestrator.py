@@ -396,6 +396,26 @@ def connect(check_same_thread=True):
       )""")
     c.execute("CREATE INDEX IF NOT EXISTS health_key_day ON collector_health_key(day,keyid)")
 
+    # ── 일별 쿼터 이력 (날짜 × 종류 × 키) ────────────────────────────
+    # 파일 카운터(.buscalls-*, .subwaycalls-*, seoul-calls-*)는 **당일 것만** 두고
+    # 쿼터 방어(호출 전 예약 기록)에만 쓴다 — 그 경로에 sqlite 락·크래시 위험을
+    # 들이지 않기 위해서다. 과거 추이는 이 테이블이 맡는다.
+    #   · 파일 = 실시간 방어 (없으면 상한을 못 지킨다)
+    #   · DB  = 이력·조회 (실패해도 수집은 안 멈춘다)
+    # kind: 'bus' | 'subway' | 'seoul'. cap 은 그날 적용된 상한 — 정책을 바꿔도
+    # 과거 행의 분모가 보존된다.
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS quota_daily (
+        day   TEXT NOT NULL,
+        kind  TEXT NOT NULL,
+        keyid TEXT NOT NULL,
+        calls INTEGER NOT NULL,
+        cap   INTEGER,
+        ts    REAL,
+        PRIMARY KEY (day, kind, keyid)
+      )""")
+    c.execute("CREATE INDEX IF NOT EXISTS quota_daily_day ON quota_daily(day)")
+
     # 기존 DB 마이그레이션 — CREATE TABLE IF NOT EXISTS 는 이미 있는 테이블에 컬럼을 안 붙인다.
     # ⚠️ 이걸 빠뜨려 배포본에만 손으로 ALTER 했다가, 새 기계에서 'no such column: startvt' 로 죽었다.
     have = {r[1] for r in c.execute("PRAGMA table_info(route)")}
@@ -814,6 +834,46 @@ def rotate_jsonl(prefix):
             print(f"[삭제] {os.path.basename(src)} (백업 확인됨)", flush=True)
         else:
             print(f"[삭제 보류] {os.path.basename(src)} — 백업 미확인, 원본 유지 (수동 확인 요망)", flush=True)
+
+
+def record_quota(day, kind, keyid, calls, cap=None):
+    """일별 쿼터 이력 upsert — **실패해도 조용히 넘어간다**.
+
+    수집 경로에서 부르므로 여기서 예외가 나면 안 된다 (sqlite 락·디스크 등).
+    쿼터 방어는 파일 카운터가 하고, 이건 이력일 뿐이라 한 번 놓쳐도 다음 호출에
+    현재 누계로 덮어써진다 (calls 는 증분이 아니라 **그날 누계**).
+    """
+    try:
+        c = connect()
+        c.execute("""
+          INSERT INTO quota_daily(day,kind,keyid,calls,cap,ts) VALUES(?,?,?,?,?,?)
+          ON CONFLICT(day,kind,keyid) DO UPDATE SET
+            calls=excluded.calls, cap=COALESCE(excluded.cap,cap), ts=excluded.ts
+        """, (day, kind, keyid, int(calls), cap, time.time()))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def quota_history(days=7, kind=None):
+    """최근 N일 쿼터 이력 — [(day, kind, keyid, calls, cap)]."""
+    c = connect()
+    q = "SELECT day,kind,keyid,calls,cap FROM quota_daily"
+    args = []
+    if kind:
+        q += " WHERE kind=?"
+        args.append(kind)
+    q += " ORDER BY day DESC, kind, keyid"
+    rows = c.execute(q, args).fetchall()
+    c.close()
+    seen, out = set(), []
+    for r in rows:
+        seen.add(r[0])
+        if len(seen) > days:
+            break
+        out.append(r)
+    return out
 
 
 def bump(conn, routeid, from_ord, to_ord, band, daytype, day, k=1):

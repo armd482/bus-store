@@ -159,6 +159,26 @@ def bump_calls(keyid, day):
     return n
 
 
+def sync_quota_db(day, keys):
+    """파일 카운터 누계를 DB 이력(quota_daily)에 반영. 실패해도 무시된다."""
+    for kid, _ in keys:
+        O.record_quota(day, "subway", kid, read_calls(kid, day), DAILY_CAP)
+
+
+def cleanup_calls_files(day, keys):
+    """당일 카운터만 남긴다 — 과거 추이는 quota_daily(DB)가 갖는다.
+    파일은 쿼터 방어의 실시간 경로일 뿐이라 당일 것만 있으면 된다 (세 수집기 통일)."""
+    import glob as _glob
+    keeps = {os.path.abspath(calls_path(kid, day)) for kid, _ in keys}
+    for p in _glob.glob(os.path.join(OUT_DIR, ".subwaycalls-*")):
+        if os.path.abspath(p) in keeps or p.endswith(".tmp"):
+            continue
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def seed_today(day):
     """재시작 복원 — 오늘 jsonl 에서 (열차,역)별 마지막 arvlCd 를 되살린다.
     없으면 첫 사이클에 전 열차의 중복 행이 한 벌 남는다.
@@ -354,6 +374,10 @@ def main():
         if spent > 0:
             cps = 0.8 * cps + 0.2 * spent      # EWMA — 페이지 수가 바뀌면 따라간다
         interval = pace(t, qday)
+
+        # 쿼터 이력 DB 반영 + 지난 날짜 파일 정리 (파일=당일 방어 · DB=과거 추이)
+        sync_quota_db(qday, keys)
+        cleanup_calls_files(qday, keys)
 
         if int(t.timestamp()) // interval % 20 == 0:
             cal = " ".join(f"{kid}:{read_calls(kid, qday)}" for kid, _ in keys)
