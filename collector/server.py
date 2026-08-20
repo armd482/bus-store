@@ -75,7 +75,8 @@ DAYS7 = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")  # 버스·지하철 �
 _SUB_TAIL = {}
 _SUB_LOCK = threading.Lock()
 
-# 서울 스냅샷도 같은 이유로 증분 리더 (하루 50만 행이라 풀스캔이면 /api 가 늘어진다)
+# 서울 스냅샷도 같은 이유로 증분 리더 (연속 수집은 하루 수백만 행이라 매 /api
+# 요청마다 풀스캔하면 대시보드가 크게 늘어진다).
 _SEOUL_TAIL = {}
 _SEOUL_LOCK = threading.Lock()
 
@@ -210,40 +211,44 @@ def _obs_rate_per_day():
 
 
 def seoul_snapshot():
-    """서울 버스 도착정보 스냅샷 현황 — 밴드별 진행과 쿼터.
-
-    지하철과 지표가 다르다. 서울은 셀을 쌓는 게 아니라 **밴드마다 노선당 1회**
-    찍어 CV(§6.4)를 재는 것이라, 볼 것은 '오늘 이 밴드에서 702노선 중 몇 개를
-    찍었나' 와 '쿼터가 남았나' 다. 진행은 매일 0 에서 다시 시작한다.
-    """
+    """서울 버스 연속 스냅샷 현황 — 독립 주기, 키별 쿼터, 밴드별 관측."""
     if seoul_collector is None:
         return {"present": False}
     now = datetime.now(O.KST)
     day = seoul_collector.service_day(now)
     qday = seoul_collector.quota_day(now)
-    cap = seoul_collector.DAILY_CAP
+    config = O.cfg()
+    key_cap = config.get("seoulBusDailyCap", seoul_collector.DAILY_CAP)
+    keys = seoul_collector.load_keys(warn=False)
+    key_calls = [
+        {"id": kid, "calls": seoul_collector.read_calls(qday, kid), "cap": key_cap}
+        for kid, _ in keys
+    ]
+    calls = sum(item["calls"] for item in key_calls)
+    cap = key_cap * len(key_calls)
     try:
         with open(seoul_collector.ROUTES_FILE, encoding="utf-8") as f:
             R = json.load(f)
     except (OSError, ValueError):
         R = {}
-    done = seoul_collector.load_done(day)
     bands = O.cfg()["timebands"]
-    per = {}
-    for b, _ in done:
-        per[b] = per.get(b, 0) + 1
     cur = O.band_of(now, bands)
 
-    # 오늘 jsonl — 행 수와 마지막 관측 (지하철과 같은 증분 리더)
+    # 오늘 jsonl — 행 수·마지막 관측·밴드별 고유 노선을 증분으로 읽는다.
     path = os.path.join(O.DATA, f"{seoul_collector.PREFIX}-{day}.jsonl")
     cache = _SEOUL_TAIL
     with _SEOUL_LOCK:
         if cache.get("path") != path:
-            cache.update(path=path, offset=0, total=0, last_t=None, last_no=None, last_stn=None)
+            cache.clear()
+            cache.update(
+                path=path, offset=0, total=0, last_t=None, last_no=None,
+                last_stn=None, band_routes={}, last_by_route={})
         try:
             size = os.path.getsize(path)
             if size < cache["offset"]:
-                cache.update(offset=0, total=0)
+                cache.update(
+                    offset=0, total=0, last_t=None, last_no=None,
+                    last_stn=None, band_routes={}, last_by_route={})
             if size > cache["offset"]:
                 with open(path, "rb") as fh:
                     fh.seek(cache["offset"])
@@ -258,10 +263,21 @@ def seoul_snapshot():
                             continue
                         cache["last_t"], cache["last_no"], cache["last_stn"] = \
                             r.get("t"), r.get("no"), r.get("stNm")
+                        rid, band, observed = r.get("rid"), r.get("band"), r.get("t")
+                        if rid is not None and band is not None:
+                            cache["band_routes"].setdefault(str(band), set()).add(rid)
+                        if rid is not None and observed:
+                            try:
+                                cache["last_by_route"][rid] = \
+                                    datetime.fromisoformat(observed).timestamp()
+                            except ValueError:
+                                pass
         except OSError:
             pass
         written, last_t = cache["total"], cache["last_t"]
         last_no, last_stn = cache["last_no"], cache["last_stn"]
+        per = {int(band): len(routes) for band, routes in cache["band_routes"].items()}
+        last_by_route = dict(cache["last_by_route"])
     last_epoch = None
     if last_t:
         try:
@@ -269,16 +285,36 @@ def seoul_snapshot():
         except ValueError:
             pass
 
-    calls = seoul_collector.read_calls(qday)
-    failures = list(seoul_collector.load_failures(day).values())
+    status = seoul_collector.read_status()
+    if status.get("serviceDay") != day:
+        status = {}
+    interval = status.get(
+        "intervalSec", config.get("seoulIntervalSec", 2175))
+    recent_cutoff = now.timestamp() - interval * 1.5
+    recent_routes = status.get(
+        "recentRoutes",
+        sum(observed >= recent_cutoff for observed in last_by_route.values()))
+    projected_calls = len(R) * 86400 / interval if interval else 0
     return {
         "present": True, "started": bool(R),
         "routes": len(R), "calls": calls, "cap": cap,
-        "need": len(R) * len(bands),          # 하루에 필요한 콜 (밴드마다 노선당 1회)
+        "keyCap": key_cap, "keyCalls": key_calls, "keys": len(key_calls),
+        "plannedCallsPerKey": status.get(
+            "plannedCallsPerKey",
+            config.get("seoulPlannedCallsPerKey", seoul_collector.PLANNED_CALLS)),
+        "intervalSec": interval,
+        "configuredIntervalSec": config.get("seoulIntervalSec", 2175),
+        "projectedCalls": projected_calls,
+        "recentRoutes": recent_routes,
         "written": written, "lastObs": last_epoch,
         "lastNo": last_no, "lastStn": last_stn,
         "curBand": cur,
-        "failures": failures,
+        "attempted": status.get("attempted", 0),
+        "successful": status.get("successful", 0),
+        "retried": status.get("retried", 0),
+        "residual": status.get("residual", 0),
+        "errors": status.get("errors", {}),
+        "quotaBlocked": status.get("quotaBlocked", 0),
         "bands": [{"i": i, "from": a, "to": b if b <= 24 else b - 24, "wrap": b > 24,
                    "done": per.get(i, 0), "total": len(R),
                    "pct": per.get(i, 0) / len(R) if R else 0,
@@ -783,8 +819,17 @@ function renderBus(d){
 
   // 건강
   const q = d.calls/d.quota;
-  const errN = Object.values(s.errors).reduce((a,b)=>a+b,0);
-  const errRate = s.picked ? errN/s.picked : 0;
+  // code99 = TAGO 공유 세션 거절(혼잡)이고 나머지는 우리가 손볼 수 있는 실패다.
+  // 뭉쳐서 '실패율'로 보이면 정상 운영이 고장으로 읽힌다 (✅ 2026-07-29).
+  const isJam = k => k.indexOf('code99') >= 0;
+  const errEntries = Object.entries(s.errors);
+  const jamN = errEntries.filter(([k])=>isJam(k)).reduce((a,[,v])=>a+v,0);
+  const faultN = errEntries.filter(([k])=>!isJam(k)).reduce((a,[,v])=>a+v,0);
+  const errN = jamN + faultN;
+  const errRate = s.picked ? faultN/s.picked : 0;
+  const jamRate = s.picked ? jamN/s.picked : 0;
+  const faultDetail = errEntries.filter(([k])=>!isJam(k))
+    .map(([k,v])=>k+'×'+v).join(' ');
   const bk = d.busKeyCalls || [];
   const worst = bk.reduce((a,x)=>!a || x.calls/x.cap>a.calls/a.cap ? x : a, null);
   const qa = worst ? worst.calls/worst.cap : 0;
@@ -792,8 +837,10 @@ function renderBus(d){
   h += `<div class=card><div class=k>키별 쿼터 (최대 사용 키)</div>
         <div class="v ${qa>.97?'bad':qa>.9?'warn':''}">${worst?num(worst.calls):'—'}</div>
         <div class=k>${worst?worst.id+' / '+num(worst.cap):'키 없음'} · 합계 ${num(d.calls)}/${num(d.quota)}</div></div>`;
-  h += `<div class=card><div class=k>실패율</div><div class="v ${errRate>.05?'bad':errRate>.02?'warn':'ok'}">${pct(errRate)}</div>
-        <div class=k>${Object.entries(s.errors).map(([k,v])=>k+'×'+v).join(' ')||'없음'}</div></div>`;
+  h += `<div class=card><div class=k>실패율 (혼잡 제외)</div><div class="v ${errRate>.05?'bad':errRate>.02?'warn':'ok'}">${pct(errRate)}</div>
+        <div class=k>${faultDetail||'없음'} — timeout·429·5xx 등 조치 대상</div></div>`;
+  h += `<div class=card><div class=k>혼잡 (code99)</div><div class="v ${jamRate>.05?'warn':''}">${pct(jamRate)}</div>
+        <div class=k>${num(jamN)}건 · TAGO 공유 세션 거절 — 고장 아님, AIMD가 대응</div></div>`;
   h += `<div class=card><div class=k>마지막 관측</div><div class=v id=lastobs>—</div>
         <div class=k>사이클 ${s.lastCycleSec?s.lastCycleSec.toFixed(0)+'s':'—'} · ${s.picked}노선${s.night?' (심야)':''}</div></div>`;
   h += `<div class=card><div class=k>총 관측</div><div class=v>${num(d.total)}</div>
@@ -862,7 +909,13 @@ function renderBus(d){
 
   // 오류 로그 — 재시도 후 잔여 실패만 · 매일(운행일 경계) 초기화
   const log = (s.errLog||[]);
-  h += `<h2>오류 로그 — 오늘 잔여 실패 (${log.length}건 · 매일 초기화)</h2>`;
+  const jamOnly = e => /code99/.test(e.detail||'')
+    && !/(Timeout|timed out|HTTP4|HTTP5|Error)/.test((e.detail||'').replace(/code99[^ ]*/g,''));
+  const faultLog = log.filter(e=>!jamOnly(e));
+  h += `<h2>오류 로그 — 오늘 잔여 실패 (${log.length}건 · 조치 대상 ${faultLog.length}건 · 매일 초기화)</h2>`;
+  h += '<div class=sub style="opacity:.6">code99만 있는 줄은 회색 <b>혼잡</b>으로 표시한다 — '
+     + 'TAGO 공유 세션 거절이라 우리 설정으로 없앨 수 없고, 줄이려면 동시성을 낮춰야 하는데 '
+     + '✅ 실측상 그러면 처리량이 38% 떨어진다.</div>';
   if(!log.length){
     h += '<div class=sub style="color:#22c55e">오늘 실패 없음</div>';
   } else {
@@ -870,8 +923,9 @@ function renderBus(d){
     for(const e of log.slice().reverse()){
       const t = new Date(e.t*1000).toLocaleTimeString('ko-KR',{hour12:false});
       const rate = e.picked ? (e.n/e.picked*100).toFixed(1) : '0';
-      h += `<tr><td width=80 style="opacity:.6">${t}</td>`
-         + `<td width=90 class=bad>실패 ${e.n}/${e.picked}</td>`
+      const jam = jamOnly(e);
+      h += `<tr${jam?' style="opacity:.45"':''}><td width=80 style="opacity:.6">${t}</td>`
+         + `<td width=90 class=${jam?'':'bad'}>${jam?'혼잡':'실패'} ${e.n}/${e.picked}</td>`
          + `<td width=44 class=n>${rate}%</td>`
          + `<td style="opacity:.8">${e.detail}</td></tr>`;
     }
@@ -893,24 +947,39 @@ function renderSeoul(d){
   if(!s.started)
     return '<div class=sub>노선 목록이 아직 없다 — <code>python3 seoul_collector.py --routes</code> 로 먼저 받을 것.</div>';
   const q = s.cap ? s.calls/s.cap : 0;
-  const needPct = s.need ? s.calls/s.need : 0;
-  let h = '<div class=sub><b>도착정보 스냅샷</b> — 경기(TAGO)와 방식이 다르다. 서울은 운영사가 '
-    + '구간시간·배차를 <b>이미 계산해서</b> 주므로 30초 폴링이 아니라 <b>밴드마다 노선당 1회</b>만 찍는다 '
-    + `(${num(s.routes)}노선 × 밴드 7 = ${num(s.need)}콜/일, 한도의 ${pct(s.need/s.cap)}). `
-    + 'arrmsg1/arrmsg2 의 간격이 <b>실측 배차</b>이고 그것이 §6.4 의 CV — 모르면 20분 배차에서 10분 오차다.</div>';
+  const coverage = s.routes ? s.recentRoutes/s.routes : 0;
+  const success = s.attempted ? s.successful/s.attempted : 0;
+  let h = '<div class=sub><b>도착정보 연속 스냅샷</b> — '
+    + `${num(s.routes)}개 노선을 ${num(s.keys)}개 키에 균등 분산해 노선별 `
+    + `<b>${Math.round(s.intervalSec/60)}분 독립 주기</b>로 조회한다. `
+    + `하루 예상 ${num(Math.round(s.projectedCalls))}콜(전체 ${num(s.cap)} 소프트캡의 `
+    + `${pct(s.cap?s.projectedCalls/s.cap:0)}). 느린 요청은 다른 노선을 막지 않고, `
+    + '7개 시간대는 조회 스케줄이 아니라 분석 라벨이다. arrmsg1/arrmsg2의 간격은 배차 CV 재료다.</div>';
 
   h += '<h2>건강 상태</h2><div class=grid>';
   h += `<div class=card><div class=k>마지막 관측</div><div class=v id=seoullastobs>—</div>
         <div class=k>${s.lastNo||''} ${s.lastStn||'—'}</div></div>`;
   h += `<div class=card><div class=k>오늘 기록</div><div class=v>${num(s.written)}</div>
         <div class=k>정류장 × 노선 행</div></div>`;
-  h += `<div class=card><div class=k>오늘 콜</div><div class="v ${q>.95?'bad':q>.85?'warn':''}">${num(s.calls)}</div>
-        <div class=k>/ ${num(s.cap)} 상한 · 필요 ${num(s.need)}</div></div>`;
-  h += `<div class=card><div class=k>하루 진행</div><div class="v ${needPct>=1?'ok':''}">${pct(Math.min(needPct,1))}</div>
-        <div class=k>밴드 7종 × ${num(s.routes)}노선</div></div>`;
+  h += `<div class=card><div class=k>오늘 전체 콜</div><div class="v ${q>.95?'bad':q>.85?'warn':''}">${num(s.calls)}</div>
+        <div class=k>/ ${num(s.cap)} · 예상 ${num(Math.round(s.projectedCalls))}</div></div>`;
+  h += `<div class=card><div class=k>최근 1.5주기 커버</div><div class="v ${coverage>.95?'ok':coverage<.8?'warn':''}">${pct(coverage)}</div>
+        <div class=k>${num(s.recentRoutes)} / ${num(s.routes)}노선</div></div>`;
+  h += `<div class=card><div class=k>오늘 요청 성공률</div><div class="v ${s.attempted&&success<.98?'warn':'ok'}">${s.attempted?pct(success):'—'}</div>
+        <div class=k>${num(s.successful)}/${num(s.attempted)} · 재시도 ${num(s.retried)}</div></div>`;
   h += '</div>';
 
-  h += '<h2>밴드별 진행 (매일 0에서 시작)</h2><table>';
+  h += `<h2>키별 쿼터 — 정상예산 ${num(s.plannedCallsPerKey)} · 정지상한 ${num(s.keyCap)}콜</h2><table>`;
+  for(const k of (s.keyCalls||[])){
+    const kp = k.cap ? k.calls/k.cap : 0;
+    h += `<tr><td width=170><code>${k.id}</code></td>
+          <td class=n width=90><b class="${kp>.95?'bad':kp>.85?'warn':''}">${num(k.calls)}</b></td>
+          <td width=240>${bar(kp,kp>.95?'bad':kp>.85?'warn':'')}</td>
+          <td class=n>${pct(kp)}</td></tr>`;
+  }
+  h += '</table>';
+
+  h += '<h2>시간대별 오늘 관측 노선 (분석 라벨)</h2><table>';
   for(const b of s.bands){
     h += `<tr><td width=90>${b.from}-${b.to}시${b.wrap?'<span style="opacity:.5">익일</span>':''}
           ${b.cur?'<span style="color:#3b82f6;font-size:11px"> 진행 중</span>':''}</td>
@@ -919,18 +988,19 @@ function renderSeoul(d){
           <td class=n style="white-space:nowrap">${num(b.done)} / ${num(b.total)}</td></tr>`;
   }
   h += '</table>';
-  const sf = s.failures || [];
-  h += `<h2>영속 실패 노선 (${num(sf.length)})</h2>`;
-  if(!sf.length) h += '<div class=sub style="color:#22c55e">현재 미해결 실패 없음</div>';
+  const errs = Object.entries(s.errors||{});
+  h += `<h2>오늘 재시도 후 잔여 실패 (${num(s.residual)})</h2>`;
+  if(!errs.length) h += '<div class=sub style="color:#22c55e">현재 잔여 실패 없음</div>';
   else {
     h += '<table>';
-    for(const f of sf)
-      h += `<tr><td>밴드 ${f.band}</td><td><b>${f.no||f.routeid}</b></td>
-            <td class=n>${num(f.tries)}회</td><td class=bad>${f.reason||'실패'}</td></tr>`;
+    for(const [reason,count] of errs)
+      h += `<tr><td class=bad>${reason}</td><td class=n>${num(count)}회</td></tr>`;
     h += '</table>';
   }
-  h += '<div class=sub style="margin-top:6px">밴드마다 전 노선을 한 번씩 찍으면 100%. '
-     + '⚠️ 이건 <b>관측이 아니라 운영사 예측</b>이라(신분당선 recptnDt 와 같은 성격, §8.1 ⑤ 가) '
+  h += '<div class=sub style="margin-top:6px">최근 커버는 마지막 성공이 현재 주기의 1.5배 안인 노선 비율이다. '
+     + '키가 누락되면 키당 정상예산 9,300콜을 지키도록 주기가 자동 연장되며, '
+     + '정상예산과 9,900콜 정지상한 사이 600콜은 재시도에 사용한다. '
+     + '⚠️ 값은 <b>운영사 예측</b>이라 '
      + '정시성 판정엔 쓰지 않는다. CV 는 다음 2대의 현재 위치 기반이라 예측 오염이 상대적으로 작다.</div>';
   h += '<div class=sub style="margin-top:12px;padding-top:10px;border-top:1px solid #8883">'
      + '데이터 출처: <a href="https://www.data.go.kr/data/15000314/openapi.do" target="_blank" rel="noreferrer">'
