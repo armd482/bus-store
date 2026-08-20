@@ -416,6 +416,23 @@ def connect(check_same_thread=True):
       )""")
     c.execute("CREATE INDEX IF NOT EXISTS quota_daily_day ON quota_daily(day)")
 
+    # ── 서울 버스 셀 — (노선, 밴드, 요일)별 관측 일수 ──────────────────
+    # 서울은 연속 수집이라 '완료'가 없어 대시보드에 진행률이 없었다. 그런데 수집
+    # 목적(§6.4 기대 대기의 CV)은 (노선,밴드,요일)마다 며칠치 배차 표본을 모으는
+    # 것이므로 목표가 정의된다 — 경기 cell·지하철 subway_cell 과 같은 구조.
+    # n = 관측 스냅샷 수, n_days = 서로 다른 운행일 수(하루에 여러 번 찍어도 1).
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS seoul_cell (
+        routeid  TEXT NOT NULL,
+        band     INTEGER NOT NULL,
+        daytype  TEXT NOT NULL,
+        n        INTEGER NOT NULL DEFAULT 0,
+        n_days   INTEGER NOT NULL DEFAULT 0,
+        last_day TEXT,
+        PRIMARY KEY (routeid, band, daytype)
+      )""")
+    c.execute("CREATE INDEX IF NOT EXISTS seoul_cell_band ON seoul_cell(band,daytype)")
+
     # 기존 DB 마이그레이션 — CREATE TABLE IF NOT EXISTS 는 이미 있는 테이블에 컬럼을 안 붙인다.
     # ⚠️ 이걸 빠뜨려 배포본에만 손으로 ALTER 했다가, 새 기계에서 'no such column: startvt' 로 죽었다.
     have = {r[1] for r in c.execute("PRAGMA table_info(route)")}
@@ -1236,6 +1253,21 @@ def bump_subway(conn, line, trainNo, statnId, daytype, day):
         n = n + 1, last_day = excluded.last_day
       WHERE subway_cell.last_day IS NOT excluded.last_day
     """, (line, trainNo, statnId, daytype, day))
+
+
+def bump_seoul(conn, routeid, band, daytype, day):
+    """서울 셀 +1. n 은 스냅샷마다, n_days 는 운행일이 바뀔 때만 오른다.
+
+    같은 (노선,밴드,요일)을 하루에 여러 번 찍어도 n_days 는 1 — 요일 비교엔
+    '서로 다른 날짜'가 필요하기 때문이다 (경기 cell.n_days 와 같은 이유).
+    """
+    conn.execute("""
+      INSERT INTO seoul_cell(routeid,band,daytype,n,n_days,last_day) VALUES(?,?,?,1,1,?)
+      ON CONFLICT(routeid,band,daytype) DO UPDATE SET
+        n = n + 1,
+        n_days = n_days + (last_day IS NOT excluded.last_day),
+        last_day = excluded.last_day
+    """, (routeid, band, daytype, day))
 
 
 def route_progress(conn, target, nbands):

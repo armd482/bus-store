@@ -402,6 +402,7 @@ def main():
     interval = max(configured_interval, safe_interval)
     retry_limit = int(config.get("seoulRetryLimit", 1))
     quota = QuotaReservations(cap)
+    conn = O.connect()          # 셀 장부(seoul_cell) 전용 — 수집 루프 단일 스레드에서만 쓴다
     qday = quota_day(now())
     ensure_key_counters(keys, qday)
     cleanup_state_files(now(), keys)
@@ -512,6 +513,7 @@ def main():
                     events.extend(dispatcher.drain(event, 128 - len(events)))
 
             rows_by_day = {}
+            cells = []
             for event in events:
                 rid, rows, error, observed = event["result"]
                 cumulative["attempted"] += 1
@@ -533,6 +535,10 @@ def main():
                     row["daytype"] = O.day_type(observed)
                     rows_by_day.setdefault(output_day, []).append(row)
                 cumulative["rows"] += len(rows)
+                # 셀 장부 — (노선,밴드,요일)별 관측 일수. 공휴일은 평상 다이어가
+                # 아니므로 장부에서만 뺀다 (jsonl 엔 그대로 남는다 — 경기와 같은 기준).
+                if rows and band is not None and not O.is_holiday(observed):
+                    cells.append((rid, band, O.day_type(observed), output_day))
 
             for output_day, output_rows in rows_by_day.items():
                 path = os.path.join(OUT_DIR, f"{PREFIX}-{output_day}.jsonl")
@@ -540,6 +546,15 @@ def main():
                     for row in output_rows:
                         file.write(json.dumps(row, ensure_ascii=False) + "\n")
                 written += len(output_rows)
+
+            if cells:
+                try:
+                    for args in cells:
+                        O.bump_seoul(conn, *args)
+                    conn.commit()
+                except Exception as exc:      # 장부 실패가 수집을 막지 않게
+                    print(f"[{now():%H:%M:%S}] ⚠️ 서울 셀 기록 실패: {type(exc).__name__}",
+                          flush=True)
 
             if time.monotonic() < report_at:
                 continue
@@ -581,6 +596,10 @@ def main():
             report_at = report_started + 60
     finally:
         dispatcher.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -210,6 +210,45 @@ def _obs_rate_per_day():
     return (size / AVG_ROW_BYTES) / (window / 86400), window / 86400
 
 
+# 서울 목표 셀 캐시 — 노선 목록이 바뀔 때만 다시 센다
+_SEOUL_GOAL = {"key": None, "value": 0}
+
+
+def _seoul_goal_cells(bands, ndays=7):
+    """목표 셀 = (그 밴드에 실제 운행하는 노선) × 요일 7종.
+
+    ⚠️ 702×7밴드 전부를 목표로 잡으면 안 된다 — 심야 밴드엔 4~6개만 운행하므로
+    (✅ 실측) 나머지는 영원히 못 채우는 분모가 된다. 경기 버스의 eligibility 와
+    같은 문제인데, 서울은 first/last 가 있어 정적으로 계산된다.
+    """
+    if seoul_collector is None:
+        return 0
+    try:
+        stamp = os.path.getmtime(seoul_collector.ROUTES_FILE)
+    except OSError:
+        return 0
+    key = (stamp, len(bands), ndays)
+    if _SEOUL_GOAL["key"] == key:
+        return _SEOUL_GOAL["value"]
+    try:
+        with open(seoul_collector.ROUTES_FILE, encoding="utf-8") as f:
+            routes = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    tail = int(O.cfg().get("seoulServiceTailMin", 120))
+    total = 0
+    for value in routes.values():
+        window = seoul_collector.service_window(value, tail)
+        for lo, hi in bands:
+            for minute in range(lo * 60, hi * 60, 10):
+                hour, mm = divmod(minute % 1440, 60)
+                if seoul_collector.is_running(window, datetime(2026, 1, 1, hour, mm)):
+                    total += 1
+                    break
+    _SEOUL_GOAL["key"], _SEOUL_GOAL["value"] = key, total * ndays
+    return _SEOUL_GOAL["value"]
+
+
 def seoul_snapshot():
     """서울 버스 연속 스냅샷 현황 — 독립 주기, 키별 쿼터, 밴드별 관측."""
     if seoul_collector is None:
@@ -233,6 +272,20 @@ def seoul_snapshot():
         R = {}
     bands = O.cfg()["timebands"]
     cur = O.band_of(now, bands)
+    # ★ 전체 진행률 — 서울에도 목표가 있다. 수집 목적(§6.4 기대 대기의 CV)은
+    #   (노선,밴드,요일)마다 며칠치 배차 표본을 모으는 것이라 경기 cell·지하철
+    #   subway_cell 과 같은 셀 모델이 성립한다. 연속 수집이라 '완료'가 없다고 보고
+    #   진행률을 안 보여주던 것을 채운다.
+    target_days = int(config.get("seoulTargetDays", 3))
+    goal_cells = _seoul_goal_cells(bands, 7)
+    try:
+        with _DB_LOCK:
+            cell_seen, cell_done, cell_fill = db().execute(
+                "SELECT COUNT(*), COALESCE(SUM(n_days >= ?),0), "
+                "COALESCE(SUM(MIN(n_days,?)),0) FROM seoul_cell",
+                (target_days, target_days)).fetchone()
+    except Exception:
+        cell_seen = cell_done = cell_fill = 0
 
     # 오늘 jsonl — 행 수·마지막 관측·밴드별 고유 노선을 증분으로 읽는다.
     path = os.path.join(O.DATA, f"{seoul_collector.PREFIX}-{day}.jsonl")
@@ -319,6 +372,10 @@ def seoul_snapshot():
                    "done": per.get(i, 0), "total": len(R),
                    "pct": per.get(i, 0) / len(R) if R else 0,
                    "cur": i == cur} for i, (a, b) in enumerate(bands)],
+        "targetDays": target_days, "goalCells": goal_cells,
+        "cells": cell_seen, "cellsDone": cell_done,
+        "progress": (cell_fill / (goal_cells * target_days)) if goal_cells else 0,
+        "donePct": (cell_done / goal_cells) if goal_cells else 0,
     }
 
 
@@ -956,6 +1013,15 @@ function renderSeoul(d){
     + `${pct(s.cap?s.projectedCalls/s.cap:0)}). 느린 요청은 다른 노선을 막지 않고, `
     + '7개 시간대는 조회 스케줄이 아니라 분석 라벨이다. arrmsg1/arrmsg2의 간격은 배차 CV 재료다.</div>';
 
+    // ★ 전체 진행률 — 다른 두 수집기와 같은 셀 모델. 분모는 그 밴드에 실제
+  //   운행하는 노선만 세므로 심야에 못 채우는 셀이 분모를 오염시키지 않는다.
+  if(s.goalCells){
+    h += `<div class=big>${pct(s.progress)}</div>`;
+    h += `<div class=sub>${num(s.cellsDone)} / ${num(s.goalCells)} 셀 충족 `
+       + `(노선×밴드×요일 · 셀당 ${s.targetDays}일) · 관측된 셀 ${num(s.cells)}`
+       + ` <span style="opacity:.6">— CV(배차 변동, §6.4) 를 재려면 셀마다 서로 다른 날짜가 필요하다</span></div>`;
+    h += bar(s.progress);
+  }
   h += '<h2>건강 상태</h2><div class=grid>';
   h += `<div class=card><div class=k>마지막 관측</div><div class=v id=seoullastobs>—</div>
         <div class=k>${s.lastNo||''} ${s.lastStn||'—'}</div></div>`;
