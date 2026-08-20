@@ -33,3 +33,14 @@ spike/graph/
 __pycache__/
 *.pyc
 .DS_Store
+
+# ── 운영 중 만들어지는 백업·스테이징 (커밋 대상 아님) ────────────────
+# 배포·설정 변경 전에 안전 사본을 남기는 관행이 있다. 원본은 git 이 갖고
+# 있으므로 사본까지 추적하면 노이즈만 는다 (EC2 에 10개 넘게 쌓여 있었다).
+*.bak
+*.bak[0-9]
+*.localbak
+*.pre-*
+collector/*.pre-*
+deploy-backups/
+deploy-stage-*/

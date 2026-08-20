@@ -320,7 +320,9 @@ def mac_status():
 #   findpath         = server.py (버스 수집 + 대시보드)
 #   findpath-subway  = subway_collector.py (전 노선 도착정보)
 LX_UNITS = (
-    ("findpath", "server.py --port 8080", "findpath collector (bus + dashboard)"),
+    # 외부 대시보드 공개는 EC2 security group이 접근 범위를 제어한다.
+    # install을 다시 실행해도 public bind가 유지돼야 한다.
+    ("findpath", "server.py --host 0.0.0.0 --port 8080", "findpath collector (bus + dashboard)"),
     ("findpath-subway", "subway_collector.py", "findpath subway collector"),
     ("findpath-seoul", "seoul_collector.py", "findpath seoul bus arrival snapshot"),
 )

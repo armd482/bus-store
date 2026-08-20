@@ -125,13 +125,8 @@
   "busGlobalMaxInflight": 52,
   "busGlobalCleanWindows": 3,
   "_busGlobalInflight": "두 egress 합계의 최종 안전 상한. 시작 44에서 정상창마다 회복해 최대 52가 되며, IP별 상한 26과 함께 Phase C 실측 조건(총 52=26+26)을 재현한다. code99 AIMD 판정은 합계 건강창을 사용하지만 즉시 3초 쿨다운은 오류가 난 egress에만 적용한다.",
-  "busEgressSourceEnvByKey": {
-    "GBIS_BUS_KEY": "GBIS_BUS_SOURCE_IP_A",
-    "GBIS_BUS_KEY2": "GBIS_BUS_SOURCE_IP_A",
-    "GBIS_BUS_KEY3": "GBIS_BUS_SOURCE_IP_B",
-    "GBIS_BUS_KEY4": "GBIS_BUS_SOURCE_IP_B"
-  },
-  "_busEgressSourceEnvByKey": "키별 HTTPS 소켓을 어느 EC2 사설 IPv4에 bind할지 지정하는 환경변수 매핑. A는 첫 EIP, B는 둘째 EIP에 연결된 사설 IP다. 모든 값이 비어 있으면 기존 단일 경로로 동작하지만 하나라도 설정되면 활성 키 전체의 값과 로컬 bind 가능 여부를 시작 시 검증한다.",
+  "busEgressSourceEnvByKey": {},
+  "_busEgressSourceEnvByKey": "★ 현재 **비활성**이다 (2026-07-29 EIP 제거). ✅ 실측: 같은 AWS VPC 의 EIP 두 개는 TAGO 에서 처리량 이득이 없었다 — 총 동시성 52 를 26+26 으로 나눠도 단일 IP 대비 +0.6% (ABBA 프로브). 되살리려면 EIP 를 붙이고 GBIS_BUS_SOURCE_IP_A/B 를 .env 에 넣은 뒤 이 매핑을 채운다. ⚠️ 세컨더리 사설 IP 만 있고 EIP 가 없으면 load_egress_sources 의 bind() 검증은 통과하지만 실제로는 나가지 못한다 — 반드시 EIP 부착을 먼저 확인할 것. 비어 있으면 단일 경로로 동작하고 busEgressMaxInflight 도 디스패처에 전달되지 않는다(그룹 상한 미적용).",
   "busEgressMaxInflight": 26,
   "_busEgressMaxInflight": "출발 IP별 동시 요청 상한. 두 IP 교차 프로브에서 총 52를 26+26으로 분리했을 때 성공 처리량 21.36/s를 얻은 조건이며, 동일 IP의 키 두 개가 합쳐 26을 넘지 못하게 한다.",
   "busQuotaMaxRatePerKey": 6,
@@ -153,10 +148,10 @@
     "GBIS_BUS_KEY4"
   ],
   "_busKeys": "경기(TAGO) 버스 인증키 변수명 목록 — 키(=계정)마다 세션 30·rate·쿼터가 독립이라(✅ 2026-07-23 실측: 같은 EC2 IP에서 키1·키2 처리량 2.16배·키2 429 0건, 2026-07-28 KEY4 단독 정상) 라운드로빈으로 동시성을 키 수만큼 곱한다. ⚠️ data.go.kr 은 계정당 서비스키 1개이므로 4키는 서로 다른 네 계정이어야 한다. 환경변수 이름만 다르고 실제 키 값이 같으면 load_keys가 중복을 제외한다. 키가 빠지면 maxRoutes도 설정 키 수 대비 활성 키 비율로 자동 축소해 남은 키를 과부하시키지 않는다.",
-  "maxRoutes": 680,
-  "_maxRoutes": "동시 폴링 노선 수의 **상한**. 실제로는 운행 중인 노선이 이보다 적으면 그만큼만 찍는다 (✅ 실측: 01:30→116개 · 02:30→97개 · 03:30→86개 · 08:30→1,775개). **현재 680 = 네 독립 키에 균등 분산해 키당 ~170** — 3키·510과 같은 키당 부하·31초 주기를 유지하면서 총 패널과 수집 속도를 33% 늘린다. 각 키의 실호출은 busKeyDailyCap(48만) 소프트캡으로 독립 보호된다. 키가 누락·중복이면 effective_maxr가 활성 키 비율만큼 줄어든다.",
-  "exploreSlots": 120,
-  "_exploreSlots": "680석 중 '탐사'에 쓰는 수 (나머지는 고정 패널+수확). 탐사는 미관측 노선 우선 — 요일별 셀은 그 요일이 와야 쌓이므로 시계를 빨리 출발시켜야 한다. 패널을 510→680으로 33% 늘리면서 탐사 비율 약 17.6%를 유지하도록 90→120으로 확대했다.",
+  "maxRoutes": 620,
+  "_maxRoutes": "동시 폴링 노선 수의 상한. 안정 실측 처리량 약 20/s에서 31초 주기를 지키는 크기(20×31≈620)다. 실제 운행 노선이 적으면 그만큼만 찍고, 키가 누락·중복이면 활성 키 비율만큼 자동 축소한다.",
+  "exploreSlots": 110,
+  "_exploreSlots": "620석 중 탐사에 쓰는 수(약 17.7%). 나머지는 고정 패널·수확에 배정한다.",
   "pinnedRoutes": [
     "GGB233000140",
     "GGB234000065",
@@ -182,5 +177,29 @@
   "maxInflight": 22,
   "_maxInflight": "키별 동시 요청의 공정성·안전 하드 상한. 실제 전체 동시 요청은 busGlobal*Inflight 압력 제어가 맡고, 키당 22 합계 88이 물리 상한이다. 한 키가 전역 슬롯을 독점하거나 다른 키가 막혔을 때 worker가 과도하게 몰리는 것을 제한한다. fetch_routes처럼 같은 키를 쓰는 다른 프로세스는 이 카운터 밖이므로 동시에 돌리지 말 것.",
   "busZombieHoldSec": 14,
-  "_busZombieHoldSec": "타임아웃난 요청의 scheduler in-flight 슬롯을 이 초만큼 더 붙잡는다. TAGO는 우리가 15초에 포기해도 서버 세션을 즉시 닫지 않을 수 있어, 슬롯을 곧장 재사용하면 새 요청+좀비 세션이 30을 넘어 code99가 연쇄된다. hold는 클라이언트 슬롯 반환을 늦춰 서버 세션 수에 가깝게 맞춘다. 0이면 비활성. 현재 14초와 AIMD를 함께 사용한다."
+  "_busZombieHoldSec": "타임아웃난 요청의 scheduler in-flight 슬롯을 이 초만큼 더 붙잡는다. TAGO는 우리가 15초에 포기해도 서버 세션을 즉시 닫지 않을 수 있어, 슬롯을 곧장 재사용하면 새 요청+좀비 세션이 30을 넘어 code99가 연쇄된다. hold는 클라이언트 슬롯 반환을 늦춰 서버 세션 수에 가깝게 맞춘다. 0이면 비활성. 현재 14초와 AIMD를 함께 사용한다.",
+  "seoulBusKeys": [
+    "SEOUL_BUS_KEY",
+    "GBIS_BUS_KEY2",
+    "GBIS_BUS_KEY3",
+    "GBIS_BUS_KEY4"
+  ],
+  "_seoulBusKeys": "서울 버스도착정보가 승인된 data.go.kr 키 변수명 목록. SEOUL_BUS_KEY 는 없으면 GBIS_BUS_KEY 로 폴백한다(계정 공통 키). ✅ 2026-08-20 실측: 네 키 모두 headerCd=0 동작. 서울 도착정보(15000314) 쿼터는 TAGO 위치정보와 **별개 데이터셋**이라 같은 키를 양쪽에 써도 서로 잠식하지 않는다 (같은 날 GBIS_BUS_KEY 가 TAGO 37만 + 서울 4.6천을 동시에 처리). 4키·1750초면 키당 8,665콜 = 예산 9,300 의 93%, 정지상한 9,900 까지 1,235콜이 재시도 여유다.",
+  "seoulIntervalSec": 1270,
+  "_seoulIntervalSec": "노선당 조회 주기(초) — **운행 중인 노선만** 대상이다. 4키·운행시간 합 13,101h(꼬리 120분 포함) 기준 키당 9,297콜/일 = 예산 9,300 의 100%, 정지상한 9,900 까지 603콜이 재시도 여유다. 노선당 68회/일. ⚠️ 전 노선 24시간(16,848h)으로 잡던 1,631초에서 당긴 값 — 심야엔 702 중 4~6개만 운행하므로(✅ 실측) 그만큼을 주간 해상도로 돌린 것이다. 더 낮춰도 service_safe_interval 이 예산선에서 클램프한다.",
+  "seoulServiceTailMin": 120,
+  "_seoulServiceTailMin": "막차 '출발' 이후 종착까지 운행 중으로 볼 여유(분). 서울 노선 주행이 1~2시간이라 60분이면 00시 패널이 220노선까지 줄지만 120분이면 575노선이다 (✅ 실측). §6.3 이 심야 막차를 절벽 후보로 지목하므로 그 구간을 놓치는 손실이 빈 응답 몇 콜보다 크다 — 비용은 주기 +5% 뿐. 과다 포함은 '운행종료' 응답 몇 개, 과소 포함은 데이터 영구 손실이라 넉넉한 쪽이 맞다.",
+  "seoulPanelRefreshSec": 300,
+  "_seoulPanelRefreshSec": "운행 패널 재계산 주기(초). 첫차·막차 진입/이탈을 반영하고 같은 주기에 쿼터 누계를 quota_daily 에 기록한다.",
+  "seoulBusDailyCap": 9900,
+  "_seoulBusDailyCap": "서울 버스도착정보 키별 로컬 정지 상한. 공식 승인량 10,000콜보다 100콜 낮게 두며 모든 물리 요청(오류·재시도 포함)을 seoul-calls-{KEYID}-{달력일}.txt에 선반영해 독립 보호한다.",
+  "seoulPlannedCallsPerKey": 9300,
+  "_seoulPlannedCallsPerKey": "정상 정규 슬롯에 배정하는 키별 일 예산. 정지 상한 9,900과의 차이 600콜은 오류 재시도·재시작 위상 변화에 남긴다. 수집기는 실제 노선 수와 활성 키 수로 이 예산을 넘지 않는 주기를 자동 계산한다.",
+  "seoulDispatchRate": 1,
+  "_seoulDispatchRate": "서울 키별 초당 최대 제출 수. 정상 평균은 키당 약 0.10/s라 1/s는 재시도·재시작 회복에 충분하면서 버스트를 제한한다.",
+  "seoulMaxWorkers": 2,
+  "seoulMaxInflight": 2,
+  "_seoulMaxInflight": "서울 키별 동시 요청 상한. 평균 부하는 매우 낮고 JSONL 쓰기는 메인 스레드 하나만 수행하므로 2면 충분하다.",
+  "seoulRetryLimit": 1,
+  "_seoulRetryLimit": "서울 노선 요청의 즉시 재시도 횟수. 물리 호출마다 키별 9,900 장부에서 차감하며, 실패한 노선은 다음 약 36분 정규 슬롯에서도 다시 시도한다."
 }
