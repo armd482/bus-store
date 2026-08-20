@@ -166,6 +166,61 @@ def minimum_safe_interval(route_count, key_count, cap, utilization=0.95):
     return route_count * 86400.0 / (key_count * cap * utilization)
 
 
+def service_window(value, tail_min=0):
+    """노선의 (첫차 분, 막차+꼬리 분). 자정을 넘기면 종료가 1440 을 넘는 값이 된다.
+
+    ⚠️ first/last 는 `YYYYMMDDHHMMSS` 형식이다 (✅ 실측 '20260722043000' = 04:30).
+    앞 4자리를 시각으로 읽으면 '20:26' 이 되어 전 노선이 심야로 분류된다.
+    tail_min 은 막차 **출발** 이후 종착까지의 여유 — 그 구간이 마지막 배차 관측이다.
+    """
+    def hm(raw):
+        digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+        if len(digits) >= 12:
+            digits = digits[8:12]          # YYYYMMDD|HHMM|SS
+        elif len(digits) >= 4:
+            digits = digits[:4]
+        else:
+            return None
+        return (int(digits[:2]) % 24) * 60 + int(digits[2:4])
+
+    start, last = hm(value.get("first")), hm(value.get("last"))
+    if start is None or last is None:
+        return None                        # 모르면 상시 운행으로 본다 (보수적)
+    return start, last + (1440 if last < start else 0) + tail_min
+
+
+def is_running(window, t):
+    """지금 이 노선이 운행 중인가. window 가 None 이면 True (모르면 찍는다)."""
+    if window is None:
+        return True
+    start, end = window
+    if end - start >= 1440:
+        return True                        # 창이 하루를 덮는다
+    minute = t.hour * 60 + t.minute
+    return start <= minute + (1440 if minute < start else 0) <= end
+
+
+def service_route_hours(windows, total_routes):
+    """전 노선 운행시간 합(시간) — 주기 산정의 분자.
+
+    노선마다 운행시간이 달라(심야 00~03시엔 702 중 4~6개만 운행 — ✅ 실측)
+    '노선 수 × 24시간'으로 주기를 잡으면 안 다니는 시간대에 빈 응답을 사느라
+    예산을 태운다. 실제 운행시간 합으로 잡아야 같은 예산에 주기를 당길 수 있다.
+    """
+    known = 0.0
+    for window in windows.values():
+        known += 24.0 if window is None else min(1440, window[1] - window[0]) / 60.0
+    missing = total_routes - len(windows)
+    return known + missing * 24.0
+
+
+def service_safe_interval(route_hours, key_count, planned_calls):
+    """운행시간 합 기준 최소 주기 — 키당 planned_calls 를 넘지 않는 값."""
+    if route_hours <= 0 or key_count <= 0 or planned_calls <= 0:
+        return 0
+    return route_hours * 3600.0 / (planned_calls * key_count)
+
+
 def fetch(key, op, **params):
     q = urllib.parse.urlencode({"serviceKey": key, **params})
     with urllib.request.urlopen(f"{BASE}/{op}?{q}", timeout=20) as response:
@@ -334,10 +389,16 @@ def main():
     planned_calls = min(
         cap, int(config.get("seoulPlannedCallsPerKey", PLANNED_CALLS)))
     configured_interval = float(config.get("seoulIntervalSec", 2175))
-    # 정상 슬롯만으로 planned_calls를 넘지 않게 실제 노선 수·활성 키 수로 계산한다.
+    # 정상 슬롯만으로 planned_calls를 넘지 않게 계산한다.
     # cap-planned_calls는 물리 재시도와 재시작 위상 변화에만 쓰는 여유다.
-    safe_interval = minimum_safe_interval(
-        len(route_map), len(keys), planned_calls, utilization=1.0)
+    # ★ 분모를 '노선 수 × 24시간'이 아니라 **실제 운행시간 합**으로 잡는다 —
+    #   심야 00~03시엔 702 중 4~6개만 운행하는데(✅ 실측) 전 노선을 계속 찍으면
+    #   빈 응답에 예산을 태운다. 운행 노선만 찍으면 같은 예산으로 주기가 당겨진다.
+    tail_min = int(config.get("seoulServiceTailMin", 60))
+    windows = {rid: service_window(value, tail_min)
+               for rid, value in route_map.items()}
+    hours = service_route_hours(windows, len(route_map))
+    safe_interval = service_safe_interval(hours, len(keys), planned_calls)
     interval = max(configured_interval, safe_interval)
     retry_limit = int(config.get("seoulRetryLimit", 1))
     quota = QuotaReservations(cap)
@@ -352,14 +413,16 @@ def main():
         int(config.get("seoulMaxInflight", 2)),
         retry_limit=retry_limit,
     )
-    dispatcher.set_routes([
-        {"routeid": rid, "cityCode": 0} for rid in route_map
-    ])
+    def running_panel(t):
+        return [{"routeid": rid, "cityCode": 0} for rid in route_map
+                if is_running(windows.get(rid), t)]
+
+    dispatcher.set_routes(running_panel(now()))
 
     type_counts = {}
     for value in route_map.values():
         type_counts[value["tp"]] = type_counts.get(value["tp"], 0) + 1
-    projected = len(route_map) * 86400 / interval / len(keys)
+    projected = hours * 3600 / interval / len(keys)
     print(f"[{now():%H:%M:%S}] 서울 연속 수집 · 노선 {len(route_map):,}개 · "
           f"키 {len(keys)}개({', '.join(kid for kid, _ in keys)}) · "
           f"노선별 {interval:.0f}초 · 키당 정상예산 "
@@ -368,13 +431,22 @@ def main():
         f"{TYPE_NM.get(key, key)}{value}" for key, value in sorted(type_counts.items())),
         flush=True)
     if interval > configured_interval + 0.5:
-        print(f"[{now():%H:%M:%S}] ⚠️ 활성 키 부족으로 주기 "
-              f"{configured_interval:.0f}→{interval:.0f}초 자동 연장", flush=True)
+        # 키가 빠졌거나 운행시간 합이 늘어 설정 주기로는 예산을 넘긴다는 뜻이다.
+        print(f"[{now():%H:%M:%S}] ⚠️ 예산 보호로 주기 "
+              f"{configured_interval:.0f}→{interval:.0f}초 자동 연장 "
+              f"(운행시간 {hours:,.0f}h · 키 {len(keys)}개 · 예산 {planned_calls:,}/키)",
+              flush=True)
 
     bands = config["timebands"]
     current_service_day = service_day(now())
     current_quota_day = qday
     rotated_day = None
+    # 운행시간에 따라 패널이 바뀌므로 주기적으로 갱신한다 (첫차·막차 진입/이탈).
+    # 같은 주기에 쿼터 누계도 DB 이력에 반영한다 — 날짜 전환 때만 쓰면 당일 값이
+    # 대시보드·조회에 안 보인다.
+    panel_refresh_sec = int(config.get("seoulPanelRefreshSec", 300))
+    next_panel = 0.0
+    panel_size = None
     written = 0
     last_success = {}
     report_started = time.monotonic()
@@ -397,6 +469,16 @@ def main():
                 print(f"[{t:%H:%M:%S}] 쿼터 날짜 전환 {current_quota_day} → {qday} "
                       f"· 차단 해제 {blocked}키", flush=True)
                 current_quota_day = qday
+
+            if time.monotonic() >= next_panel:
+                panel = running_panel(t)
+                if panel_size is not None and len(panel) != panel_size:
+                    print(f"[{t:%H:%M:%S}] 운행 패널 {panel_size:,}→{len(panel):,}노선 "
+                          f"(운행시간 기준)", flush=True)
+                panel_size = len(panel)
+                dispatcher.set_routes(panel)
+                sync_quota_db(qday, keys)
+                next_panel = time.monotonic() + panel_refresh_sec
 
             new_service_day = service_day(t)
             if new_service_day != current_service_day:
