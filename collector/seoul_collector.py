@@ -1,33 +1,22 @@
 #!/usr/bin/env python3
-"""서울 버스 도착정보 스냅샷 수집기 (docs §3.2 · §6.4)
+"""서울 버스 도착정보를 노선별 독립 주기로 연속 수집한다.
 
-⚠️ **경기(TAGO) 수집기와 방식이 다르다.** 경기는 위치를 30초마다 찍어 구간시간을
-   역산한다 — TAGO 가 타임스탬프도 구간시간도 안 주기 때문이다. 서울 도착정보는
-   운영사가 **이미 계산한 값**을 준다 (✅ 실측: 753번 1콜에 정류장 104개 × 필드 85개,
-   nstnSec·traTime·term·mkTm 전부 채워짐). 그래서 30초 폴링이 필요 없고,
-   **밴드당 노선별 1스냅샷**이면 된다.
+서울 도착정보는 운영사가 계산한 다음 2대의 도착 예정값(arrmsg1/2, nstnSec1/2)을
+노선 단위로 제공한다. 약 702개 노선을 3개 키에 균등 분산하고 각 노선을 약 36분마다
+조회하면 하루 키당 약 9,295콜이다. 정상 요청 예산은 키당 9,300콜, 정지 상한은
+9,900콜로 분리해 약 600콜을 재시도·재시작 여유로 남긴다.
 
-   문서 §3.2 의 "서울 수집 불가(665×2,280=152만 콜)"는 경기식 위치폴링 전제다.
-   스냅샷이면 702노선 × 밴드 7 = **4,914콜/일**로 한도 10,000 의 49% 다.
+config.timebands 7개는 수집 횟수를 정하는 스케줄이 아니라 분석용 라벨이다. 각 노선은
+자기 next_due를 가지며 느린 요청이나 재시도는 다른 노선의 주기를 막지 않는다.
 
-무엇을 얻나 (§6.4 기대 대기의 CV — 모르면 20분 배차에서 10분 오차):
-  arrmsg1/arrmsg2  다음 2대의 도착 예정 → 두 대의 간격 = **실측 순간 배차**
-  term             계획 배차 (대조군)
-  nstnSec1/2       운영사가 계산한 다음 구간 예정시간
-  mkTm             제공시각 — TAGO 에 없는 타임스탬프
-
-⚠️ 이건 **관측이 아니라 운영사 예측**이다. 신분당선 recptnDt 와 같은 성격이라
-   (§8.1 ⑤ 가) 시각표 대조 전엔 정시성 판정에 쓰지 말 것. 단 CV(배차 흩어짐)는
-   '다음 2대'의 현재 위치 기반이라 예측 오염이 상대적으로 작다.
-
-  python3 seoul_collector.py            # 수집
+  python3 seoul_collector.py            # 연속 수집
   python3 seoul_collector.py --routes   # 노선 목록만 갱신하고 종료
 """
 import glob
 import json
 import os
-import random
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -37,15 +26,18 @@ from datetime import datetime, timedelta
 
 import orchestrator as O
 import env_config as E
+from rolling_dispatcher import RollingDispatcher
 
-BASE = "http://ws.bus.go.kr/api/rest"      # ⚠️ https 아님 — 443 이 안 열린다 (§3.2 실측)
+BASE = "http://ws.bus.go.kr/api/rest"  # 443이 열리지 않아 HTTP를 사용한다.
 PREFIX = "seoul"
 OUT_DIR = O.DATA
-DAILY_CAP = 9500        # 도착정보 10,000/일에 마진. 위치·노선정보는 별도 쿼터라 무관
+DAILY_CAP = 9900
+PLANNED_CALLS = 9300
 ROUTES_FILE = os.path.join(O.DATA, "seoul_routes.json")
+STATUS_FILE = os.path.join(O.DATA, "seoul-status.json")
+_CALL_LOCK = threading.Lock()
 
-# routeType — 7(인천)·8(경기)은 **뺀다**: 경기는 TAGO 로 이미 수집 중이라 중복이고,
-# 서울 API 쿼터를 남의 지역에 태울 이유가 없다 (§3.2 '광역버스 중복' 경고 참조).
+# routeType 7(인천)·8(경기)은 경기 TAGO 수집과 중복되므로 제외한다.
 SEOUL_TYPES = {"1", "2", "3", "4", "5", "6"}
 TYPE_NM = {"1": "공항", "2": "마을", "3": "간선", "4": "지선", "5": "순환", "6": "광역"}
 
@@ -59,47 +51,126 @@ def service_day(t):
 
 
 def quota_day(t):
-    """쿼터는 달력일 — 자정 리셋. 운행일(04시)과 다르다 (지하철 수집기와 같은 이유)."""
+    """data.go.kr 쿼터는 운행일이 아닌 달력일 자정에 바뀐다."""
     return t.strftime("%Y-%m-%d")
 
 
-def calls_path(day):
-    return os.path.join(O.DATA, f"seoul-calls-{day}.txt")
+def _load_key(envname):
+    """첫 서울 키만 기존 공통 키로 호환하고, 추가 키에는 fallback을 쓰지 않는다."""
+    if envname == "SEOUL_BUS_KEY":
+        return E.get("SEOUL_BUS_KEY") or E.get("GBIS_BUS_KEY", "DATA_GO_KR_KEY")
+    return E.get(envname)
 
 
-def read_calls(day):
+def load_key():
+    keys = load_keys()
+    return keys[0][1] if keys else None
+
+
+def load_keys(warn=True):
+    """설정된 실제 키를 값 기준으로 중복 제거한다."""
+    names = O.cfg().get("seoulBusKeys") or ["SEOUL_BUS_KEY"]
+    out, seen = [], {}
+    for name in names:
+        key = _load_key(name)
+        if not key:
+            continue
+        if key in seen:
+            if warn:
+                print(f"[서울 키 설정] ⚠️ {name}은 {seen[key]}과 같은 실제 키 — 중복 제외",
+                      flush=True)
+            continue
+        seen[key] = name
+        out.append((name, key))
+    return out
+
+
+def calls_path(day, keyid=None):
+    suffix = f"-{keyid}" if keyid else ""
+    return os.path.join(O.DATA, f"seoul-calls{suffix}-{day}.txt")
+
+
+def read_calls(day, keyid=None):
     try:
-        with open(calls_path(day)) as f:
+        with open(calls_path(day, keyid)) as f:
             return int(f.read().strip() or 0)
     except (OSError, ValueError):
         return 0
 
 
-def add_calls(day, n):
-    """디스크에 둔다 — 재시작해도 하루 상한을 넘지 않게 (지하철 수집기와 같은 이유)."""
-    v = read_calls(day) + n
-    with open(calls_path(day), "w") as f:
-        f.write(str(v))
-    return v
+def _write_calls(day, value, keyid=None):
+    path = calls_path(day, keyid)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(value))
+    os.replace(tmp, path)
 
 
-def load_key():
-    """data.go.kr 키는 계정 공통이라 GBIS 키가 서울 데이터셋에도 그대로 통한다
-    (✅ 실측: 노선·도착·위치 3종 모두 headerCd=0). 별도 키를 안 만드는 이유."""
-    for name in ("SEOUL_BUS_KEY", "GBIS_BUS_KEY"):
-        fallback = "DATA_GO_KR_KEY" if name == "GBIS_BUS_KEY" else None
-        v = E.get(name, fallback)
-        if v:
-            return v
-    return None
+def add_calls(day, n, keyid=None):
+    """호출 전에 키별 장부와 호환용 합계 장부를 원자적으로 올린다."""
+    with _CALL_LOCK:
+        value = read_calls(day, keyid) + n
+        _write_calls(day, value, keyid)
+        if keyid:
+            _write_calls(day, read_calls(day) + n)
+    return value
+
+
+def ensure_key_counters(keys, day):
+    """구버전 단일 장부의 호출량을 첫 활성 키 장부로 보수적으로 이관한다."""
+    if not keys:
+        return
+    with _CALL_LOCK:
+        total = read_calls(day)
+        assigned = sum(read_calls(day, kid) for kid, _ in keys)
+        missing = max(0, total - assigned)
+        if missing:
+            first = keys[0][0]
+            _write_calls(day, read_calls(day, first) + missing, first)
+
+
+def sync_quota_db(day, keys=None):
+    """파일 카운터 누계를 DB 이력(quota_daily)에 반영. 실패해도 무시된다.
+
+    서울은 cleanup_state_files 가 당일 파일만 남기므로 과거 추이는 여기서만
+    남는다 (세 수집기 공통 정책 — 파일=당일 쿼터 방어 · DB=과거 이력).
+    """
+    ids = [k for k, _ in (keys or [])] or [None]
+    for kid in ids:
+        O.record_quota(day, "seoul", kid or "SEOUL", read_calls(day, kid), DAILY_CAP)
+
+
+class QuotaReservations:
+    """키별 정지 상한을 요청 제출 직전에 예약한다."""
+
+    def __init__(self, cap, clock=now):
+        self.cap = int(cap)
+        self.clock = clock
+
+    def reserve(self, kid, n):
+        day = quota_day(self.clock())
+        with _CALL_LOCK:
+            current = read_calls(day, kid)
+            if current + n > self.cap:
+                return False
+            _write_calls(day, current + n, kid)
+            _write_calls(day, read_calls(day) + n)
+        return True
+
+
+def minimum_safe_interval(route_count, key_count, cap, utilization=0.95):
+    """활성 키가 빠져도 키별 cap의 utilization 이하를 쓰는 최소 평균 주기."""
+    if route_count <= 0 or key_count <= 0 or cap <= 0:
+        return 0
+    utilization = min(1.0, max(0.01, float(utilization)))
+    return route_count * 86400.0 / (key_count * cap * utilization)
 
 
 def fetch(key, op, **params):
     q = urllib.parse.urlencode({"serviceKey": key, **params})
-    with urllib.request.urlopen(f"{BASE}/{op}?{q}", timeout=20) as r:
-        root = ET.fromstring(r.read().decode("utf-8", "replace"))
-    # 서울 API도 오류를 HTTP 200 XML로 돌려준다. headerCd를 안 보면 오류 응답의
-    # itemList 없음이 정상 빈 스냅샷으로 바뀌고 해당 (밴드,노선)을 done 처리한다.
+    with urllib.request.urlopen(f"{BASE}/{op}?{q}", timeout=20) as response:
+        root = ET.fromstring(response.read().decode("utf-8", "replace"))
+    # 서울 API도 업무 오류를 HTTP 200 XML로 반환한다.
     code = root.findtext(".//headerCd")
     if code is not None and str(code).strip() not in ("0", "00"):
         msg = root.findtext(".//headerMsg") or root.findtext(".//headerMsg1") or "unknown"
@@ -108,93 +179,86 @@ def fetch(key, op, **params):
 
 
 def refresh_routes(key):
-    """서울 소속 노선 목록. getBusRouteList 는 검색어가 필수라 0~9 로 훑는다
-    (노선번호에 숫자가 없는 노선은 없다). 노선정보는 **별도 쿼터**(1,000/일)."""
+    """서울 소속 노선 목록. 노선번호 검색어 0~9로 전체를 훑는다."""
     seen = {}
-    for s in "0123456789":
+    for search in "0123456789":
         try:
-            root = fetch(key, "busRouteInfo/getBusRouteList", strSrch=s)
-        except Exception as e:
-            print(f"  노선 조회 실패({s}): {type(e).__name__}", flush=True)
+            root = fetch(key, "busRouteInfo/getBusRouteList", strSrch=search)
+        except Exception as exc:
+            print(f"  노선 조회 실패({search}): {type(exc).__name__}", flush=True)
             continue
-        for it in root.findall(".//itemList"):
-            f = {c.tag: (c.text or "") for c in it}
-            if f.get("routeType") in SEOUL_TYPES and f.get("busRouteId"):
-                seen[f["busRouteId"]] = {"no": f.get("busRouteNm"), "tp": f.get("routeType"),
-                                         "term": f.get("term"), "first": f.get("firstBusTm"),
-                                         "last": f.get("lastBusTm")}
+        for item in root.findall(".//itemList"):
+            fields = {child.tag: (child.text or "") for child in item}
+            if fields.get("routeType") in SEOUL_TYPES and fields.get("busRouteId"):
+                seen[fields["busRouteId"]] = {
+                    "no": fields.get("busRouteNm"), "tp": fields.get("routeType"),
+                    "term": fields.get("term"), "first": fields.get("firstBusTm"),
+                    "last": fields.get("lastBusTm"),
+                }
         time.sleep(0.3)
     if seen:
-        with open(ROUTES_FILE, "w", encoding="utf-8") as f:
-            json.dump(seen, f, ensure_ascii=False)
+        with open(ROUTES_FILE, "w", encoding="utf-8") as file:
+            json.dump(seen, file, ensure_ascii=False)
     return seen
 
 
 def routes(key, force=False):
     if not force and os.path.exists(ROUTES_FILE):
         try:
-            with open(ROUTES_FILE, encoding="utf-8") as f:
-                r = json.load(f)
-            if r:
-                return r
+            with open(ROUTES_FILE, encoding="utf-8") as file:
+                result = json.load(file)
+            if result:
+                return result
         except (OSError, ValueError):
             pass
     print(f"[{now():%H:%M:%S}] 서울 노선 목록 갱신 중…", flush=True)
-    r = refresh_routes(key)
-    print(f"[{now():%H:%M:%S}] 서울 소속 {len(r):,}개", flush=True)
-    return r
+    result = refresh_routes(key)
+    print(f"[{now():%H:%M:%S}] 서울 소속 {len(result):,}개", flush=True)
+    return result
 
 
 def snapshot(key, rid):
-    """노선 1개의 전 정류장 도착정보 — 1콜. 슬림 형식으로 줄여 저장한다
-    (원본 85필드를 다 남기면 하루 수백 MB. 쓰는 것만 남긴다)."""
+    """노선 한 개의 전 정류장 도착정보를 슬림 형식으로 반환한다."""
     root = fetch(key, "arrive/getArrInfoByRouteAll", busRouteId=rid)
     out = []
-    for it in root.findall(".//itemList"):
-        f = {c.tag: (c.text or "") for c in it}
+    for item in root.findall(".//itemList"):
+        fields = {child.tag: (child.text or "") for child in item}
         out.append({
-            "ord": f.get("staOrd"), "stId": f.get("stId"), "stNm": f.get("stNm"),
-            "mkTm": f.get("mkTm"),
-            # 다음 2대 — 이 둘의 간격이 실측 순간 배차 (CV 의 재료)
-            "arr1": f.get("arrmsg1"), "arr2": f.get("arrmsg2"),
-            "veh1": f.get("plainNo1"), "veh2": f.get("plainNo2"),
-            "sec1": f.get("nstnSec1"), "sec2": f.get("nstnSec2"),   # 다음 구간 예정시간
-            "spd1": f.get("traSpd1"), "term": f.get("term"),
+            "ord": fields.get("staOrd"), "stId": fields.get("stId"),
+            "stNm": fields.get("stNm"), "mkTm": fields.get("mkTm"),
+            "arr1": fields.get("arrmsg1"), "arr2": fields.get("arrmsg2"),
+            "veh1": fields.get("plainNo1"), "veh2": fields.get("plainNo2"),
+            "sec1": fields.get("nstnSec1"), "sec2": fields.get("nstnSec2"),
+            "spd1": fields.get("traSpd1"), "term": fields.get("term"),
         })
-    # 등록된 노선은 운행 여부와 무관하게 정류장 목록을 돌려준다. 0행은 유효한
-    # '버스 없음'이 아니라 오류 형식 변경/부분 응답일 가능성이 크므로 재시도한다.
     if not out:
         raise RuntimeError("empty_route_snapshot")
     return out
 
 
+def dispatcher_fetch(key, _city, rid):
+    """RollingDispatcher가 쓰는 실패-값 반환 어댑터."""
+    try:
+        rows = snapshot(key, rid)
+        return rid, rows, None, now()
+    except urllib.error.HTTPError as exc:
+        return rid, [], f"HTTP{exc.code}", now()
+    except Exception as exc:
+        return rid, [], f"{type(exc).__name__}:{str(exc)[:100]}", now()
+
+
+# 구버전 상태 파일 접근자는 대시보드/도구의 짧은 호환 기간을 위해 읽기만 남긴다.
 def done_path(day):
     return os.path.join(O.DATA, f"seoul-done-{day}.json")
 
 
 def load_done(day):
-    """(밴드, 노선) 진행 상황을 디스크에서 복원.
-
-    ⚠️ 메모리에만 두면 재시작할 때마다 그 밴드를 처음부터 다시 찍는다. systemd 가
-    Restart=always 라 크래시·배포 때마다 쿼터가 샌다 — 지하철에서 같은 구조(하루 1회
-    제약이 메모리에만 있던 것)로 셀이 통째로 0 이 됐던 것과 같은 부류다.
-    콜 카운터를 디스크에 두는 것과 같은 이유이고, 이건 그 짝이다.
-    """
     try:
-        with open(done_path(day), encoding="utf-8") as f:
-            return {(int(k.split(":", 1)[0]), k.split(":", 1)[1]): True for k in json.load(f)}
+        with open(done_path(day), encoding="utf-8") as file:
+            return {(int(key.split(":", 1)[0]), key.split(":", 1)[1]): True
+                    for key in json.load(file)}
     except (OSError, ValueError, IndexError):
         return {}
-
-
-def save_done(day, done):
-    tmp = done_path(day) + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump([f"{b}:{r}" for b, r in done], f)
-        os.replace(tmp, done_path(day))   # 원자적 교체 — 쓰다 죽어도 이전 것이 남는다
-    except OSError:
-        pass
 
 
 def failures_path(day):
@@ -203,33 +267,33 @@ def failures_path(day):
 
 def load_failures(day):
     try:
-        with open(failures_path(day), encoding="utf-8") as f:
-            return json.load(f)
+        with open(failures_path(day), encoding="utf-8") as file:
+            return json.load(file)
     except (OSError, ValueError):
         return {}
 
 
-def save_failures(day, failures):
-    tmp = failures_path(day) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(failures, f, ensure_ascii=False)
-    os.replace(tmp, failures_path(day))
+def read_status():
+    try:
+        with open(STATUS_FILE, encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        return {}
 
 
-def cleanup_state_files(t):
-    """재시작 복원에 필요한 현재 서울 장부만 남긴다.
+def write_status(status):
+    tmp = STATUS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as file:
+        json.dump(status, file, ensure_ascii=False)
+    os.replace(tmp, STATUS_FILE)
 
-    calls는 data.go.kr 쿼터와 같은 달력일(00시 경계), done/failures는 JSONL과
-    같은 운행일(04시 경계)이다. 00~04시에는 둘의 날짜가 다르므로 단순히 가장
-    최근 파일 하나를 남기면 안 된다. 각 기준의 현재 파일을 정확히 하나씩 보존한다.
-    과거 장부는 원본 데이터도 rebuild 입력도 아니어서 삭제해도 수집 결과가 줄지 않는다.
-    """
-    service_day_now = service_day(t)
-    keep = {
-        os.path.abspath(calls_path(quota_day(t))),
-        os.path.abspath(done_path(service_day_now)),
-        os.path.abspath(failures_path(service_day_now)),
-    }
+
+def cleanup_state_files(t, keys=None):
+    """현재 달력일의 합계·활성 키 장부만 남기고 구버전 done/failure를 제거한다."""
+    qday = quota_day(t)
+    keys = keys if keys is not None else load_keys(warn=False)
+    keep = {os.path.abspath(calls_path(qday))}
+    keep.update(os.path.abspath(calls_path(qday, kid)) for kid, _ in keys)
     patterns = (
         os.path.join(O.DATA, "seoul-calls-*.txt"),
         os.path.join(O.DATA, "seoul-done-*.json"),
@@ -243,10 +307,8 @@ def cleanup_state_files(t):
             try:
                 os.remove(path)
                 removed.append(os.path.basename(path))
-            except OSError as e:
-                # 상태 정리 실패가 수집 중단으로 번지면 안 된다. 다음 날짜 경계나
-                # 재시작 때 다시 시도할 수 있도록 로그만 남긴다.
-                print(f"[상태 정리] ⚠️ {os.path.basename(path)} 삭제 실패: {e}",
+            except OSError as exc:
+                print(f"[상태 정리] ⚠️ {os.path.basename(path)} 삭제 실패: {exc}",
                       flush=True)
     if removed:
         print(f"[상태 정리] 과거 서울 장부 {len(removed)}개 삭제: "
@@ -255,141 +317,188 @@ def cleanup_state_files(t):
 
 
 def main():
-    key = load_key()
-    if not key:
-        sys.exit("키 없음 — .env 에 SEOUL_BUS_KEY 또는 GBIS_BUS_KEY 가 있어야 한다")
+    keys = load_keys()
+    if not keys:
+        sys.exit("키 없음 — config.seoulBusKeys에 대응하는 키를 .env에 넣어야 한다")
     if "--routes" in sys.argv:
-        print(f"{len(routes(key, force=True)):,}개 저장: {ROUTES_FILE}")
+        print(f"{len(routes(keys[0][1], force=True)):,}개 저장: {ROUTES_FILE}")
         return
 
     os.makedirs(O.DATA, exist_ok=True)
-    R = routes(key)
-    if not R:
-        sys.exit("노선 목록이 비었다 — --routes 로 먼저 받을 것")
-    bands = O.cfg()["timebands"]
-    print(f"[{now():%H:%M:%S}] 서울 도착정보 스냅샷 · 노선 {len(R):,}개 · 밴드 {len(bands)}개 "
-          f"· 상한 {DAILY_CAP:,}/일 (오늘 {read_calls(quota_day(now())):,} 사용)", flush=True)
-    tp_n = {}
-    for v in R.values():
-        tp_n[v["tp"]] = tp_n.get(v["tp"], 0) + 1
-    print("  " + " · ".join(f"{TYPE_NM.get(k, k)}{v}" for k, v in sorted(tp_n.items())), flush=True)
+    route_map = routes(keys[0][1])
+    if not route_map:
+        sys.exit("노선 목록이 비었다 — --routes로 먼저 받을 것")
 
-    started_at = now()
-    day = service_day(started_at)
-    cleanup_state_files(started_at)
-    state_days = (quota_day(started_at), day)
-    done = load_done(day)   # (band, routeid) -> **성공**만. 재시작해도 이어간다
-    fails = {}              # (band, routeid) -> 연속 실패 횟수 (메모리 — 재시작 시 새 시도)
-    fail_log = load_failures(day)
-    MAX_TRIES = 3           # 밴드 안에서 이만큼 실패하면 포기 (다음 밴드에 다시 온다)
+    config = O.cfg()
+    cap = int(config.get("seoulBusDailyCap", DAILY_CAP))
+    planned_calls = min(
+        cap, int(config.get("seoulPlannedCallsPerKey", PLANNED_CALLS)))
+    configured_interval = float(config.get("seoulIntervalSec", 2175))
+    # 정상 슬롯만으로 planned_calls를 넘지 않게 실제 노선 수·활성 키 수로 계산한다.
+    # cap-planned_calls는 물리 재시도와 재시작 위상 변화에만 쓰는 여유다.
+    safe_interval = minimum_safe_interval(
+        len(route_map), len(keys), planned_calls, utilization=1.0)
+    interval = max(configured_interval, safe_interval)
+    retry_limit = int(config.get("seoulRetryLimit", 1))
+    quota = QuotaReservations(cap)
+    qday = quota_day(now())
+    ensure_key_counters(keys, qday)
+    cleanup_state_files(now(), keys)
+
+    dispatcher = RollingDispatcher(
+        keys, dispatcher_fetch, quota.reserve, interval,
+        float(config.get("seoulDispatchRate", 1)),
+        int(config.get("seoulMaxWorkers", 2)),
+        int(config.get("seoulMaxInflight", 2)),
+        retry_limit=retry_limit,
+    )
+    dispatcher.set_routes([
+        {"routeid": rid, "cityCode": 0} for rid in route_map
+    ])
+
+    type_counts = {}
+    for value in route_map.values():
+        type_counts[value["tp"]] = type_counts.get(value["tp"], 0) + 1
+    projected = len(route_map) * 86400 / interval / len(keys)
+    print(f"[{now():%H:%M:%S}] 서울 연속 수집 · 노선 {len(route_map):,}개 · "
+          f"키 {len(keys)}개({', '.join(kid for kid, _ in keys)}) · "
+          f"노선별 {interval:.0f}초 · 키당 정상예산 "
+          f"{projected:,.0f}/{planned_calls:,} · 정지상한 {cap:,}콜", flush=True)
+    print("  " + " · ".join(
+        f"{TYPE_NM.get(key, key)}{value}" for key, value in sorted(type_counts.items())),
+        flush=True)
+    if interval > configured_interval + 0.5:
+        print(f"[{now():%H:%M:%S}] ⚠️ 활성 키 부족으로 주기 "
+              f"{configured_interval:.0f}→{interval:.0f}초 자동 연장", flush=True)
+
+    bands = config["timebands"]
+    current_service_day = service_day(now())
+    current_quota_day = qday
     rotated_day = None
     written = 0
-    if done:
-        print(f"[{now():%H:%M:%S}] 재시작 복원: 이미 찍은 (밴드,노선) {len(done):,}개", flush=True)
+    last_success = {}
+    report_started = time.monotonic()
+    report_at = report_started + 60
+    cumulative = {
+        "attempted": 0, "successful": 0, "retried": 0, "residual": 0,
+        "rows": 0, "errors": {},
+    }
 
-    while True:
-        t = now()
-        d = service_day(t)
-        current_state_days = (quota_day(t), d)
-        if current_state_days != state_days:
-            cleanup_state_files(t)
-            state_days = current_state_days
-        if d != day:
-            print(f"[{t:%H:%M:%S}] 운행일 전환 {day} → {d} (전일 {written:,}행)", flush=True)
-            # ⚠️ fails 도 반드시 초기화 — 전날 MAX_TRIES 실패한 (밴드,노선)이 남으면
-            #    다음 운행일 내내(재시작 전까지) todo 에서 영구 제외된다 (done/fail_log 만
-            #    비우던 버그). fails 는 '오늘 안에서' 재시도를 포기하는 카운터라 매일 리셋.
-            day, done, written, fail_log, fails = d, {}, 0, {}, {}
-            save_done(day, done)
-            save_failures(day, fail_log)
-            continue
-        due = O.rotate_due(rotated_day, t)
-        if due:
-            rotated_day = due
-            __import__("threading").Thread(
-                target=O.rotate_jsonl, args=(PREFIX,), daemon=True).start()
+    try:
+        while True:
+            t = now()
+            dispatcher.raise_if_failed()
+            qday = quota_day(t)
+            if qday != current_quota_day:
+                ensure_key_counters(keys, qday)
+                sync_quota_db(current_quota_day, keys)   # 지난 날짜 최종 누계 확정
+                cleanup_state_files(t, keys)
+                blocked = dispatcher.reset_quota_blocks()
+                print(f"[{t:%H:%M:%S}] 쿼터 날짜 전환 {current_quota_day} → {qday} "
+                      f"· 차단 해제 {blocked}키", flush=True)
+                current_quota_day = qday
 
-        b = O.band_of(t, bands)
-        if b is None:
-            time.sleep(120)
-            continue
-        qday = quota_day(t)
-        # 성공(done)도 아니고 포기(fails>=MAX)도 아닌 것만 — 실패는 재시도 대상
-        todo = [rid for rid in R if (b, rid) not in done and fails.get((b, rid), 0) < MAX_TRIES]
-        if not todo:
-            time.sleep(60)              # 이 밴드는 다 찍었다 — 다음 밴드까지 쉰다
-            continue
+            new_service_day = service_day(t)
+            if new_service_day != current_service_day:
+                print(f"[{t:%H:%M:%S}] 운행일 전환 {current_service_day} → "
+                      f"{new_service_day} (전일 {written:,}행)", flush=True)
+                current_service_day = new_service_day
+                written = 0
+                last_success = {}
+                cumulative = {
+                    "attempted": 0, "successful": 0, "retried": 0, "residual": 0,
+                    "rows": 0, "errors": {},
+                }
 
-        left = DAILY_CAP - read_calls(qday)
-        if left <= 0:
-            print(f"[{t:%H:%M:%S}] 일 상한 도달 — 자정 리셋까지 대기", flush=True)
-            time.sleep(300)
-            continue
+            due = O.rotate_due(rotated_day, t)
+            if due:
+                rotated_day = due
+                threading.Thread(
+                    target=O.rotate_jsonl, args=(PREFIX,), daemon=True).start()
 
-        # 밴드가 끝나기 전에 todo 를 고르게 편다. 남은 쿼터도 함께 본다
-        # (지하철 pace() 와 같은 원칙 — 캡에 부딪히는 대신 성겨진다).
-        # ⚠️ 밴드 6 은 [20,28] 로 자정을 넘는다. "28>=24 면 무조건 +1일"로 두면
-        #    01시에 잔여를 27시간으로 계산해(실제 3시간) 간격이 30초 상한에 붙고
-        #    새벽에 남은 노선을 못 찍는다 (✅ 재현: 03시 계산 25h vs 실제 1h).
-        #    지금이 자정 **전**인지 **후**인지로 갈라야 한다.
-        lo, hi = bands[b]
-        band_end = t.replace(hour=hi % 24, minute=0, second=0, microsecond=0)
-        if hi >= 24:
-            if t.hour >= lo:              # 20~24시 구간 — 종료는 다음날 04시
-                band_end += timedelta(days=1)
-        elif band_end <= t:
-            band_end += timedelta(days=1)
-        secs = max(60, (band_end - t).total_seconds())
-        # 하한 2초 — 밴드가 얼마 안 남은 채로 시작하면 산식이 0.8초까지 내려가
-        # 702콜을 10분에 몰아친다. 서울 API 의 순간 rate 제한은 확인된 바 없어
-        # 버스트를 만들지 않는다 (경기에서 버스트가 429·세션99 를 부른 전례 — paced()).
-        gap = max(2.0, min(30.0, secs / min(len(todo), left)))
+            first = dispatcher.get(timeout=0.5)
+            events = dispatcher.drain(first)
+            if events:
+                batch_until = time.monotonic() + 0.5
+                while len(events) < 128:
+                    wait = batch_until - time.monotonic()
+                    if wait <= 0:
+                        break
+                    event = dispatcher.get(timeout=wait)
+                    if event is None:
+                        break
+                    events.extend(dispatcher.drain(event, 128 - len(events)))
 
-        rid = random.choice(todo)       # 무작위 — 항상 같은 순서면 노선별 위상이 고정된다
-        # 호출 전에 예약한다. 응답 도중 프로세스가 죽어도 실제 쿼터보다 장부가 작아져
-        # 재시작 후 상한을 넘는 경로가 없게 한다.
-        add_calls(qday, 1)
-        try:
-            rows = snapshot(key, rid)
-        except Exception as e:
-            # ⚠️ [리뷰 R1 #5] 실패를 done 으로 찍으면 완료율이 '성공률'이 아니라
-            #    '시도율'이 된다. done 은 안 찍고 지수 백오프로 재시도, MAX 회 넘으면
-            #    포기(todo 에서 빠지되 done 도 아니라 대시보드가 미완료로 본다).
-            fails[(b, rid)] = fails.get((b, rid), 0) + 1
-            nt = fails[(b, rid)]
-            fail_log[f"{b}:{rid}"] = {
-                "band": b, "routeid": rid, "no": R[rid]["no"], "tries": nt,
-                "reason": f"{type(e).__name__}: {str(e)[:120]}", "t": t.isoformat(),
+            rows_by_day = {}
+            for event in events:
+                rid, rows, error, observed = event["result"]
+                cumulative["attempted"] += 1
+                cumulative["retried"] += int(event["retried"])
+                if error:
+                    cumulative["residual"] += 1
+                    cumulative["errors"][error] = cumulative["errors"].get(error, 0) + 1
+                    continue
+                cumulative["successful"] += 1
+                last_success[rid] = observed.timestamp()
+                band = O.band_of(observed, bands)
+                output_day = service_day(observed)
+                for row in rows:
+                    row["t"] = observed.isoformat()
+                    row["rid"] = rid
+                    row["no"] = route_map[rid]["no"]
+                    row["tp"] = route_map[rid]["tp"]
+                    row["band"] = band
+                    row["daytype"] = O.day_type(observed)
+                    rows_by_day.setdefault(output_day, []).append(row)
+                cumulative["rows"] += len(rows)
+
+            for output_day, output_rows in rows_by_day.items():
+                path = os.path.join(OUT_DIR, f"{PREFIX}-{output_day}.jsonl")
+                with open(path, "a", encoding="utf-8") as file:
+                    for row in output_rows:
+                        file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                written += len(output_rows)
+
+            if time.monotonic() < report_at:
+                continue
+            report_now = now()
+            snap = dispatcher.snapshot()
+            recent_cutoff = report_now.timestamp() - interval * 1.5
+            recent_routes = sum(ts >= recent_cutoff for ts in last_success.values())
+            status = {
+                "updated": report_now.timestamp(),
+                "serviceDay": current_service_day,
+                "routes": len(route_map),
+                "keys": [kid for kid, _ in keys],
+                "intervalSec": interval,
+                "configuredIntervalSec": configured_interval,
+                "plannedCallsPerKey": planned_calls,
+                "recentRoutes": recent_routes,
+                "attempted": cumulative["attempted"],
+                "successful": cumulative["successful"],
+                "retried": cumulative["retried"],
+                "residual": cumulative["residual"],
+                "rows": cumulative["rows"],
+                "written": written,
+                "errors": cumulative["errors"],
+                "inflight": snap["inflight"],
+                "quotaBlocked": snap["quotaBlocked"],
             }
-            save_failures(day, fail_log)
-            print(f"[{t:%H:%M:%S}] 실패({nt}/{MAX_TRIES}) {R[rid]['no']}: {type(e).__name__}", flush=True)
-            time.sleep(min(30.0, gap * (2 ** (nt - 1))))   # 지수 백오프
-            continue
-        done[(b, rid)] = True           # 성공(빈 응답 포함 — 유효)만 done
-        fails.pop((b, rid), None)
-        fail_log.pop(f"{b}:{rid}", None)
-        save_failures(day, fail_log)
-        save_done(day, done)
-
-        if rows:
-            path = os.path.join(OUT_DIR, f"{PREFIX}-{day}.jsonl")
-            with open(path, "a", encoding="utf-8") as f:
-                for r in rows:
-                    r["t"] = t.isoformat()
-                    r["rid"] = rid
-                    r["no"] = R[rid]["no"]
-                    r["tp"] = R[rid]["tp"]
-                    r["band"] = b
-                    r["daytype"] = O.day_type(t)
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            written += len(rows)
-
-        if len(done) % 50 == 0:
-            mem = O.rss_mb()
-            print(f"[{t:%H:%M:%S}] 밴드{b} · 찍은 노선 {len([1 for k in done if k[0] == b]):,}/{len(R):,}"
-                  f" · 콜 {read_calls(qday):,}/{DAILY_CAP:,} · 오늘 {written:,}행 · {gap:.1f}s 간격"
-                  + (f" · {mem:.0f}MB" if mem else ""), flush=True)
-        time.sleep(gap + random.uniform(-0.2, 0.2))
+            write_status(status)
+            calls = " · ".join(
+                f"{kid}={read_calls(current_quota_day, kid):,}/{cap:,}"
+                for kid, _ in keys)
+            elapsed = time.monotonic() - report_started
+            print(f"[{report_now:%H:%M:%S}] {elapsed:.0f}초 상태 · "
+                  f"성공 {cumulative['successful']}/{cumulative['attempted']} · "
+                  f"최근 노선 {recent_routes}/{len(route_map)} · "
+                  f"in-flight {snap['inflight']} · {calls}"
+                  + (f" · 잔여실패 {cumulative['residual']}"
+                     if cumulative["residual"] else ""), flush=True)
+            report_started = time.monotonic()
+            report_at = report_started + 60
+    finally:
+        dispatcher.close()
 
 
 if __name__ == "__main__":
